@@ -33,10 +33,12 @@ curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh
   | sh -s -- -y
 source "$HOME/.elan/env"
 
-# 2. Create a Mathlib project
+# 2. Create a Mathlib project (fetch the Lean version Mathlib requires)
+LEAN_TOOLCHAIN=$(curl -fsSL \
+  https://raw.githubusercontent.com/leanprover-community/mathlib4/master/lean-toolchain \
+  | tr -d '[:space:]')
 mkdir lean_proofs && cd lean_proofs
-lake +leanprover-community/mathlib4:stable init lean_proofs math
-# ↑ "math" template wires up Mathlib automatically
+lake +"$LEAN_TOOLCHAIN" new lean_proofs math
 
 # 3. Download prebuilt Mathlib cache (avoids a multi-hour source build)
 lake exe cache get
@@ -71,13 +73,17 @@ import LeanProofs.MainTheorem
 
 Every `.lean` file should start with:
 ```lean
-import Mathlib
+import Mathlib.Tactic          -- tactics only (~1-2GB cache vs 5GB for bare `import Mathlib`)
 import LeanProofs.Definitions  -- if referencing other local files
 
 namespace LeanProofs
 -- ... your content ...
 end LeanProofs
 ```
+
+**Never use `import Mathlib` (bare).** Always use `import Mathlib.Tactic` as the default.
+If a specific lemma is not found, add its module (e.g. `import Mathlib.Data.Nat.Basic`)
+rather than switching to the bare import.
 
 ### Theorem / Lemma syntax
 
@@ -197,7 +203,7 @@ grep -r "sorry" lean_proofs/LeanProofs/ && echo "INCOMPLETE PROOFS FOUND" || ech
 | `unsolved goals: ⊢ P` | Proof is incomplete — `P` still needs to be proved |
 | `application type mismatch` | Applied lemma to wrong argument type |
 | `failed to synthesize instance` | Missing typeclass — may need `[DecidableEq α]` or similar |
-| `declaration uses sorry` | Proof accepted but marked incomplete — replace all `sorry` |
+| `declaration uses \`sorry\`` | Proof accepted but marked incomplete — replace all `sorry` |
 
 ## Proof Skeleton Template
 

@@ -32,12 +32,30 @@ if [ -d "$PROJECT_DIR" ]; then
 else
   echo ""
   echo "► Creating Lean project with Mathlib..."
-  # Use the official mathlib4 template so the toolchain pin is correct
-  lake +leanprover-community/mathlib4:stable init "$PROJECT_DIR" math
+  # Use the official mathlib4 template so the toolchain pin is correct.
+  # Fetch the current Lean version Mathlib requires — elan only ships binaries
+  # for leanprover/lean4 releases, not leanprover-community/mathlib4.
+  LEAN_TOOLCHAIN=$(curl -fsSL \
+    https://raw.githubusercontent.com/leanprover-community/mathlib4/master/lean-toolchain \
+    | tr -d '[:space:]')
+  lake +"$LEAN_TOOLCHAIN" new "$PROJECT_DIR" math
   echo "  Project created."
 fi
 
 cd "$PROJECT_DIR"
+
+# ── Redirect build artifacts to /tmp ─────────────────────────────────────────
+# lake build extracts Mathlib oleans into buildDir (~1-3GB). By redirecting to
+# /tmp (container-internal) we avoid filling the host-mounted workspace volume.
+# The .lean source files stay in the workspace; only build artifacts go to /tmp.
+LAKE_BUILD_TMP="/tmp/lean-build-$(basename "$(pwd)")-$$"
+mkdir -p "$LAKE_BUILD_TMP"
+if [ -f lakefile.toml ]; then
+    printf '\nbuildDir = "%s"\npackagesDir = "%s/packages"\n' \
+        "$LAKE_BUILD_TMP" "$LAKE_BUILD_TMP" >> lakefile.toml
+elif [ -f lakefile.lean ]; then
+    sed -i "s|^package.*$|&\n  buildDir := \"$LAKE_BUILD_TMP\"\n  packagesDir := \"$LAKE_BUILD_TMP/packages\"|" lakefile.lean
+fi
 
 # ── 3. Create library source directory ───────────────────────────────────────
 mkdir -p "$LIB_NAME"
@@ -80,7 +98,7 @@ namespace LeanProofs
 Prove intermediate results here. Each lemma should:
 1. Have a doc comment explaining what it says
 2. State all hypotheses explicitly
-3. End with QED (i.e. no `sorry`)
+3. End with QED (no incomplete proofs)
 -/
 
 end LeanProofs

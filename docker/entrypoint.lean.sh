@@ -10,7 +10,7 @@ set -e
 export ELAN_HOME="${ELAN_HOME:-/home/neurico/.elan}"
 export PATH="${ELAN_HOME}/bin:${PATH}"
 
-# ── Lean status check ────────────────────────────────────────────────────────
+#Lean status check
 BLUE='\033[0;34m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -40,5 +40,31 @@ fi
 
 echo ""
 
-# ── Hand off to the standard neurico entrypoint ──────────────────────────────
+# -----------------------------------------------------------------------------
+# Claude isolation: Claude Code 2.1+ writes session-env/ inside its config dir
+# at runtime. Windows bind-mounts block new subdirectory creation even with :ro,
+# so copy credentials from the read-only host mount into a container-private
+# writable directory and point CLAUDE_CONFIG_DIR there before handing off.
+# Supports both mount styles: .claude-host and /tmp/.claude (default neurico).
+# -----------------------------------------------------------------------------
+if [ "${NEURICO_LOGIN_ONLY:-0}" != "1" ]; then
+    _claude_src=""
+    if [ -d "$HOME/.claude-host" ]; then
+        _claude_src="$HOME/.claude-host"
+    elif [ -d "/tmp/.claude" ]; then
+        _claude_src="/tmp/.claude"
+    fi
+    if [ -n "$_claude_src" ]; then
+        mkdir -p "$HOME/.claude-container"
+        for f in .claude.json .credentials.json settings.json; do
+            if [ -f "$_claude_src/$f" ]; then
+                cp "$_claude_src/$f" "$HOME/.claude-container/$f" 2>/dev/null || true
+                chmod 600 "$HOME/.claude-container/$f" 2>/dev/null || true
+            fi
+        done
+        export CLAUDE_CONFIG_DIR="$HOME/.claude-container"
+    fi
+fi
+
+# Hand off to the standard neurico entrypoint
 exec /app/docker/entrypoint.sh "$@"

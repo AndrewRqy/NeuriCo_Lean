@@ -2,8 +2,9 @@
 # neurico-lean Docker Compose Configuration
 #
 # STANDALONE mode: each run is a self-contained, ephemeral job.
-# The Lean toolchain and Mathlib.Tactic cache are baked into the image —
-# no volume mounts are needed for Lean to work.
+# The Lean toolchain is baked into the image. The Mathlib olean cache is
+# persisted in the `mathlib-cache` Docker volume — downloaded once on first
+# use via `lake exe cache get`, reused across all subsequent runs.
 #
 # Build:
 #   docker compose -f docker-compose.lean.yml build
@@ -44,18 +45,17 @@ services:
       - ELAN_HOME=/home/neurico/.elan
 
     volumes:
-      # ── Research output (the only persistent state across runs) ────────────
+      #  Research output (the only persistent state across runs)
       # Each run writes its workspace here; the directory survives container exit.
       - ./workspaces:/workspaces:rw
 
-      # ── Ideas and config (read-only inputs) ───────────────────────────────
+      #Ideas and config (read-only inputs)
       - ./ideas:/app/ideas:rw
       - ./logs:/app/logs:rw
       - ./config:/app/config:ro
       - ./templates:/app/templates:ro
 
-      # ── CLI credentials (OAuth tokens, read-only) ─────────────────────────
-      - ~/.claude:/tmp/.claude:ro
+      #CLI credentials (OAuth tokens, read-only)
       - ~/.codex:/tmp/.codex:ro
       - ~/.gemini:/tmp/.gemini:ro
 

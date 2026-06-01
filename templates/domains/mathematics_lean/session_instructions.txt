@@ -125,7 +125,7 @@ Phase 2: Environment & Mathematical Setup (15-25 min)
   ✓ Confirm Lean setup: cd lean_proofs && lake build && cd ..
   ✓ Write lean_proofs/LeanProofs/Definitions.lean:
       - All types, structures, and notation for the research
-      - Use import Mathlib at the top
+      - Use import Mathlib.Tactic at the top (not bare import Mathlib)
       - Run lake build to confirm definitions compile
   ✓ Write definitions.md with informal descriptions of each Lean definition
   ✓ Verify prerequisite Mathlib lemmas exist: add #check statements and lake build
