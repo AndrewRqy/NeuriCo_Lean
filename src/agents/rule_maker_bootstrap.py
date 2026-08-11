@@ -98,24 +98,32 @@ def _trusted_idea_yaml(idea: Optional[Dict[str, Any]], work_dir: Path) -> str:
         return f"(idea.yaml could not be read: {e})"
 
 
-def read_prior_scoring_protocol(work_dir: Path) -> Optional[Dict[str, str]]:
+def read_prior_scoring_protocol(
+        work_dir: Path,
+        allow_workspace: bool = False) -> Optional[Dict[str, str]]:
     """
     Return the existing scoring protocol as {'eval','targets','interface'}, or
     None when no trusted prior exists (first generation / raw adopted repo).
 
-    Read ONLY from TRUSTED copies, in order: the .scoring_sealed relocation
-    (freshest, but transient: every unseal removes it) and then the durable
-    .protocol_store sibling (written by trusted runner code each time a
-    protocol is validated, so it survives a completed-run lifecycle). The
-    workspace copy is worker-writable, so it is NOT a fallback: with neither
-    trusted copy present the rule maker regenerates fresh. Feeding an
-    agent-edited eval.py/targets.json into the regeneration prompt could steer
-    weaker targets (the eval-verifier gate is skipped for goal-only ideas), so
-    this reads a trusted copy or nothing.
-    """
-    from core.scoring_seal import protocol_store_dir_for, sealed_dir_for
+    The freshest trusted copy is the .scoring_sealed relocation (present during
+    a live run, removed by every unseal). The worker-writable workspace copy in
+    scoring/ is trusted ONLY when allow_workspace is set, which the caller does
+    exclusively on the freshly adopted path: adopt_repository has just
+    materialized the tree from the trusted repo source and no research agent has
+    run, so the repo's own scorer is pristine and is a valid prior to extend.
 
-    for root in (sealed_dir_for(work_dir), protocol_store_dir_for(work_dir)):
+    On resume allow_workspace is False: a prior run's agents had write access to
+    the unsealed scoring/ files, so an agent-edited eval.py/targets.json could
+    steer weaker targets (the eval-verifier gate is skipped for goal-only
+    ideas). With no sealed copy present there, this returns None and the rule
+    maker regenerates fresh rather than trust a possibly-tampered copy.
+    """
+    from core.scoring_seal import sealed_dir_for
+
+    roots = [sealed_dir_for(work_dir)]
+    if allow_workspace:
+        roots.append(Path(work_dir))
+    for root in roots:
         eval_path = root / "scoring" / "eval.py"
         targets_path = root / "scoring" / "targets.json"
         if eval_path.is_file() and targets_path.is_file():
@@ -473,15 +481,9 @@ def check_target_floor(work_dir: Path,
     Returns one message per weakened target; an empty list means no regression.
     """
     work_dir = Path(work_dir)
-    try:
-        new_payload = json.loads(
-            (work_dir / "scoring" / "targets.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    new_targets = _target_map(new_payload)
-    if not new_targets:
-        return []
-
+    # Build the trusted anchors FIRST, so "cannot validate the new targets"
+    # (unreadable / non-numeric) is judged against what must be retained rather
+    # than waved through. An empty anchor set means there is nothing to weaken.
     anchors: Dict[str, Dict[str, Any]] = {}
     if prior_protocol and prior_protocol.get("targets"):
         try:
@@ -502,6 +504,27 @@ def check_target_floor(work_dir: Path,
                                     "direction": None})
             except (TypeError, ValueError, KeyError):
                 continue
+
+    # Parse the regenerated targets. When they cannot be validated (unreadable,
+    # or no numeric target at all) while trusted anchors exist, fail CLOSED:
+    # "unable to validate the new targets" must never be reported as "no
+    # regression found". With no anchors there is nothing to protect.
+    try:
+        new_payload = json.loads(
+            (work_dir / "scoring" / "targets.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        if anchors:
+            return [f"regenerated scoring/targets.json could not be validated "
+                    f"({type(exc).__name__}); cannot confirm the {len(anchors)} "
+                    f"retained metric target(s) survived (failing closed)"]
+        return []
+    new_targets = _target_map(new_payload)
+    if not new_targets:
+        if anchors:
+            return ["regenerated scoring/targets.json declares no numeric "
+                    f"targets; cannot confirm the {len(anchors)} retained "
+                    f"metric target(s) survived (failing closed)"]
+        return []
 
     violations: List[str] = []
     for name, anchor in anchors.items():

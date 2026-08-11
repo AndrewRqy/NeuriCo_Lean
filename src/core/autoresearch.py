@@ -17,7 +17,6 @@ import tempfile
 
 from core.scorer import load_scoring_results
 from core.scoring_seal import (
-    persist_validated_protocol,
     seal_scoring_files,
     unseal_scoring_files,
 )
@@ -1144,6 +1143,7 @@ def construct_bootstrap_initial_node(
     autoresearch_history_dir: Optional[Path],
     prepare_workspace: Optional[Callable[[Path], None]] = None,
     force_rebaseline: bool = False,
+    trust_workspace_protocol: bool = False,
 ) -> Dict[str, Any]:
     """Create an initial scored AutoResearch node from an existing unscored workspace.
 
@@ -1152,6 +1152,13 @@ def construct_bootstrap_initial_node(
     set when new evaluation materials were supplied, so the bootstrap rule
     maker regenerates a coherent protocol (extending the prior one) and the
     baseline is recomputed under it. Prior frontier nodes stay historical.
+
+    trust_workspace_protocol says the workspace scoring/ copy is a trusted prior
+    to extend. Set ONLY on the freshly adopted path, where adopt_repository just
+    materialized the tree from the trusted repo source and no research agent has
+    run yet, so the repo's own scorer is pristine. On resume it stays False: a
+    prior run's agents had write access to the unsealed scoring/ files, so the
+    workspace copy is not trusted and only the sealed copy may be read.
     """
     from core.pipeline_orchestrator import ResearchPipelineOrchestrator
     from core.local_resources import record_scoring_materials_fingerprint
@@ -1232,10 +1239,15 @@ def construct_bootstrap_initial_node(
 
     # Capture the existing protocol to extend BEFORE the pipeline seals or
     # overwrites scoring/; None when there is nothing to extend. Read AFTER the
-    # restore above so it reflects the trusted current-best tree, and (see
-    # read_prior_scoring_protocol) only from the sealed copy, never a
-    # worker-writable workspace copy.
-    prior_protocol = read_prior_scoring_protocol(work_dir) if force_rebaseline else None
+    # restore above so it reflects the trusted current-best tree. On resume
+    # (force_rebaseline) only the sealed copy is trusted; on the freshly adopted
+    # path (trust_workspace_protocol) the pristine repo scorer in scoring/ is
+    # also a trusted prior, so the rule maker extends the adopted repo's own
+    # scorer instead of starting blank.
+    prior_protocol = (
+        read_prior_scoring_protocol(
+            work_dir, allow_workspace=trust_workspace_protocol)
+        if (force_rebaseline or trust_workspace_protocol) else None)
 
     bootstrap_history_root = work_dir / "logs" / "bootstrap_baseline"
     bootstrap_state = read_bootstrap_baseline_state(work_dir)
@@ -1410,12 +1422,6 @@ def construct_bootstrap_initial_node(
             # so a later run re-fires the bootstrap rule maker only when they
             # change (not on incidental idea edits).
             record_scoring_materials_fingerprint(work_dir, idea)
-            # Persist the validated protocol into the durable store, so a later
-            # regeneration can extend it. The transient .scoring_sealed copy is
-            # removed by every unseal, and the workspace copy is wiped by the
-            # rebaseline restore, so without this store the "extend the prior
-            # protocol" path never sees a prior in a completed-run lifecycle.
-            persist_validated_protocol(work_dir)
             print()
             print("✅ Bootstrap AutoResearch baseline is ready.")
             print(f"   Baseline checkpoint: {baseline_sha}")

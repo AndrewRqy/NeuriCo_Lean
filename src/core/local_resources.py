@@ -516,7 +516,22 @@ def _stage_sealed_source_plaintext(src: Path, dst: Path) -> None:
     src, dst = Path(src), Path(dst)
     if not src.is_dir():
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst, follow_symlinks=True)
+        # Atomic: copy to a temp sibling then rename, so a crash mid-copy never
+        # leaves a partial dst that the idempotent staging check would keep as
+        # complete. dst is replaced only once the copy has fully succeeded.
+        tmp = dst.with_name(dst.name + '.staging')
+        if tmp.is_dir():
+            shutil.rmtree(tmp)
+        elif tmp.exists() or tmp.is_symlink():
+            tmp.unlink()
+        try:
+            shutil.copy2(src, tmp, follow_symlinks=True)
+            os.replace(tmp, dst)
+        finally:
+            if tmp.is_dir():
+                shutil.rmtree(tmp, ignore_errors=True)
+            elif tmp.exists() or tmp.is_symlink():
+                tmp.unlink()
         return
     staging = dst.with_name(dst.name + '.staging')
     if staging.exists():
@@ -636,7 +651,14 @@ def sealed_dataset_entries(idea: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _tree_sha256(path: Path) -> str:
-    """Content hash of a file or directory tree (sorted relpath + bytes)."""
+    """Content hash of a file or directory tree (sorted relpath + bytes).
+
+    The walk MUST mirror _stage_sealed_source_plaintext: it follows directory
+    symlinks (with the same ancestor-cycle guard) and dereferences file
+    symlinks, so a change to a file behind a directory symlink is reflected in
+    the hash. A plain rglob would skip symlinked subtrees the copy includes,
+    leaving a replaced dataset with a matching hash and no re-stage.
+    """
     path = Path(path)
     digest = hashlib.sha256()
     if path.is_file():
@@ -644,8 +666,24 @@ def _tree_sha256(path: Path) -> str:
             for chunk in iter(lambda: handle.read(1 << 20), b''):
                 digest.update(chunk)
         return digest.hexdigest()
-    for file_path in sorted(p for p in path.rglob('*') if p.is_file()):
-        digest.update(file_path.relative_to(path).as_posix().encode('utf-8'))
+
+    collected: list[tuple[str, Path]] = []
+
+    def _walk(dir_path: Path, rel_root: Path, ancestors: frozenset) -> None:
+        for entry in sorted(os.scandir(dir_path), key=lambda e: e.name):
+            entry_path = Path(dir_path) / entry.name
+            if entry.is_dir(follow_symlinks=True):
+                real = os.path.realpath(entry_path)
+                if real in ancestors:
+                    continue  # true cycle: target is on the current path
+                _walk(entry_path, rel_root / entry.name, ancestors | {real})
+            elif entry_path.is_file():
+                collected.append(
+                    ((rel_root / entry.name).as_posix(), entry_path))
+
+    _walk(path, Path('.'), frozenset({os.path.realpath(path)}))
+    for rel, file_path in sorted(collected, key=lambda item: item[0]):
+        digest.update(rel.encode('utf-8'))
         with file_path.open('rb') as handle:
             for chunk in iter(lambda: handle.read(1 << 20), b''):
                 digest.update(chunk)
@@ -1054,12 +1092,16 @@ def stage_local_resources(work_dir: Path, idea_spec: Dict[str, Any],
                         # agents run and feeds it to the scorer, so an agent
                         # never sees it. Symlinks are dereferenced so the
                         # staged copy is self-contained.
-                        # Record the SOURCE content hash before the source is
-                        # removed: the replacement check compares future
-                        # sources against this value.
+                        # Stage first (atomic), THEN record the SOURCE content
+                        # hash, THEN remove the source. Recording only after a
+                        # fully-staged copy means an interrupted stage never
+                        # leaves a recorded hash matching a partial destination;
+                        # the source is still present here, so the hash reflects
+                        # exactly what was staged, and the replacement check
+                        # compares future sources against this value.
+                        _stage_sealed_source_plaintext(src, dst)
                         _record_sealed_content_sha(
                             work_dir, dst.name, _tree_sha256(src))
-                        _stage_sealed_source_plaintext(src, dst)
                         _remove_in_workspace_sealed_source(
                             work_dir, src, source_repo=continuation_repo)
                     elif src.is_dir():

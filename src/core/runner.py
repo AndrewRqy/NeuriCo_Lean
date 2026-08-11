@@ -1309,6 +1309,10 @@ https://github.com/ChicagoHAI/neurico
 
                 need_bootstrap = True
                 force_rebaseline = False
+                # adopt_repository just materialized the tree from the trusted
+                # repo source and no research agent has run, so the repo's own
+                # scorer in scoring/ is a pristine, trusted prior to extend.
+                trust_workspace_protocol = True
             else:
                 print("↩️  Existing AutoResearch checkpoint found; skipping "
                       "adoption.")
@@ -1326,6 +1330,9 @@ https://github.com/ChicagoHAI/neurico
                     != scoring_materials_fingerprint(idea, work_dir))
                 need_bootstrap = protocol_missing or materials_changed
                 force_rebaseline = need_bootstrap
+                # Resume: a prior run's agents had write access to the unsealed
+                # scoring/ files, so the workspace copy is not a trusted prior.
+                trust_workspace_protocol = False
                 if protocol_missing:
                     print("   No scoring protocol present; running the "
                           "bootstrap rule maker.")
@@ -1335,6 +1342,20 @@ https://github.com/ChicagoHAI/neurico
                 else:
                     print("   Scoring protocol is current; continuing from "
                           "the current best.")
+
+            # Mirror the fresh branch: --prepare-workspace must exit before any
+            # agent runs. The bootstrap below runs the manifest trimmer, rule
+            # maker, and verifier; on a resumed workspace those must not execute
+            # inside the Docker preparation container, where the original sealed
+            # host source is still mounted. Staging (above) is prepare's job and
+            # has already happened; return here so the agents run only in the
+            # research container, which omits the sealed mounts.
+            if prepare_only:
+                print()
+                print("📦 Workspace prepared (staging complete); exiting before "
+                      "agents (--prepare-workspace).")
+                return {"work_dir": work_dir, "github_url": github_url,
+                        "success": True, "prepared": True}
 
             if need_bootstrap:
                 baseline = construct_bootstrap_initial_node(
@@ -1353,6 +1374,7 @@ https://github.com/ChicagoHAI/neurico
                         compute_backend=compute_backend,
                     ),
                     force_rebaseline=force_rebaseline,
+                    trust_workspace_protocol=trust_workspace_protocol,
                 )
                 result_payload["baseline"] = baseline
                 if not baseline.get("success"):
@@ -1364,13 +1386,6 @@ https://github.com/ChicagoHAI/neurico
                         "success": False,
                         **result_payload,
                     }
-
-            if prepare_only:
-                print()
-                print("📦 Workspace already prepared; exiting before agents "
-                      "(--prepare-workspace).")
-                return {"work_dir": work_dir, "github_url": github_url,
-                        "success": True, "prepared": True}
 
             if autoresearch_iterations > 0:
                 from core.autoresearch import make_isolated_continuation_scorer
