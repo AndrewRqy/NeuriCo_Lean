@@ -300,7 +300,7 @@ class ResearchPipelineOrchestrator:
         self.hitl_autoresearch = hitl_autoresearch
         self.hitl_mode = normalize_hitl_mode(hitl_mode)
 
-    def _create_hitl_runtime(self, pipeline_stage: str) -> HitlRuntime:
+    def _create_hitl_runtime(self, pipeline_stage: str, *, invocation_id: str = "") -> HitlRuntime:
         whiteboard_mode: Dict[str, bool] = {}
         if self.hitl_autoresearch:
             whiteboard_mode["use_hitl_autoresearch_whiteboard"] = True
@@ -309,6 +309,7 @@ class ResearchPipelineOrchestrator:
                 self.work_dir,
                 pipeline_stage,
                 hitl_mode=self.hitl_mode,
+                invocation_id=invocation_id,
                 **whiteboard_mode,
             )
         return HitlRuntime(
@@ -318,6 +319,7 @@ class ResearchPipelineOrchestrator:
             channel=self.hitl_channel,
             config=self.hitl_manager_config,
             hitl_mode=self.hitl_mode,
+            invocation_id=invocation_id,
             **whiteboard_mode,
         )
 
@@ -698,7 +700,8 @@ class ResearchPipelineOrchestrator:
                 if hitl_enabled:
                     results["stages"]["resource_finder"] = self._run_hitl_stage_until_complete(
                         stage_name="resource_finder",
-                        run_stage=lambda: self._run_resource_finder_hitl(
+                        run_stage=lambda: self.run_hitl_agent_stage(
+                            "resource_finder",
                             idea=idea,
                             provider=provider,
                             timeout=resource_finder_timeout,
@@ -1291,7 +1294,13 @@ class ResearchPipelineOrchestrator:
             raise
 
     def _run_resource_finder_hitl(
-        self, idea: Dict[str, Any], provider: str, timeout: Optional[int], full_permissions: bool
+        self,
+        idea: Dict[str, Any],
+        provider: str,
+        timeout: Optional[int],
+        full_permissions: bool,
+        manager_objective: str = "",
+        invocation_id: str = "",
     ) -> Dict[str, Any]:
         """Run resource_finder through the plan-centered HITL workflow."""
         print()
@@ -1300,16 +1309,22 @@ class ResearchPipelineOrchestrator:
         print("─" * 80)
         print()
 
-        if not self._initial_stage_request("resource_finder"):
+        if invocation_id or not self._initial_stage_request("resource_finder"):
             self.state.start_stage("resource_finder")
-        runtime = self._create_hitl_runtime("resource_finder")
+        runtime = self._create_hitl_runtime(
+            "resource_finder",
+            invocation_id=invocation_id,
+        )
         worker_prompt_contexts = {
-            phase: generate_resource_finder_prompt(
-                idea,
-                self.templates_dir,
-                hitl_runtime_completion=True,
-                provider=provider,
-                hitl_phase=phase,
+            phase: self._with_manager_resource_objective(
+                generate_resource_finder_prompt(
+                    idea,
+                    self.templates_dir,
+                    hitl_runtime_completion=True,
+                    provider=provider,
+                    hitl_phase=phase,
+                ),
+                manager_objective,
             )
             for phase in ("plan", "execution", "review")
         }
@@ -1398,10 +1413,21 @@ class ResearchPipelineOrchestrator:
             )
 
         try:
-            resumed = self._resume_initial_worker(runtime, launch_worker, worker_prompt_contexts, resource_artifact_validator)
-            if resumed is not None:
-                result, finish = resumed
-                return complete_approved(result, finish) if finish.get("approved") else finalize_failed(finish or result)
+            invocation_log_suffix = f"_{invocation_id}" if invocation_id else ""
+            if not invocation_id:
+                resumed = self._resume_initial_worker(
+                    runtime,
+                    launch_worker,
+                    worker_prompt_contexts,
+                    resource_artifact_validator,
+                )
+                if resumed is not None:
+                    result, finish = resumed
+                    return (
+                        complete_approved(result, finish)
+                        if finish.get("approved")
+                        else finalize_failed(finish or result)
+                    )
             return run_plan_centered_hitl_stage(
                 runtime=runtime,
                 actor="resource_finder",
@@ -1409,10 +1435,13 @@ class ResearchPipelineOrchestrator:
                 worker_prompt_contexts=worker_prompt_contexts,
                 phase_finish_validator=resource_artifact_validator,
                 launch_worker=launch_worker,
-                plan_log_prefix="resource_finder_hitl_plan",
-                execution_log_prefix="resource_finder_hitl_execute_1",
+                plan_log_prefix=f"resource_finder_hitl_plan{invocation_log_suffix}",
+                execution_log_prefix=(
+                    f"resource_finder_hitl_execute_1{invocation_log_suffix}"
+                ),
                 on_approved=complete_approved,
                 on_failed=finalize_failed,
+                provenance=({"attempt_id": invocation_id} if invocation_id else None),
             )
 
         except HitlRunStopRequested:
@@ -1434,6 +1463,45 @@ class ResearchPipelineOrchestrator:
             }
         finally:
             runtime.clear_idea_tool_context()
+
+    def run_hitl_agent_stage(
+        self,
+        agent: str,
+        *,
+        idea: Dict[str, Any],
+        provider: str,
+        timeout: Optional[int],
+        full_permissions: bool,
+        manager_objective: str = "",
+        invocation_id: str = "",
+    ) -> Dict[str, Any]:
+        """Dispatch a fixed-pipeline or manager-requested agent through one HITL route."""
+        from core.manager_callable_agents import manager_callable_agent
+
+        agent = manager_callable_agent(agent)
+        if agent == "resource_finder":
+            return self._run_resource_finder_hitl(
+                idea=idea,
+                provider=provider,
+                timeout=timeout,
+                full_permissions=full_permissions,
+                manager_objective=manager_objective,
+                invocation_id=invocation_id,
+            )
+        raise RuntimeError(f"No HITL stage executor is registered for {agent}")
+
+    @staticmethod
+    def _with_manager_resource_objective(prompt: str, objective: str) -> str:
+        objective = str(objective or "").strip()
+        if not objective:
+            return prompt
+        return (
+            f"{prompt.rstrip()}\n\n"
+            "## MANAGER-REQUESTED RESOURCE REFRESH\n\n"
+            "This is a focused follow-up resource run requested between AutoResearch "
+            "iterations. Preserve useful existing resources and investigate this gap:\n\n"
+            f"{objective}\n"
+        )
 
     def _wait_for_human_approval(self) -> Dict[str, Any]:
         """Wait for human to review resources and approve continuation."""
