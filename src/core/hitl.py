@@ -1887,7 +1887,10 @@ class HitlRuntime:
         *,
         worker_name: str,
     ) -> Dict[str, Any]:
-        self._join_live_worker_request_handler(expected_kind="proposal")
+        # Finish any active runtime-held request before deciding whether the
+        # proposer needs replacement, including validation before its durable record.
+        with self._worker_request_lock:
+            pass
         cancelled = self._cancelled_worker_command_result(
             result,
             phase="proposal",
