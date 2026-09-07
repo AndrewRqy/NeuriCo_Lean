@@ -1502,24 +1502,12 @@ class HitlRuntime:
             ),
         }
 
-    def _join_live_worker_request_handler(self, *, expected_kind: str) -> bool:
-        """Wait for the in-process owner of a durable worker request."""
-        from core.hitl_runtime_state import HitlRuntimeState
-
-        pending = HitlRuntimeState(self.work_dir).pending_worker_command()
-        if (
-            not isinstance(pending, dict)
-            or str(pending.get("kind", "")).strip() != expected_kind
-            or not self._worker_request_lock.locked()
-        ):
-            return False
-
-        # The HTTP handler owns this lock across manager/human review and all
-        # runtime transition work. Joining it preserves the single ordered
-        # completion path when the provider exits before its command child.
-        self._worker_request_lock.acquire()
-        self._worker_request_lock.release()
-        return True
+    def _join_live_worker_request_handler(self) -> None:
+        """Finish any active runtime-held request before handling worker exit."""
+        # The handler owns this lock from validation, before its durable record
+        # exists, through review and result handling.
+        with self._worker_request_lock:
+            pass
 
     def idea_tool_env(self, base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         env = dict(base_env or os.environ)
@@ -1887,10 +1875,7 @@ class HitlRuntime:
         *,
         worker_name: str,
     ) -> Dict[str, Any]:
-        # Finish any active runtime-held request before deciding whether the
-        # proposer needs replacement, including validation before its durable record.
-        with self._worker_request_lock:
-            pass
+        self._join_live_worker_request_handler()
         cancelled = self._cancelled_worker_command_result(
             result,
             phase="proposal",
@@ -3326,7 +3311,7 @@ class HitlRuntime:
         live tool-server and request state and gives a continuation worker the runtime
         prompt that the lost worker should have continued from.
         """
-        self._join_live_worker_request_handler(expected_kind="phase_finish")
+        self._join_live_worker_request_handler()
         cancelled = self._cancelled_worker_command_result(
             result,
             phase=phase,
