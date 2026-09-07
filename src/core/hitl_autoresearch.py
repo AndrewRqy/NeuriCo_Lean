@@ -75,6 +75,7 @@ from core.scoring_seal import (
     remove_public_sealed_paths,
     seal_scoring_files,
     sealed_dir_for,
+    verify_sealed_scoring_manifest,
 )
 
 HitlCommentModeHook = Callable[..., Dict[str, Any]]
@@ -1502,6 +1503,11 @@ class HitlAutoResearchController:
         runtime = self._proposal_hitl_runtime()
         request_kind = str(pending.get("kind", "")).strip()
 
+        # Recovery must reconnect to the original evaluator before relaunching
+        # a worker; never reconstruct its authority from public candidate files.
+        sealed_path = sealed_dir_for(self.work_dir)
+        verify_sealed_scoring_manifest(sealed_path)
+
         if request_kind == "proposal":
             runtime.prepare_idea_tool_context(
                 hitl_stage="proposal",
@@ -1553,6 +1559,7 @@ class HitlAutoResearchController:
             parent_node_id=parent_sha,
             attempt_id=attempt_id,
             attempt_dir=recovery.removed_attempt_dir,
+            sealed_scoring={"path": sealed_path},
             resume_pending=request_kind != "proposal",
         )
         scored_candidate = comment_result.get("scored_candidate")
@@ -2216,7 +2223,7 @@ class HitlAutoResearchController:
         parent_node_id: str,
         attempt_id: str,
         attempt_dir: Path,
-        sealed_scoring: Optional[Dict[str, Optional[Path]]] = None,
+        sealed_scoring: Dict[str, Optional[Path]],
         resume_pending: bool = False,
     ) -> Dict[str, Any]:
         if self.hitl_comment_mode is None:
