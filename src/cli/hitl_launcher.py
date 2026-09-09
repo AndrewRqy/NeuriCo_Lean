@@ -140,7 +140,12 @@ class HitlRunController:
                             )
                             stale_request.unlink(missing_ok=True)
             select_hitl_manager_provider(self.work_dir, provider)
-            continuation = HitlFrontierStore(self.work_dir).exists()
+            from core.hitl_autoresearch import initial_publication_requires_resume
+
+            continuation = (
+                HitlFrontierStore(self.work_dir).exists()
+                and not initial_publication_requires_resume(self.work_dir)
+            )
             mode = "continue" if continuation else "fresh"
             request_id = uuid.uuid4().hex
             request = {

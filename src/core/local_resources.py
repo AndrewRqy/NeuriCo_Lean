@@ -349,7 +349,7 @@ def workspace_contract_copy(idea_spec: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def stage_local_resources(work_dir: Path, idea_spec: Dict[str, Any],
-                          base_dir: Path = None) -> int:
+                          base_dir: Path = None, *, preserve_existing: bool = False) -> int:
     """
     Copy declared local resources into the workspace and rewrite their paths.
 
@@ -374,6 +374,8 @@ def stage_local_resources(work_dir: Path, idea_spec: Dict[str, Any],
         work_dir: Workspace root directory
         idea_spec: Full idea specification (mutated in place)
         base_dir: Directory to resolve relative source paths against
+        preserve_existing: Reuse already-reviewed staged inputs during initial
+            resume; never refresh or supply missing files in that case.
 
     Returns:
         Number of resources actually copied this pass (0 if none needed)
@@ -411,7 +413,9 @@ def stage_local_resources(work_dir: Path, idea_spec: Dict[str, Any],
             # A reloaded original contract (path not yet rewritten) whose
             # function is already on disk: refresh from source so the
             # recorded sha256 is computed from the bytes actually staged.
-            refresh_function = (kind == 'functions' and not already_staged
+            if preserve_existing and not dst.exists():
+                raise FileNotFoundError(f"Reviewed local resource is missing: {dst}")
+            refresh_function = (not preserve_existing and kind == 'functions' and not already_staged
                                 and dst.exists() and src_available)
 
             if dst.exists() and not refresh_function:

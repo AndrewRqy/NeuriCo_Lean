@@ -264,6 +264,23 @@ def _initial_node_result_from_publication(
     )
 
 
+def initial_publication_requires_resume(work_dir: Path) -> bool:
+    """A partially published initial node is not yet an iteration frontier."""
+    transition = HitlRuntimeState(work_dir).initial_root_publication_transition()
+    return isinstance(transition, dict) and transition.get("status") != "completed"
+
+
+def prepare_initial_hitl_resume(work_dir: Path) -> bool:
+    """Restore initial state before a manager or new worker can act on it."""
+    from core.pipeline_orchestrator import ResearchPipelineOrchestrator
+
+    if initial_publication_requires_resume(work_dir):
+        return True
+    return ResearchPipelineOrchestrator(
+        work_dir=work_dir, hitl_autoresearch=True,
+    ).prepare_initial_resume()
+
+
 def run_fresh_hitl_autoresearch_initial_node(
     *,
     idea: Dict[str, Any],
