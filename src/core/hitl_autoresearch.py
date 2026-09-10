@@ -1447,7 +1447,15 @@ class HitlAutoResearchController:
                     )
 
             runtime = self._proposal_hitl_runtime()
-            premise_idea_id = self._latest_frontier_manager_decision_id(runtime)
+            persisted_premise = (
+                str(pending_boundary.get("premise_idea_id", "")).strip()
+                if preparation_is_persisted
+                else ""
+            )
+            premise_idea_id = persisted_premise or self._proposal_preparation_premise_id(
+                runtime,
+                parent_sha,
+            )
 
             def persist_decision(decision: Dict[str, Any]) -> Dict[str, Any]:
                 record = runtime.log_proposal_preparation_decision(
@@ -1463,6 +1471,7 @@ class HitlAutoResearchController:
 
             decision = runtime.manager.begin_proposal_preparation(
                 parent_sha=parent_sha,
+                premise_idea_id=premise_idea_id,
                 on_decision=persist_decision,
             )
             if decision.get("choice") == "proceed":
@@ -1490,19 +1499,6 @@ class HitlAutoResearchController:
             raise RuntimeError("No manager-callable agent runner is configured.")
 
         request_id = str(action.get("request_id", ""))
-        base_context_sha = self.hitl_frontier.resource_context(parent_sha)
-        resuming_worker = worker_command_requires_resume(
-            runtime_state.pending_worker_command()
-        )
-        if (
-            not resuming_worker
-            and base_context_sha
-            and self.checkpoints.current_sha() != base_context_sha
-        ):
-            self.checkpoints.restore_checkpoint(
-                base_context_sha,
-                clean_untracked_public=True,
-            )
         sealed_dir: Optional[Path] = None
         try:
             sealed_dir = seal_scoring_files(self.work_dir, immutable=True)
@@ -1560,6 +1556,50 @@ class HitlAutoResearchController:
             max_active_nodes=MAX_ACTIVE_HITL_FRONTIER_NODES,
             on_prune=persist_prune,
         )
+
+    @staticmethod
+    def _proposal_preparation_premise_id(
+        runtime: HitlRuntime,
+        parent_sha: str,
+    ) -> str:
+        """Use the latest manager choice, or establish the scored root as evidence."""
+        for record in reversed(runtime.log.records()):
+            if (
+                record.get("pipeline_stage") == "experiment_runner"
+                and record.get("idea_type") == "decision"
+                and record.get("level") == "B"
+                and record.get("actor") == "manager"
+            ):
+                idea_id = str(record.get("idea_id", "")).strip()
+                if idea_id:
+                    return idea_id
+        parent = str(parent_sha).strip()
+        record = runtime.log.append(
+            {
+                "pipeline_stage": "experiment_runner",
+                "hitl_stage": "review",
+                "idea_type": "evidence",
+                "idea_category": "experiment_result",
+                "level": "C",
+                "actor": "experiment_runner",
+                "premises": [],
+                "context": f"Scored AutoResearch frontier node {parent} is selected.",
+                "evidence": (
+                    "Runtime has an accepted scored frontier node available as the "
+                    "workspace basis for the next proposal."
+                ),
+                "related_artifacts": [
+                    {
+                        "path": "scoring/results.json",
+                        "description": "Objective scoring result for the selected frontier node.",
+                    }
+                ],
+                "raised": False,
+                "parent_node_id": parent,
+            },
+            idempotent=True,
+        )
+        return str(record["idea_id"])
 
     @staticmethod
     def _latest_frontier_manager_decision_id(runtime: HitlRuntime) -> str:

@@ -2009,17 +2009,27 @@ class HitlManager:
         self,
         *,
         parent_sha: str,
+        premise_idea_id: str,
         on_decision: Callable[[Dict[str, Any]], Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Wait for one durable proceed-or-insert decision before a proposal."""
         from core.hitl import _load_hitl_template
 
         kind = "prepare_proposal"
+        premise = str(premise_idea_id).strip()
+        if not premise:
+            raise HitlRuntimeStateError("Proposal preparation requires a finalized premise")
         action = self.runtime_state.begin_next_autoresearch_action(
-            {"kind": kind, "parent_sha": str(parent_sha).strip()}
+            {
+                "kind": kind,
+                "parent_sha": str(parent_sha).strip(),
+                "premise_idea_id": premise,
+            }
         )
         if str(action.get("parent_sha", "")).strip() != str(parent_sha).strip():
             raise HitlRuntimeStateError("Proposal preparation targets a different frontier")
+        if str(action.get("premise_idea_id", "")).strip() != premise:
+            raise HitlRuntimeStateError("Proposal preparation has a different persisted premise")
 
         def complete_recorded() -> Dict[str, Any]:
             current = self.runtime_state.snapshot().get("next_autoresearch_action")

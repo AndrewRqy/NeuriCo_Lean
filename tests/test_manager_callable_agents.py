@@ -186,20 +186,26 @@ def test_completed_context_is_restored_before_next_proposal(tmp_path):
     assert restored == ["context"]
 
 
-def test_interrupted_agent_resume_preserves_inflight_workspace(tmp_path, monkeypatch):
+@pytest.mark.parametrize("between_commands", [False, True])
+def test_interrupted_agent_resume_preserves_inflight_workspace(
+    tmp_path,
+    monkeypatch,
+    between_commands,
+):
     state = HitlRuntimeState(tmp_path)
     state.begin_next_autoresearch_action(
         {"kind": "prepare_proposal", "parent_sha": "parent"}
     )
     state.request_manager_agent_action(_request())
-    state.begin_worker_command(
-        {
-            "request_key": "resource-finder-plan",
-            "kind": "phase_finish",
-            "pipeline_stage": "resource_finder",
-            "hitl_stage": "plan",
-        }
-    )
+    if not between_commands:
+        state.begin_worker_command(
+            {
+                "request_key": "resource-finder-plan",
+                "kind": "phase_finish",
+                "pipeline_stage": "resource_finder",
+                "hitl_stage": "plan",
+            }
+        )
     observed = []
 
     class FakeCheckpoints:
@@ -237,6 +243,106 @@ def test_interrupted_agent_resume_preserves_inflight_workspace(tmp_path, monkeyp
     controller._advance_manager_agent_action("parent")
 
     assert observed == ["inflight"]
+
+
+def test_first_proposal_after_bootstrap_uses_scored_root_as_premise(tmp_path):
+    log = HitlIdeaLog(tmp_path)
+    runtime = HitlRuntime.__new__(HitlRuntime)
+    runtime.log = log
+
+    class FakeManager:
+        @staticmethod
+        def begin_proposal_preparation(*, parent_sha, premise_idea_id, on_decision):
+            assert parent_sha == "root"
+            assert premise_idea_id == log.records()[0]["idea_id"]
+            return on_decision(
+                {
+                    "choice": "proceed",
+                    "reason": "The scored root already provides enough evidence.",
+                }
+            )
+
+    runtime.manager = FakeManager()
+
+    class FakeCheckpoints:
+        @staticmethod
+        def current_sha():
+            return "root"
+
+    controller = hitl_autoresearch.HitlAutoResearchController.__new__(
+        hitl_autoresearch.HitlAutoResearchController
+    )
+    controller.work_dir = tmp_path
+    controller.checkpoints = FakeCheckpoints()
+    controller.hitl_frontier = type(
+        "FakeFrontier", (), {"resource_context": lambda self, _parent: None}
+    )()
+    controller._proposal_hitl_runtime = lambda: runtime
+
+    controller._prepare_next_proposal("root")
+
+    records = log.records()
+    assert len(records) == 2
+    assert records[0]["idea_type"] == "evidence"
+    assert records[0]["parent_node_id"] == "root"
+    assert records[1]["idea_type"] == "decision"
+    assert records[1]["decision"] == "O1"
+    assert records[1]["premises"] == [records[0]["idea_id"]]
+
+
+def test_replayed_proceed_decision_reuses_persisted_premise(tmp_path):
+    log = HitlIdeaLog(tmp_path)
+    runtime = HitlRuntime.__new__(HitlRuntime)
+    runtime.log = log
+    state = HitlRuntimeState(tmp_path)
+    runtime.manager = _manager(tmp_path, state)
+
+    premise = hitl_autoresearch.HitlAutoResearchController._proposal_preparation_premise_id(
+        runtime,
+        "root",
+    )
+    state.begin_next_autoresearch_action(
+        {
+            "kind": "prepare_proposal",
+            "parent_sha": "root",
+            "premise_idea_id": premise,
+        }
+    )
+    decision = {
+        "choice": "proceed",
+        "reason": "The scored root already provides enough evidence.",
+        "parent_sha": "root",
+    }
+    state.record_next_autoresearch_action_decision("prepare_proposal", decision)
+    logged = runtime.log_proposal_preparation_decision(
+        choice="proceed",
+        reason=decision["reason"],
+        parent_sha="root",
+        premise_idea_id=premise,
+    )
+
+    class FakeCheckpoints:
+        @staticmethod
+        def current_sha():
+            return "root"
+
+    controller = hitl_autoresearch.HitlAutoResearchController.__new__(
+        hitl_autoresearch.HitlAutoResearchController
+    )
+    controller.work_dir = tmp_path
+    controller.checkpoints = FakeCheckpoints()
+    controller.hitl_frontier = type(
+        "FakeFrontier", (), {"resource_context": lambda self, _parent: None}
+    )()
+    controller._proposal_hitl_runtime = lambda: runtime
+
+    controller._prepare_next_proposal("root")
+
+    records = log.records()
+    assert len(records) == 2
+    assert records[1]["idea_id"] == logged["idea_id"]
+    assert records[1]["premises"] == [premise]
+    assert state.snapshot()["next_autoresearch_action"] is None
 
 
 def test_plan_approval_is_scoped_to_manager_invocation():
