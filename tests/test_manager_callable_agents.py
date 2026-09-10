@@ -19,6 +19,7 @@ from core.hitl import HitlIdeaLog, HitlRuntime  # noqa: E402
 from core.hitl_frontier import HitlFrontierStore  # noqa: E402
 from core.hitl_manager_react import HitlManager  # noqa: E402
 from core.hitl_runtime_state import HitlRuntimeState, HitlRuntimeStateError  # noqa: E402
+from core.manager_callable_agents import manager_agent_provenance  # noqa: E402
 from core.pipeline_orchestrator import ResearchPipelineOrchestrator  # noqa: E402
 
 
@@ -248,6 +249,120 @@ def test_interrupted_agent_resume_preserves_inflight_workspace(
     controller._advance_manager_agent_action("parent")
 
     assert observed == ["inflight"]
+
+
+@pytest.mark.parametrize("with_pending_request", [False, True])
+def test_manager_invocation_boundary_rolls_back_before_continuation(
+    tmp_path,
+    monkeypatch,
+    with_pending_request,
+):
+    checkpoints = CheckpointManager(tmp_path)
+    artifact = tmp_path / "resources.md"
+    artifact.write_text("baseline\n", encoding="utf-8")
+    checkpoints.create_checkpoint("baseline")
+
+    state = HitlRuntimeState(tmp_path)
+    state.begin_next_autoresearch_action(
+        {"kind": "prepare_proposal", "parent_sha": checkpoints.current_sha()}
+    )
+    state.request_manager_agent_action(_request())
+    state.update_manager_agent_action(
+        "request-1",
+        status="running",
+        attempt_count=1,
+    )
+    orchestrator = ResearchPipelineOrchestrator(tmp_path, hitl_autoresearch=True)
+    orchestrator.state.start_stage("resource_finder")
+    orchestrator.state.complete_stage("resource_finder", True, {"initial": True})
+    orchestrator._stage_rollback(
+        "resource_finder",
+        "manager invocation boundary",
+        provenance=manager_agent_provenance("request-1"),
+    )
+    orchestrator.state.start_stage("resource_finder")
+    artifact.write_text("partial invocation\n", encoding="utf-8")
+    if with_pending_request:
+        provenance = manager_agent_provenance("request-1")
+        runtime_state = HitlRuntimeState(tmp_path)
+        runtime_state.record_worker_continuation(
+            {
+                "pipeline_stage": "resource_finder",
+                "hitl_stage": "execution",
+                "actor": "resource_finder",
+                "provenance": provenance,
+                "prompt_block": "resume resource finding",
+            }
+        )
+        runtime_state.begin_worker_command(
+            {
+                "request_key": "resource-finder-finish",
+                "kind": "phase_finish",
+                "pipeline_stage": "resource_finder",
+                "hitl_stage": "execution",
+                "provenance": provenance,
+            }
+        )
+
+    class FakeRuntime:
+        @staticmethod
+        def abandon_pending_worker_request_for_rollback(_reason):
+            pass
+
+        @staticmethod
+        def reload_manager_after_state_restore():
+            pass
+
+        @staticmethod
+        def clear_idea_tool_context():
+            pass
+
+    recovering = ResearchPipelineOrchestrator(tmp_path, hitl_autoresearch=True)
+    monkeypatch.setattr(recovering, "_create_hitl_runtime", lambda *_a, **_k: FakeRuntime())
+
+    recovering.prepare_initial_resume()
+
+    assert artifact.read_text(encoding="utf-8") == "baseline\n"
+    recovered_action = HitlRuntimeState(tmp_path).manager_agent_action()
+    assert recovered_action["request_id"] == "request-1"
+    assert recovered_action["status"] == "running"
+    assert recovered_action["attempt_count"] == 1
+    assert HitlRuntimeState(tmp_path).pending_worker_command() is None
+    assert HitlRuntimeState(tmp_path).worker_continuation() is None
+    assert recovering.state.is_stage_completed("resource_finder")
+    assert recovering.state.get_runtime_recovery("initial_stage") is None
+
+
+def test_manager_invocation_boundary_rejects_mismatched_provenance(tmp_path):
+    checkpoints = CheckpointManager(tmp_path)
+    (tmp_path / "resources.md").write_text("baseline\n", encoding="utf-8")
+    checkpoints.create_checkpoint("baseline")
+    state = HitlRuntimeState(tmp_path)
+    state.begin_next_autoresearch_action(
+        {"kind": "prepare_proposal", "parent_sha": checkpoints.current_sha()}
+    )
+    state.request_manager_agent_action(_request())
+    state.update_manager_agent_action("request-1", status="running", attempt_count=1)
+    orchestrator = ResearchPipelineOrchestrator(tmp_path, hitl_autoresearch=True)
+    orchestrator.state.start_stage("resource_finder")
+    rollback = pipeline_orchestrator.HitlStageRollback.capture(
+        tmp_path,
+        "manager invocation boundary",
+    )
+    orchestrator.state.set_runtime_recovery(
+        "initial_stage",
+        {
+            "stage": "resource_finder",
+            "provenance": manager_agent_provenance("request-2"),
+            **rollback.descriptor(),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="does not match its persisted invocation"):
+        ResearchPipelineOrchestrator(
+            tmp_path,
+            hitl_autoresearch=True,
+        ).prepare_initial_resume()
 
 
 def test_first_proposal_after_bootstrap_uses_scored_root_as_premise(tmp_path):

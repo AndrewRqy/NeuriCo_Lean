@@ -656,8 +656,10 @@ class ResearchRunner:
             if initial_publication_requires_resume(work_dir):
                 continue_autoresearch = False
                 autoresearch = True
-            if autoresearch:
-                preserve_initial_inputs = prepare_initial_hitl_resume(work_dir)
+            if autoresearch or continue_autoresearch:
+                recovered_initial_state = prepare_initial_hitl_resume(work_dir)
+                if autoresearch:
+                    preserve_initial_inputs = recovered_initial_state
 
         # Create subdirectories
         (work_dir / "logs").mkdir(parents=True, exist_ok=True)

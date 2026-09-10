@@ -370,6 +370,40 @@ class ResearchPipelineOrchestrator:
             raise RuntimeError("Initial worker request has no matching stage continuation.")
         return pending
 
+    def _manager_agent_boundary_invocation(
+        self,
+        boundary: Dict[str, Any],
+        stage: str,
+    ) -> str:
+        """Validate and return the manager invocation owning a stage boundary."""
+        provenance = boundary.get("provenance") or {}
+        if not provenance:
+            return ""
+        if provenance.get("kind") != "manager_agent":
+            raise RuntimeError("Initial-stage rollback boundary has unknown provenance.")
+        invocation_id = str(provenance.get("invocation_id", "")).strip()
+        runtime_state = HitlRuntimeState(self.work_dir)
+        action = runtime_state.manager_agent_action() or {}
+        if (
+            not invocation_id
+            or action.get("request_id") != invocation_id
+            or action.get("agent") != stage
+            or action.get("status") != "running"
+            or action.get("context_sha")
+        ):
+            raise RuntimeError(
+                "Manager-agent rollback boundary does not match its persisted invocation."
+            )
+        for record in (
+            runtime_state.pending_worker_command(),
+            runtime_state.worker_continuation(),
+        ):
+            if isinstance(record, dict) and record.get("provenance") != provenance:
+                raise RuntimeError(
+                    "Manager-agent rollback state has mismatched invocation provenance."
+                )
+        return invocation_id
+
     def prepare_initial_resume(self) -> bool:
         """Recover before new work; return whether reviewed inputs must be preserved."""
         if not self.hitl_autoresearch:
@@ -396,6 +430,18 @@ class ResearchPipelineOrchestrator:
                 raise RuntimeError("Unknown initial stage rollback boundary.")
             if self.state.is_stage_completed(stage):
                 self._discard_initial_boundary(boundary)
+            elif invocation_id := self._manager_agent_boundary_invocation(boundary, stage):
+                rollback = HitlStageRollback.from_descriptor(self.work_dir, boundary)
+                runtime = self._create_hitl_runtime(stage, invocation_id=invocation_id)
+                try:
+                    rollback.restore(
+                        runtime,
+                        "Recovering interrupted manager-agent invocation.",
+                        cleanup_label="restored",
+                    )
+                finally:
+                    runtime.clear_idea_tool_context()
+                self.state = PipelineState(self.work_dir)
             elif self._initial_stage_request(stage):
                 HitlStageRollback.from_descriptor(self.work_dir, boundary)
                 if stage == "experiment_runner":
@@ -443,13 +489,21 @@ class ResearchPipelineOrchestrator:
         self.state.clear_runtime_recovery("initial_stage")
 
     def _stage_rollback(
-        self, stage: str, message: str, *, repair: bool = False
+        self,
+        stage: str,
+        message: str,
+        *,
+        repair: bool = False,
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> HitlStageRollback:
+        expected_provenance = dict(provenance or {})
         if self.hitl_autoresearch:
             existing = self.state.get_runtime_recovery("initial_stage")
             if existing:
                 if existing.get("stage") != stage:
                     raise RuntimeError("Another initial stage still owns the rollback boundary.")
+                if dict(existing.get("provenance") or {}) != expected_provenance:
+                    raise RuntimeError("Stage rollback boundary belongs to another invocation.")
                 return HitlStageRollback.from_descriptor(self.work_dir, existing)
             if self._initial_stage_request(stage):
                 experiment = self.state.get_runtime_recovery("experiment_runner")
@@ -481,7 +535,12 @@ class ResearchPipelineOrchestrator:
         )
         if self.hitl_autoresearch:
             self.state.set_runtime_recovery(
-                "initial_stage", {"stage": stage, **rollback.descriptor()}
+                "initial_stage",
+                {
+                    "stage": stage,
+                    **({"provenance": expected_provenance} if expected_provenance else {}),
+                    **rollback.descriptor(),
+                },
             )
         return rollback
 
@@ -1309,7 +1368,19 @@ class ResearchPipelineOrchestrator:
         print("─" * 80)
         print()
 
-        if invocation_id or not self._initial_stage_request("resource_finder"):
+        invocation_provenance: Optional[Dict[str, Any]] = None
+        rollback: Optional[HitlStageRollback] = None
+        if invocation_id:
+            from core.manager_callable_agents import manager_agent_provenance
+
+            invocation_provenance = manager_agent_provenance(invocation_id)
+            rollback = self._stage_rollback(
+                "resource_finder",
+                "HITL resource finder starting state",
+                provenance=invocation_provenance,
+            )
+            self.state.start_stage("resource_finder")
+        elif not self._initial_stage_request("resource_finder"):
             self.state.start_stage("resource_finder")
         runtime = self._create_hitl_runtime(
             "resource_finder",
@@ -1330,10 +1401,11 @@ class ResearchPipelineOrchestrator:
         }
         # Keep ordinary-stage HITL failure semantics consistent: a failed
         # resource run must not leave public artifacts or private idea state.
-        rollback = self._stage_rollback(
-            "resource_finder",
-            "HITL resource finder starting state",
-        )
+        if rollback is None:
+            rollback = self._stage_rollback(
+                "resource_finder",
+                "HITL resource finder starting state",
+            )
 
         def resource_artifact_validator() -> Dict[str, Any]:
             required = [
@@ -1428,7 +1500,6 @@ class ResearchPipelineOrchestrator:
                         if finish.get("approved")
                         else finalize_failed(finish or result)
                     )
-            from core.manager_callable_agents import manager_agent_provenance
             return run_plan_centered_hitl_stage(
                 runtime=runtime,
                 actor="resource_finder",
@@ -1442,7 +1513,7 @@ class ResearchPipelineOrchestrator:
                 ),
                 on_approved=complete_approved,
                 on_failed=finalize_failed,
-                provenance=(manager_agent_provenance(invocation_id) if invocation_id else None),
+                provenance=invocation_provenance,
             )
 
         except HitlRunStopRequested:
