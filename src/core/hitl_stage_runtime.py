@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict
 
 from core.hitl_git_state import HitlGitSnapshot, HitlGitStateStore
 from core.hitl_run_control import HitlRunStopRequested, hitl_run_stop_requested
+from core.hitl_runtime_state import HitlRuntimeState, worker_command_requires_resume
 
 
 WorkerLauncher = Callable[..., Dict[str, Any]]
@@ -74,12 +75,45 @@ def run_plan_centered_hitl_stage(
     on_failed: StageFailureHandler,
 ) -> Dict[str, Any]:
     """Run the shared plan/execution state machine for ordinary HITL stages."""
-    plan_approved = getattr(
+    # A held request's saved phase takes precedence over plan approval on restart.
+    state = HitlRuntimeState(runtime.work_dir)
+    pending = state.pending_worker_command()
+    resume_pending = worker_command_requires_resume(pending)
+    if resume_pending:
+        continuation = state.worker_continuation() or {}
+        saved_phase = str(continuation.get("hitl_stage", "")).strip()
+        if (
+            pending.get("pipeline_stage") != runtime.pipeline_stage
+            or continuation.get("pipeline_stage") != runtime.pipeline_stage
+            or continuation.get("actor") != actor
+            or pending.get("provenance")
+            or continuation.get("provenance")
+            or not str(pending.get("request_key") or "").strip()
+            or pending.get("kind") not in {"phase_finish", "raised_idea"}
+            or saved_phase not in {"plan", "execution", "review"}
+            or not str(continuation.get("prompt_block") or "").strip()
+            or (
+                pending.get("status") != "resolved"
+                and pending.get("hitl_stage") != saved_phase
+            )
+        ):
+            raise RuntimeError("Pending HITL stage request has no matching worker continuation.")
+        from core.hitl import _load_hitl_template
+
+        runtime.prepare_idea_tool_context(
+            hitl_stage=saved_phase,
+            actor=actor,
+            phase_finish_validator=phase_finish_validator,
+            worker_prompt_contexts=worker_prompt_contexts,
+        )
+        prompt = _load_hitl_template("worker_resume_pending_request.txt")
+        log_prefix = plan_log_prefix if saved_phase == "plan" else execution_log_prefix
+        phase = "stage"
+    elif not getattr(
         runtime,
         "plan_has_required_approval",
         runtime.plan_has_human_approval,
-    )()
-    if not plan_approved:
+    )():
         runtime.prepare_idea_tool_context(
             hitl_stage="plan",
             actor=actor,
@@ -116,6 +150,7 @@ def run_plan_centered_hitl_stage(
         log_prefix=log_prefix,
         phase=phase,
         worker_name=worker_name,
+        record_continuation=not resume_pending,
     )
     if finish and finish.get("approved"):
         return on_approved(result, finish)
