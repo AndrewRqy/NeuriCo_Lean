@@ -114,7 +114,12 @@ def _raise_if_hitl_worker_stopped(result: Dict[str, Any]) -> None:
 def _manager_agent_action_inflight(runtime_state: HitlRuntimeState) -> bool:
     """Whether a persisted manager insertion still needs standard execution."""
     action = runtime_state.manager_agent_action()
-    return isinstance(action, dict) and not bool(action.get("context_sha"))
+    status = str((action or {}).get("status") or "pending").strip()
+    return (
+        isinstance(action, dict)
+        and not bool(action.get("context_sha"))
+        and status in {"pending", "running", "retry_pending", "publishing"}
+    )
 
 
 @dataclass(frozen=True)
@@ -1447,6 +1452,12 @@ class HitlAutoResearchController:
                     )
 
             runtime = self._proposal_hitl_runtime()
+            failed_action = runtime_state.manager_agent_action()
+            if not (
+                isinstance(failed_action, dict)
+                and failed_action.get("status") == "failed"
+            ):
+                failed_action = None
             persisted_premise = (
                 str(pending_boundary.get("premise_idea_id", "")).strip()
                 if preparation_is_persisted
@@ -1467,12 +1478,24 @@ class HitlAutoResearchController:
                     objective=str(decision.get("objective", "")).strip(),
                     request_id=str(decision.get("request_id", "")).strip(),
                 )
+                if failed_action is not None:
+                    # Retire the old failure only after its replacement decision
+                    # is logged, but before that decision boundary is completed.
+                    # Replaying a crash in either half is therefore idempotent.
+                    runtime_state.clear_failed_manager_agent_action(
+                        str(failed_action.get("request_id", ""))
+                    )
                 return {**decision, "idea_id": record["idea_id"]}
 
+            preparation_kwargs = {
+                "parent_sha": parent_sha,
+                "premise_idea_id": premise_idea_id,
+                "on_decision": persist_decision,
+            }
+            if failed_action is not None:
+                preparation_kwargs["prior_agent_failure"] = failed_action
             decision = runtime.manager.begin_proposal_preparation(
-                parent_sha=parent_sha,
-                premise_idea_id=premise_idea_id,
-                on_decision=persist_decision,
+                **preparation_kwargs,
             )
             if decision.get("choice") == "proceed":
                 return
@@ -1482,6 +1505,8 @@ class HitlAutoResearchController:
 
     def _advance_manager_agent_action(self, parent_sha: str) -> None:
         """Run one bound manager insertion through the standard HITL executor."""
+        from core.manager_callable_agents import MAX_MANAGER_AGENT_ATTEMPTS
+
         runtime_state = HitlRuntimeState(self.work_dir)
         action = runtime_state.manager_agent_action()
         if not isinstance(action, dict):
@@ -1495,35 +1520,124 @@ class HitlAutoResearchController:
             raise HitlRuntimeStateError("Manager agent action has not been bound to a frontier")
         if str(action.get("parent_sha", "")) != parent_sha:
             raise HitlRuntimeStateError("Manager agent action is bound to a different frontier")
+        if action.get("status") == "publishing":
+            context_sha = str(action.get("candidate_context_sha", "")).strip()
+            if not context_sha or not self.checkpoints.checkpoint_exists(context_sha):
+                raise HitlRuntimeStateError(
+                    "Manager agent publication has no valid context checkpoint"
+                )
+            self.hitl_frontier.retain_resource_context(parent_sha, context_sha)
+            runtime_state.update_manager_agent_action(
+                str(action.get("request_id", "")),
+                context_sha=context_sha,
+                status="completed",
+            )
+            return
         if self.manager_callable_agent_runner is None:
             raise RuntimeError("No manager-callable agent runner is configured.")
 
         request_id = str(action.get("request_id", ""))
-        sealed_dir: Optional[Path] = None
-        try:
-            sealed_dir = seal_scoring_files(self.work_dir, immutable=True)
-            result = self.manager_callable_agent_runner(
-                str(action.get("agent", "")),
-                str(action.get("objective", "")),
+        while True:
+            action = runtime_state.manager_agent_action() or {}
+            attempt_count = int(action.get("attempt_count") or 0)
+            recovery_count = int(action.get("recovery_count") or 0)
+            if action.get("status") == "running":
+                if attempt_count >= MAX_MANAGER_AGENT_ATTEMPTS:
+                    runtime_state.update_manager_agent_action(
+                        request_id,
+                        status="failed",
+                        last_error=str(
+                            action.get("last_error")
+                            or "Manager-requested agent was interrupted during its final attempt."
+                        ),
+                    )
+                    return
+                recovery_count += 1
+                action = runtime_state.update_manager_agent_action(
+                    request_id,
+                    status="retry_pending",
+                    recovery_count=recovery_count,
+                    last_error=str(
+                        action.get("last_error")
+                        or "Manager-requested agent was interrupted and rolled back."
+                    ),
+                )
+            if attempt_count >= MAX_MANAGER_AGENT_ATTEMPTS:
+                runtime_state.update_manager_agent_action(
+                    request_id,
+                    status="failed",
+                    last_error=str(
+                        action.get("last_error")
+                        or "Manager-requested agent exhausted its automatic retry."
+                    ),
+                )
+                return
+            runtime_state.update_manager_agent_action(
                 request_id,
+                status="running",
+                attempt_count=attempt_count + 1,
             )
-        finally:
-            from core.scoring_seal import unseal_scoring_files
+            sealed_dir: Optional[Path] = None
+            try:
+                sealed_dir = seal_scoring_files(self.work_dir, immutable=True)
+                result = self.manager_callable_agent_runner(
+                    str(action.get("agent", "")),
+                    str(action.get("objective", "")),
+                    request_id,
+                )
+            finally:
+                from core.scoring_seal import unseal_scoring_files
 
-            unseal_scoring_files(self.work_dir, sealed_dir)
-        if not result.get("success"):
+                unseal_scoring_files(self.work_dir, sealed_dir)
+            if result.get("success"):
+                break
             if result.get("stopped"):
                 from core.hitl_run_control import raise_if_hitl_run_stop_requested
 
                 raise_if_hitl_run_stop_requested()
-            raise RuntimeError(str(result.get("error") or "Manager-requested agent run failed."))
+            error = str(result.get("error") or "Manager-requested agent run failed.")
+            if not result.get("hitl_rollback_completed"):
+                runtime_state.update_manager_agent_action(
+                    request_id,
+                    last_error=error,
+                )
+                raise RuntimeError(
+                    "Manager-requested agent failed without completing rollback: "
+                    f"{error}"
+                )
+            if result.get("hitl_terminal_failure"):
+                runtime_state.update_manager_agent_action(
+                    request_id,
+                    status="failed",
+                    last_error=error,
+                )
+                return
+            if attempt_count + 1 >= MAX_MANAGER_AGENT_ATTEMPTS:
+                runtime_state.update_manager_agent_action(
+                    request_id,
+                    status="failed",
+                    last_error=error,
+                )
+                return
+            runtime_state.update_manager_agent_action(
+                request_id,
+                status="retry_pending",
+                recovery_count=recovery_count + 1,
+                last_error=error,
+            )
         context = self.checkpoints.create_checkpoint(
             f"Manager-requested {action.get('agent')} context"
+        )
+        runtime_state.update_manager_agent_action(
+            request_id,
+            candidate_context_sha=context.sha,
+            status="publishing",
         )
         self.hitl_frontier.retain_resource_context(parent_sha, context.sha)
         runtime_state.update_manager_agent_action(
             request_id,
             context_sha=context.sha,
+            status="completed",
         )
 
     def _maintain_frontier_after_scored_iteration(self) -> str:
@@ -3070,17 +3184,14 @@ def run_hitl_autoresearch_loop(
             hitl_autoresearch=True,
             hitl_mode=hitl_mode,
         )
-        return orchestrator._run_hitl_stage_until_complete(
-            stage_name=agent,
-            run_stage=lambda: orchestrator.run_hitl_agent_stage(
-                agent,
-                idea=idea,
-                provider=provider,
-                timeout=resource_finder_timeout,
-                full_permissions=full_permissions,
-                manager_objective=objective,
-                invocation_id=invocation_id,
-            ),
+        return orchestrator.run_hitl_agent_stage(
+            agent,
+            idea=idea,
+            provider=provider,
+            timeout=resource_finder_timeout,
+            full_permissions=full_permissions,
+            manager_objective=objective,
+            invocation_id=invocation_id,
         )
 
     controller = HitlAutoResearchController(

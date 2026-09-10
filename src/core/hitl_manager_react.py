@@ -473,9 +473,16 @@ class HitlManager:
             if kind in {"prune_frontier", "select_frontier"}:
                 names.add(kind)
             if kind == "prepare_proposal" and action.get("status") == "pending":
+                manager_action = snapshot.get("manager_agent_action")
+                manager_action_status = (
+                    str(manager_action.get("status") or "pending").strip()
+                    if isinstance(manager_action, dict)
+                    else ""
+                )
                 if (
-                    isinstance(snapshot.get("manager_agent_action"), dict)
-                    and not snapshot["manager_agent_action"].get("context_sha")
+                    isinstance(manager_action, dict)
+                    and not manager_action.get("context_sha")
+                    and manager_action_status != "failed"
                 ):
                     names.add("request_agent_run")
                 else:
@@ -2011,6 +2018,7 @@ class HitlManager:
         parent_sha: str,
         premise_idea_id: str,
         on_decision: Callable[[Dict[str, Any]], Dict[str, Any]],
+        prior_agent_failure: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Wait for one durable proceed-or-insert decision before a proposal."""
         from core.hitl import _load_hitl_template
@@ -2051,10 +2059,18 @@ class HitlManager:
             self.runtime_state.clear_completed_next_autoresearch_action(kind)
             return result
 
-        self.notify_runtime(
-            _load_hitl_template("manager_prepare_proposal.txt"),
-            runtime_action_kind=kind,
-        )
+        prompt = _load_hitl_template("manager_prepare_proposal.txt")
+        if isinstance(prior_agent_failure, dict):
+            prompt = (
+                f"{prompt.rstrip()}\n\n"
+                "The previous manager-requested agent invocation was rolled back after "
+                "it could not complete within the automatic retry policy. Decide whether to "
+                "proceed with the current evidence or request a fresh agent invocation.\n"
+                f"Agent: {prior_agent_failure.get('agent', '')}\n"
+                f"Objective: {prior_agent_failure.get('objective', '')}\n"
+                f"Last error: {prior_agent_failure.get('last_error', '')}\n"
+            )
+        self.notify_runtime(prompt, runtime_action_kind=kind)
         while True:
             from core.hitl_run_control import raise_if_hitl_run_stop_requested
 

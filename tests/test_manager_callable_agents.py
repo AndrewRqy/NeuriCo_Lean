@@ -48,6 +48,9 @@ def test_agent_request_has_independent_scheduler_state(tmp_path):
 
     requested = state.request_manager_agent_action(_request())
     assert requested["parent_sha"] == "parent"
+    assert requested["status"] == "pending"
+    assert requested["attempt_count"] == 0
+    assert requested["recovery_count"] == 0
     assert "requested_agent_run" not in state.snapshot()["next_autoresearch_action"]
     assert HitlRuntimeState(tmp_path).manager_agent_action() == requested
     assert state.request_manager_agent_action(_request()) == requested
@@ -153,6 +156,8 @@ def test_scheduled_agent_uses_existing_seal_and_records_context(tmp_path, monkey
     ]
     completed = HitlRuntimeState(tmp_path).manager_agent_action()
     assert completed["context_sha"] == "context"
+    assert completed["status"] == "completed"
+    assert completed["attempt_count"] == 1
 
 
 def test_completed_context_is_restored_before_next_proposal(tmp_path):
@@ -412,6 +417,283 @@ def test_manager_invocation_uses_standard_pipeline_stage_tracking(tmp_path, monk
     assert b'"refresh": true' in orchestrator.state.state_file.read_bytes()
     assert stage_calls[0]["plan_log_prefix"].endswith("_request-1")
     assert stage_calls[0]["execution_log_prefix"].endswith("_request-1")
+    assert stage_calls[0]["provenance"] == {
+        "kind": "manager_agent",
+        "invocation_id": "request-1",
+    }
+
+
+def test_manager_invocation_retries_once_after_clean_rollback(tmp_path, monkeypatch):
+    state = HitlRuntimeState(tmp_path)
+    state.begin_next_autoresearch_action(
+        {"kind": "prepare_proposal", "parent_sha": "parent"}
+    )
+    state.request_manager_agent_action(_request())
+    calls = []
+
+    class FakeCheckpoints:
+        def create_checkpoint(self, message):
+            return Checkpoint("context", message)
+
+    controller = hitl_autoresearch.HitlAutoResearchController.__new__(
+        hitl_autoresearch.HitlAutoResearchController
+    )
+    controller.work_dir = tmp_path
+    controller.checkpoints = FakeCheckpoints()
+    controller.hitl_frontier = type(
+        "FakeFrontier",
+        (),
+        {"retain_resource_context": lambda self, parent, context: None},
+    )()
+    results = [
+        {"success": False, "error": "transient", "hitl_rollback_completed": True},
+        {"success": True},
+    ]
+    controller.manager_callable_agent_runner = lambda *_args: (
+        calls.append(_args) or results.pop(0)
+    )
+    monkeypatch.setattr(hitl_autoresearch, "seal_scoring_files", lambda *_a, **_k: Path("seal"))
+    monkeypatch.setattr(scoring_seal, "unseal_scoring_files", lambda *_a, **_k: None)
+
+    controller._advance_manager_agent_action("parent")
+
+    assert len(calls) == 2
+    completed = state.manager_agent_action()
+    assert completed["status"] == "completed"
+    assert completed["attempt_count"] == 2
+    assert completed["recovery_count"] == 1
+    assert completed["context_sha"] == "context"
+
+
+def test_manager_invocation_stops_after_one_automatic_retry(tmp_path, monkeypatch):
+    state = HitlRuntimeState(tmp_path)
+    state.begin_next_autoresearch_action(
+        {"kind": "prepare_proposal", "parent_sha": "parent"}
+    )
+    state.request_manager_agent_action(_request())
+    calls = []
+
+    controller = hitl_autoresearch.HitlAutoResearchController.__new__(
+        hitl_autoresearch.HitlAutoResearchController
+    )
+    controller.work_dir = tmp_path
+    controller.manager_callable_agent_runner = lambda *_args: (
+        calls.append(_args)
+        or {"success": False, "error": "deterministic", "hitl_rollback_completed": True}
+    )
+    monkeypatch.setattr(hitl_autoresearch, "seal_scoring_files", lambda *_a, **_k: Path("seal"))
+    monkeypatch.setattr(scoring_seal, "unseal_scoring_files", lambda *_a, **_k: None)
+
+    controller._advance_manager_agent_action("parent")
+
+    assert len(calls) == 2
+    failed = state.manager_agent_action()
+    assert failed["status"] == "failed"
+    assert failed["attempt_count"] == 2
+    assert failed["recovery_count"] == 1
+    assert failed["last_error"] == "deterministic"
+
+
+def test_terminal_manager_invocation_failure_is_not_retried(tmp_path, monkeypatch):
+    state = HitlRuntimeState(tmp_path)
+    state.begin_next_autoresearch_action(
+        {"kind": "prepare_proposal", "parent_sha": "parent"}
+    )
+    state.request_manager_agent_action(_request())
+    calls = []
+
+    controller = hitl_autoresearch.HitlAutoResearchController.__new__(
+        hitl_autoresearch.HitlAutoResearchController
+    )
+    controller.work_dir = tmp_path
+    controller.manager_callable_agent_runner = lambda *_args: (
+        calls.append(_args)
+        or {
+            "success": False,
+            "error": "manager backend exhausted",
+            "hitl_rollback_completed": True,
+            "hitl_terminal_failure": True,
+        }
+    )
+    monkeypatch.setattr(hitl_autoresearch, "seal_scoring_files", lambda *_a, **_k: Path("seal"))
+    monkeypatch.setattr(scoring_seal, "unseal_scoring_files", lambda *_a, **_k: None)
+
+    controller._advance_manager_agent_action("parent")
+
+    assert len(calls) == 1
+    failed = state.manager_agent_action()
+    assert failed["status"] == "failed"
+    assert failed["attempt_count"] == 1
+    assert failed["recovery_count"] == 0
+    assert failed["last_error"] == "manager backend exhausted"
+
+
+def test_manager_invocation_does_not_continue_without_clean_rollback(tmp_path, monkeypatch):
+    state = HitlRuntimeState(tmp_path)
+    state.begin_next_autoresearch_action(
+        {"kind": "prepare_proposal", "parent_sha": "parent"}
+    )
+    state.request_manager_agent_action(_request())
+
+    controller = hitl_autoresearch.HitlAutoResearchController.__new__(
+        hitl_autoresearch.HitlAutoResearchController
+    )
+    controller.work_dir = tmp_path
+    controller.manager_callable_agent_runner = lambda *_args: {
+        "success": False,
+        "error": "rollback failed",
+    }
+    monkeypatch.setattr(hitl_autoresearch, "seal_scoring_files", lambda *_a, **_k: Path("seal"))
+    monkeypatch.setattr(scoring_seal, "unseal_scoring_files", lambda *_a, **_k: None)
+
+    with pytest.raises(RuntimeError, match="without completing rollback"):
+        controller._advance_manager_agent_action("parent")
+
+    interrupted = state.manager_agent_action()
+    assert interrupted["status"] == "running"
+    assert interrupted["attempt_count"] == 1
+    assert interrupted["last_error"] == "rollback failed"
+
+
+def test_interrupted_manager_invocation_consumes_its_only_retry(tmp_path, monkeypatch):
+    state = HitlRuntimeState(tmp_path)
+    state.begin_next_autoresearch_action(
+        {"kind": "prepare_proposal", "parent_sha": "parent"}
+    )
+    state.request_manager_agent_action(_request())
+    state.update_manager_agent_action(
+        "request-1",
+        status="running",
+        attempt_count=1,
+    )
+
+    class FakeCheckpoints:
+        def create_checkpoint(self, message):
+            return Checkpoint("context", message)
+
+    controller = hitl_autoresearch.HitlAutoResearchController.__new__(
+        hitl_autoresearch.HitlAutoResearchController
+    )
+    controller.work_dir = tmp_path
+    controller.checkpoints = FakeCheckpoints()
+    controller.hitl_frontier = type(
+        "FakeFrontier",
+        (),
+        {"retain_resource_context": lambda self, parent, context: None},
+    )()
+    controller.manager_callable_agent_runner = lambda *_args: {"success": True}
+    monkeypatch.setattr(hitl_autoresearch, "seal_scoring_files", lambda *_a, **_k: Path("seal"))
+    monkeypatch.setattr(scoring_seal, "unseal_scoring_files", lambda *_a, **_k: None)
+
+    controller._advance_manager_agent_action("parent")
+
+    completed = state.manager_agent_action()
+    assert completed["status"] == "completed"
+    assert completed["attempt_count"] == 2
+    assert completed["recovery_count"] == 1
+
+
+def test_interrupted_context_publication_finishes_without_rerunning_agent(tmp_path):
+    state = HitlRuntimeState(tmp_path)
+    state.begin_next_autoresearch_action(
+        {"kind": "prepare_proposal", "parent_sha": "parent"}
+    )
+    state.request_manager_agent_action(_request())
+    state.update_manager_agent_action(
+        "request-1",
+        status="publishing",
+        attempt_count=1,
+        candidate_context_sha="context",
+    )
+    retained = []
+
+    class FakeCheckpoints:
+        @staticmethod
+        def checkpoint_exists(sha):
+            return sha == "context"
+
+    controller = hitl_autoresearch.HitlAutoResearchController.__new__(
+        hitl_autoresearch.HitlAutoResearchController
+    )
+    controller.work_dir = tmp_path
+    controller.checkpoints = FakeCheckpoints()
+    controller.hitl_frontier = type(
+        "FakeFrontier",
+        (),
+        {
+            "retain_resource_context": (
+                lambda self, parent, context: retained.append((parent, context))
+            )
+        },
+    )()
+    controller.manager_callable_agent_runner = lambda *_args: pytest.fail(
+        "publishing recovery must not rerun the agent"
+    )
+
+    controller._advance_manager_agent_action("parent")
+
+    assert retained == [("parent", "context")]
+    completed = state.manager_agent_action()
+    assert completed["status"] == "completed"
+    assert completed["context_sha"] == "context"
+    assert completed["attempt_count"] == 1
+
+
+def test_failed_manager_invocation_returns_to_existing_decision_boundary(tmp_path):
+    log = HitlIdeaLog(tmp_path)
+    state = HitlRuntimeState(tmp_path)
+    state.begin_next_autoresearch_action(
+        {"kind": "prepare_proposal", "parent_sha": "parent"}
+    )
+    state.request_manager_agent_action(_request())
+    state.update_manager_agent_action(
+        "request-1",
+        status="failed",
+        attempt_count=2,
+        recovery_count=1,
+        last_error="deterministic",
+    )
+    state.record_next_autoresearch_action_decision(
+        "prepare_proposal",
+        {"choice": "insert", "parent_sha": "parent"},
+    )
+    state.complete_next_autoresearch_action("prepare_proposal", {"choice": "insert"})
+    state.clear_completed_next_autoresearch_action("prepare_proposal")
+    observed = []
+
+    runtime = HitlRuntime.__new__(HitlRuntime)
+    runtime.log = log
+
+    class FakeManager:
+        @staticmethod
+        def begin_proposal_preparation(**kwargs):
+            observed.append(kwargs["prior_agent_failure"])
+            return kwargs["on_decision"](
+                {"choice": "proceed", "reason": "Continue with existing evidence."}
+            )
+
+    runtime.manager = FakeManager()
+
+    class FakeCheckpoints:
+        @staticmethod
+        def current_sha():
+            return "parent"
+
+    controller = hitl_autoresearch.HitlAutoResearchController.__new__(
+        hitl_autoresearch.HitlAutoResearchController
+    )
+    controller.work_dir = tmp_path
+    controller.checkpoints = FakeCheckpoints()
+    controller.hitl_frontier = type(
+        "FakeFrontier", (), {"resource_context": lambda self, _parent: None}
+    )()
+    controller._proposal_hitl_runtime = lambda: runtime
+
+    controller._prepare_next_proposal("parent")
+
+    assert observed[0]["request_id"] == "request-1"
+    assert observed[0]["last_error"] == "deterministic"
+    assert state.manager_agent_action() is None
 
 
 def test_next_request_uses_selected_parent_without_copying_completed_context(tmp_path):

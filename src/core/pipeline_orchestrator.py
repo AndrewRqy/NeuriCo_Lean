@@ -1428,6 +1428,7 @@ class ResearchPipelineOrchestrator:
                         if finish.get("approved")
                         else finalize_failed(finish or result)
                     )
+            from core.manager_callable_agents import manager_agent_provenance
             return run_plan_centered_hitl_stage(
                 runtime=runtime,
                 actor="resource_finder",
@@ -1441,7 +1442,7 @@ class ResearchPipelineOrchestrator:
                 ),
                 on_approved=complete_approved,
                 on_failed=finalize_failed,
-                provenance=({"attempt_id": invocation_id} if invocation_id else None),
+                provenance=(manager_agent_provenance(invocation_id) if invocation_id else None),
             )
 
         except HitlRunStopRequested:

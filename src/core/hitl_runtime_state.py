@@ -725,7 +725,16 @@ class HitlRuntimeState:
                     "Agent requests are allowed only while preparing the next proposal"
                 )
             existing = self._state.get("manager_agent_action")
-            if isinstance(existing, dict) and not existing.get("context_sha"):
+            existing_status = (
+                str(existing.get("status") or "pending").strip()
+                if isinstance(existing, dict)
+                else ""
+            )
+            if (
+                isinstance(existing, dict)
+                and not existing.get("context_sha")
+                and existing_status != "failed"
+            ):
                 if existing.get("request_id") == request_id:
                     if any(
                         existing.get(key) != request.get(key)
@@ -740,6 +749,9 @@ class HitlRuntimeState:
             record["parent_sha"] = str(action.get("parent_sha", "")).strip()
             if not record["parent_sha"]:
                 raise HitlRuntimeStateError("Proposal preparation is missing its frontier parent")
+            record["status"] = "pending"
+            record["attempt_count"] = 0
+            record["recovery_count"] = 0
             record["created_at"] = _now()
             self._state["manager_agent_action"] = record
             self._save_unlocked()
@@ -761,6 +773,21 @@ class HitlRuntimeState:
             self._state["manager_agent_action"] = record
             self._save_unlocked()
             return self._copy(record)
+
+    def clear_failed_manager_agent_action(self, request_id: str) -> bool:
+        """Retire one exhausted action after its replacement decision is durable."""
+        with self._locked():
+            self._state = self._load_unlocked() or self._default()
+            record = self._state.get("manager_agent_action")
+            if (
+                not isinstance(record, dict)
+                or record.get("request_id") != str(request_id).strip()
+                or record.get("status") != "failed"
+            ):
+                return False
+            self._state["manager_agent_action"] = None
+            self._save_unlocked()
+            return True
 
     def record_next_autoresearch_action_decision(
         self,
