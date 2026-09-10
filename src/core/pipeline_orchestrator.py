@@ -243,9 +243,20 @@ def _require_reviewed_workspace_unchanged(
     current = HitlWorkspaceWriteGuard.public_fingerprint(work_dir)
     if not expected or current != expected:
         raise RuntimeError(
-            "HITL rule-maker workspace changed after its reviewed snapshot; "
-            "refusing to seal or approve stale conformance evidence."
+            "HITL workspace changed after its reviewed snapshot or has no saved fingerprint; "
+            "refusing to approve changed or unverified stage outputs."
         )
+
+
+def _is_saved_initial_stage_approval(request: Dict[str, Any]) -> bool:
+    """Recognize completion from the durable manager response, not worker-only flags."""
+    return (
+        request.get("pipeline_stage") in {"resource_finder", RULE_MAKER_STAGE}
+        and request.get("kind") == "phase_finish"
+        and request.get("status") == "resolved"
+        and request.get("hitl_stage") in {"execution", "review"}
+        and (request.get("response") or {}).get("status") == "approved"
+    )
 
 
 class ResearchPipelineOrchestrator:
@@ -329,9 +340,14 @@ class ResearchPipelineOrchestrator:
         response = pending.get("response") or {}
         if not pending.get("request_key"):
             raise RuntimeError("Initial worker request has no request key.")
-        if pending.get("status") == "resolved" and response.get("final"):
+        if pending.get("status") == "resolved" and (
+            response.get("final") or _is_saved_initial_stage_approval(pending)
+        ):
             if pending.get("kind") != "phase_finish" or not (
                 response.get("status") == "approved" or response.get("rule_maker_repair_requested")
+            ) or (
+                stage in {"resource_finder", RULE_MAKER_STAGE}
+                and not _is_saved_initial_stage_approval(pending)
             ):
                 raise RuntimeError("Initial recovery found an invalid final stage response.")
             if stage == "experiment_runner" and not response.get("rule_maker_repair_requested"):
@@ -503,7 +519,20 @@ class ResearchPipelineOrchestrator:
         pending = self._initial_stage_request(runtime.pipeline_stage)
         if pending is None:
             return None
-        if pending.get("status") == "resolved" and (pending.get("response") or {}).get("final"):
+        if pending.get("status") == "resolved" and (
+            (pending.get("response") or {}).get("final")
+            or _is_saved_initial_stage_approval(pending)
+        ):
+            if runtime.pipeline_stage in {"resource_finder", RULE_MAKER_STAGE}:
+                _require_reviewed_workspace_unchanged(
+                    self.work_dir, str(pending.get("workspace_fingerprint", ""))
+                )
+                validation = validator()
+                if not validation.get("valid"):
+                    raise HitlValidationError(
+                        f"Recovered {runtime.pipeline_stage} approval failed artifact validation: "
+                        f"{validation.get('issues', [])}"
+                    )
             HitlRuntimeState(self.work_dir).clear_worker_continuation()
             return {"success": True, "resumed": True}, {"approved": True}
         from core.hitl import _load_hitl_template
