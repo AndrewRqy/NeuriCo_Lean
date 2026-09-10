@@ -644,6 +644,21 @@ class ResearchRunner:
 
                 print(f"📁 Working directory: {work_dir}\n")
 
+        preserve_initial_inputs = False
+        if hitl and (autoresearch or continue_autoresearch):
+            from core.hitl_autoresearch import (
+                initial_publication_requires_resume,
+                prepare_initial_hitl_resume,
+            )
+
+            # Finish an interrupted initial publication even for direct callers
+            # that selected continue because the root already exists.
+            if initial_publication_requires_resume(work_dir):
+                continue_autoresearch = False
+                autoresearch = True
+            if autoresearch:
+                preserve_initial_inputs = prepare_initial_hitl_resume(work_dir)
+
         # Create subdirectories
         (work_dir / "logs").mkdir(parents=True, exist_ok=True)
         (work_dir / "results").mkdir(parents=True, exist_ok=True)
@@ -653,12 +668,23 @@ class ResearchRunner:
             (work_dir / "notebooks").mkdir(parents=True, exist_ok=True)
 
         # Copy helper scripts and backend-selected skills to workspace.
-        self._copy_workspace_resources(work_dir, compute_backend=compute_backend)
+        if not preserve_initial_inputs:
+            self._copy_workspace_resources(work_dir, compute_backend=compute_backend)
 
         # Stage user-declared local resources (datasets, functions) into the
         # workspace and rewrite their paths workspace-relative, so no agent
         # ever depends on host paths. Hard error if a declared path is gone.
-        stage_local_resources(work_dir, idea)
+        if preserve_initial_inputs:
+            # Reconnect the saved contract without refreshing reviewed files
+            # from host-side sources. Integrity checks still use the submitted idea.
+            from core.local_resources import staged_function_mismatches
+
+            issues = staged_function_mismatches(work_dir, idea)
+            if issues:
+                raise RuntimeError("Cannot resume reviewed initial inputs: " + "; ".join(issues))
+            stage_local_resources(work_dir, idea, preserve_existing=True)
+        else:
+            stage_local_resources(work_dir, idea)
 
         recovered_hitl_attempt = None
         if hitl and continue_autoresearch:
