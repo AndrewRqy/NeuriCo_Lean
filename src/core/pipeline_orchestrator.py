@@ -311,7 +311,7 @@ class ResearchPipelineOrchestrator:
         )
 
     def _initial_stage_request(self, stage: str) -> Optional[Dict[str, Any]]:
-        """Find replayable requests or resolved decisions with worker work remaining."""
+        """Find replayable work belonging to this incomplete initial stage."""
         if not self.hitl_autoresearch or self.state.is_stage_completed(stage):
             return None
         state = HitlRuntimeState(self.work_dir)
@@ -339,10 +339,7 @@ class ResearchPipelineOrchestrator:
                 if not isinstance(score.get("results"), dict) or not score.get("scored_checkpoint_sha"):
                     raise RuntimeError("Initial approval has no durable scored checkpoint/result.")
             return pending
-        resolved_decision = (
-            pending.get("kind") == "raised_idea" and pending.get("status") == "resolved"
-        )
-        if not resolved_decision and not worker_command_requires_resume(pending):
+        if not worker_command_requires_resume(pending):
             return None
         continuation = state.worker_continuation() or {}
         if (
@@ -353,13 +350,6 @@ class ResearchPipelineOrchestrator:
             or pending.get("kind") not in {"phase_finish", "raised_idea"}
         ):
             raise RuntimeError("Initial worker request has no matching stage continuation.")
-        if resolved_decision and (
-            continuation.get("hitl_stage") not in {"execution", "review"}
-            or continuation.get("hitl_stage") != pending.get("hitl_stage")
-            or not isinstance(response.get("manager_feedback"), str)
-            or not response["manager_feedback"].strip()
-        ):
-            raise RuntimeError("Initial resolved decision has no matching continuation with saved feedback.")
         return pending
 
     def prepare_initial_resume(self) -> bool:
@@ -527,24 +517,10 @@ class ResearchPipelineOrchestrator:
             allow_scoring_approval=scoring_handler is not None,
             scoring_handler=scoring_handler,
         )
-        if pending.get("kind") == "raised_idea" and pending.get("status") == "resolved":
-            # Resolution is persisted before its continuation prompt. Rebuild with
-            # the saved feedback so a restart in that gap cannot lose the decision.
-            feedback = pending["response"]["manager_feedback"].strip()
-            hitl_stage = continuation["hitl_stage"]
-            phase_prompt = (
-                runtime.review_prompt_block(feedback)
-                if hitl_stage == "review"
-                else runtime.execution_prompt_block(mode="continue", feedback=feedback)
-            )
-            prompt = runtime.compose_worker_prompt(hitl_stage=hitl_stage, phase_prompt=phase_prompt)
-            runtime._update_worker_continuation(prompt_block=prompt, status="running")
-        else:
-            prompt = _load_hitl_template("worker_resume_pending_request.txt")
         return run_worker_with_replacements(
             runtime=runtime,
             launch_worker=launch_worker,
-            prompt=prompt,
+            prompt=_load_hitl_template("worker_resume_pending_request.txt"),
             log_prefix=f"hitl/{runtime.pipeline_stage}_resume",
             phase="stage",
             worker_name=runtime.pipeline_stage,
