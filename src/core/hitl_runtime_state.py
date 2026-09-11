@@ -690,7 +690,7 @@ class HitlRuntimeState:
                 "prepare_proposal": "preparing_proposal",
             }.get(kind, kind)
             self._record_phase_transition_unlocked(
-                stage="frontier",
+                stage=("experiment_runner" if kind == "prepare_proposal" else "frontier"),
                 phase=phase,
                 activity="reviewing",
             )
@@ -738,7 +738,11 @@ class HitlRuntimeState:
                 "prepare_proposal": "saving_proposal_preparation",
             }.get(normalized_kind, f"saving_{normalized_kind}")
             self._record_phase_transition_unlocked(
-                stage="frontier",
+                stage=(
+                    "experiment_runner"
+                    if normalized_kind == "prepare_proposal"
+                    else "frontier"
+                ),
                 phase=phase,
                 activity="saving",
             )

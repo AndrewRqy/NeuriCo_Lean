@@ -2116,7 +2116,10 @@ class HitlManager:
                         "reason": reason,
                     }
                 )
-                checkpoints.restore_checkpoint(node_sha, clean_untracked_public=True)
+                checkpoints.restore_checkpoint(
+                    store.workspace_checkpoint_sha(node_sha),
+                    clean_untracked_public=True,
+                )
                 state = store.select(node_sha)
                 return {
                     **recorded,
@@ -2337,9 +2340,11 @@ class HitlManager:
 
         action_kind = turn.runtime_action_kind.strip()
         if action_kind:
-            boundary = (
-                "frontier selection" if action_kind == "select_frontier" else "frontier pruning"
-            )
+            boundary = {
+                "select_frontier": "frontier selection",
+                "prune_frontier": "frontier pruning",
+                "prepare_proposal": "proposal preparation",
+            }.get(action_kind, action_kind.replace("_", " "))
             reason = f"{failure} The {boundary} boundary was not completed; restart HITL AutoResearch to retry it."
             self.runtime_state.cancel_next_autoresearch_action(action_kind, reason=reason)
             self.channel.send(reason, kind="system")

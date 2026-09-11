@@ -417,7 +417,10 @@ class ResearchPipelineOrchestrator:
                 rollback = HitlStageRollback.from_descriptor(self.work_dir, boundary)
                 runtime = self._create_hitl_runtime(
                     stage,
-                    invocation_id=str(provenance.get("attempt_id", "")),
+                    invocation_id=str(
+                        provenance.get("invocation_id")
+                        or provenance.get("attempt_id", "")
+                    ),
                 )
                 try:
                     rollback.restore(
@@ -1355,7 +1358,7 @@ class ResearchPipelineOrchestrator:
         print()
 
         provenance = (
-            {"parent_node_id": parent_node_id, "attempt_id": invocation_id}
+            {"parent_node_id": parent_node_id, "invocation_id": invocation_id}
             if invocation_id
             else {}
         )

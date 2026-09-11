@@ -102,6 +102,7 @@ IDEA_RECORD_FIELD_ORDER = [
     "actor",
     "parent_node_id",
     "attempt_id",
+    "invocation_id",
     "premises",
     "worker_context",
     "context",
@@ -119,7 +120,7 @@ IDEA_RECORD_FIELD_ORDER = [
     "worker_escalation_reason",
     "manager_escalation_reason",
 ]
-RUNTIME_PROVENANCE_FIELDS = ("parent_node_id", "attempt_id")
+RUNTIME_PROVENANCE_FIELDS = ("parent_node_id", "attempt_id", "invocation_id")
 
 
 def _now() -> str:
@@ -2280,7 +2281,7 @@ class HitlRuntime:
             ),
             "raised": False,
             "parent_node_id": parent,
-            "attempt_id": invocation,
+            "invocation_id": invocation,
         }
         return self.log.append(record, idempotent=True)
 

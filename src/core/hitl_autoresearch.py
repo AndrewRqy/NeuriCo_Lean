@@ -860,6 +860,7 @@ def recover_interrupted_hitl_attempt_if_needed(work_dir: Path) -> Optional[HitlR
     run_state = frontier.autoresearch_run()
     runtime_state = HitlRuntimeState(work_dir)
     current_best_sha = frontier.state()["selected_frontier_node_sha"]
+    current_workspace_sha = frontier.workspace_checkpoint_sha(current_best_sha)
     history_root = Path(run_state["history_root"]).resolve()
     attempt_dir = _resolve_marked_attempt_dir(history_root, marker)
     runtime_state = HitlRuntimeState(work_dir)
@@ -870,7 +871,7 @@ def recover_interrupted_hitl_attempt_if_needed(work_dir: Path) -> Optional[HitlR
         and rejected_cleanup.get("attempt_id") == marker
     ):
         CheckpointManager(work_dir).restore_checkpoint(
-            current_best_sha,
+            current_workspace_sha,
             clean_untracked_public=True,
         )
         _recover_rejected_whiteboard_cleanup(
@@ -927,7 +928,7 @@ def recover_interrupted_hitl_attempt_if_needed(work_dir: Path) -> Optional[HitlR
         )
     _retire_runtime_scoring_refs(work_dir, runtime_state, strict=True)
     CheckpointManager(work_dir).restore_checkpoint(
-        current_best_sha,
+        current_workspace_sha,
         clean_untracked_public=True,
     )
     _restore_hitl_state_snapshot(work_dir, attempt_dir)
@@ -1125,9 +1126,12 @@ def continue_hitl_autoresearch(
     if not frontier.exists():
         raise RuntimeError("Cannot continue HITL AutoResearch without initialized frontier state.")
     selected_sha = frontier.state(allow_unselected=True)["selected_frontier_node_sha"]
+    selected_workspace_sha = (
+        frontier.workspace_checkpoint_sha(selected_sha) if selected_sha else None
+    )
     checkpoints = CheckpointManager(work_dir)
-    if selected_sha and not checkpoints.checkpoint_exists(selected_sha):
-        raise RuntimeError("The selected HITL frontier node is not a workspace checkpoint.")
+    if selected_workspace_sha and not checkpoints.checkpoint_exists(selected_workspace_sha):
+        raise RuntimeError("The selected HITL frontier workspace is not a checkpoint.")
 
     run_state = frontier.autoresearch_run()
     history_root = Path(run_state["history_root"])
@@ -1150,15 +1154,13 @@ def continue_hitl_autoresearch(
         not pending_worker_request
         and not pending_frontier_transition
         and not proposal_preparation_pending
-        and selected_sha
+        and selected_workspace_sha
     ):
-        if checkpoints.current_sha() != selected_sha:
-            checkpoints.restore_checkpoint(selected_sha, clean_untracked_public=True)
-        current_sha = checkpoints.current_sha()
-        if current_sha != selected_sha:
+        if checkpoints.current_sha() != selected_workspace_sha:
+            checkpoints.restore_checkpoint(selected_workspace_sha, clean_untracked_public=True)
+        if checkpoints.current_sha() != selected_workspace_sha:
             raise RuntimeError("HITL runtime could not restore the selected frontier checkpoint.")
-    else:
-        current_sha = selected_sha or checkpoints.current_sha()
+    current_sha = selected_sha or checkpoints.current_sha()
 
     if iterations == 0 and (
         pending_worker_request
@@ -1310,7 +1312,7 @@ class HitlAutoResearchController:
                 )
                 if not preparing_proposal:
                     self.checkpoints.restore_checkpoint(
-                        current_best_sha,
+                        self.hitl_frontier.workspace_checkpoint_sha(current_best_sha),
                         clean_untracked_public=True,
                     )
                 initial = Checkpoint(current_best_sha, "Existing HITL AutoResearch frontier root")
@@ -1452,6 +1454,10 @@ class HitlAutoResearchController:
                 raise RuntimeError(
                     str(result.get("error") or "Manager-requested agent stage failed.")
                 )
+            checkpoint = self.checkpoints.create_checkpoint(
+                f"HITL proposal preparation after {decision.get('agent', 'agent')}"
+            )
+            self.hitl_frontier.update_workspace_checkpoint(parent_sha, checkpoint.sha)
             return {"choice": choice, "decision_idea_id": record["idea_id"]}
 
         while True:
@@ -1763,7 +1769,10 @@ class HitlAutoResearchController:
         )
         self._retire_temporary_scoring_ref(scorer_result, strict=True)
         self._retire_pending_scoring_ref(strict=True)
-        self.checkpoints.restore_checkpoint(parent_sha, clean_untracked_public=True)
+        self.checkpoints.restore_checkpoint(
+            self.hitl_frontier.workspace_checkpoint_sha(parent_sha),
+            clean_untracked_public=True,
+        )
         remove_public_sealed_paths(self.work_dir)
         _restore_hitl_state_snapshot(self.work_dir, attempt_dir)
         self._reload_manager_after_hitl_restore()
@@ -2129,7 +2138,10 @@ class HitlAutoResearchController:
                 "The AutoResearch attempt failed before scoring and runtime is restoring its parent."
             )
             self._retire_pending_scoring_ref(strict=True)
-            self.checkpoints.restore_checkpoint(parent_sha, clean_untracked_public=True)
+            self.checkpoints.restore_checkpoint(
+                self.hitl_frontier.workspace_checkpoint_sha(parent_sha),
+                clean_untracked_public=True,
+            )
             remove_public_sealed_paths(self.work_dir)
             _restore_hitl_state_snapshot(self.work_dir, attempt_dir)
             self._reload_manager_after_hitl_restore()
@@ -2198,7 +2210,7 @@ class HitlAutoResearchController:
             self._retire_temporary_scoring_ref(scorer_result, strict=True)
             self._retire_pending_scoring_ref(strict=True)
             self.checkpoints.restore_checkpoint(
-                parent_sha,
+                self.hitl_frontier.workspace_checkpoint_sha(parent_sha),
                 clean_untracked_public=True,
             )
             remove_public_sealed_paths(self.work_dir)
@@ -2811,7 +2823,7 @@ class HitlAutoResearchController:
         runtime_state = HitlRuntimeState(self.work_dir)
         runtime_state.begin_rejected_whiteboard_cleanup(attempt_id)
         self.checkpoints.restore_checkpoint(
-            parent_sha,
+            self.hitl_frontier.workspace_checkpoint_sha(parent_sha),
             clean_untracked_public=clean_untracked_public,
         )
         remove_public_sealed_paths(self.work_dir)

@@ -85,6 +85,67 @@ def test_manager_records_insert_choice_with_runtime_invocation_id(tmp_path):
     assert action["decision"]["invocation_id"] == "invocation-1"
 
 
+def test_proposal_decision_uses_dedicated_invocation_provenance(tmp_path):
+    premise = _premise(tmp_path)
+    runtime = HitlRuntime(tmp_path, "experiment_runner", manager=object())
+    values = {
+        "choice": "insert",
+        "reason": "The current evidence is incomplete.",
+        "parent_sha": "parent",
+        "premise_idea_id": premise,
+        "agent": "resource_finder",
+        "objective": "Find an external benchmark.",
+    }
+
+    first = runtime.log_proposal_preparation_decision(
+        **values,
+        invocation_id="invocation-1",
+    )
+    replay = runtime.log_proposal_preparation_decision(
+        **values,
+        invocation_id="invocation-1",
+    )
+    repeated_request = runtime.log_proposal_preparation_decision(
+        **values,
+        invocation_id="invocation-2",
+    )
+
+    assert first["invocation_id"] == "invocation-1"
+    assert "attempt_id" not in first
+    assert replay["idea_id"] == first["idea_id"]
+    assert repeated_request["idea_id"] != first["idea_id"]
+
+
+def test_manager_invocation_provenance_does_not_activate_attempt_semantics():
+    runtime = HitlRuntime.__new__(HitlRuntime)
+    runtime.pipeline_stage = "resource_finder"
+    runtime.current_hitl_stage = "execution"
+    runtime._tool_context = {
+        "actor": "resource_finder",
+        "hitl_stage": "execution",
+        "provenance": {
+            "parent_node_id": "parent",
+            "invocation_id": "invocation-1",
+        },
+    }
+
+    record = runtime._record_from_tool_payload(
+        {
+            "idea_type": "evidence",
+            "idea_category": "paper_finding",
+            "context": "An external result was reviewed.",
+            "evidence": "The result supports the proposed direction.",
+            "premises": [],
+            "related_artifacts": [],
+        },
+        raised=False,
+    )
+
+    assert record["invocation_id"] == "invocation-1"
+    assert "attempt_id" not in record
+    assert runtime._autoresearch_candidate_prompt_context()["autoresearch_attempt"] is False
+
+
 def test_invalid_premise_does_not_consume_boundary(tmp_path):
     state = HitlRuntimeState(tmp_path)
     state.begin_next_autoresearch_action(
@@ -208,11 +269,29 @@ def test_controller_returns_to_boundary_after_insert():
     controller.manager_callable_agent_runner = (
         lambda *args: runs.append(args) or {"success": True}
     )
+    controller.checkpoints = type(
+        "Checkpoints",
+        (),
+        {"create_checkpoint": lambda _self, _message: type("Checkpoint", (), {"sha": "prepared"})()},
+    )()
+    updated_workspaces = []
+    controller.hitl_frontier = type(
+        "Frontier",
+        (),
+        {
+            "update_workspace_checkpoint": (
+                lambda _self, node_sha, checkpoint_sha: updated_workspaces.append(
+                    (node_sha, checkpoint_sha)
+                )
+            )
+        },
+    )()
 
     controller._prepare_next_proposal("parent")
 
     assert len(logged) == 2
     assert runs == [("resource_finder", "Find evidence.", "invocation-1", "parent")]
+    assert updated_workspaces == [("parent", "prepared")]
 
 
 def test_physical_attempt_retry_reopens_proposal_preparation():
@@ -231,6 +310,146 @@ def test_physical_attempt_retry_reopens_proposal_preparation():
 
     assert result.child_sha == "child"
     assert prepared == ["parent", "parent"]
+
+
+def test_frontier_workspace_checkpoint_uses_standard_checkpoint_and_retention(tmp_path):
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("scored root\n", encoding="utf-8")
+    checkpoints = CheckpointManager(tmp_path)
+    root = checkpoints.create_checkpoint("root")
+    frontier = HitlFrontierStore(tmp_path)
+    frontier.initialize_root(
+        node_sha=root.sha,
+        plan_text="plan\n",
+        objective_score={"results": {}},
+        reason_for_acceptance="root",
+    )
+
+    artifact.write_text("prepared resources\n", encoding="utf-8")
+    prepared = checkpoints.create_checkpoint("prepared")
+    frontier.update_workspace_checkpoint(root.sha, prepared.sha)
+
+    node = frontier.node(root.sha)
+    assert node["node_sha"] == root.sha
+    assert node["workspace_checkpoint_sha"] == prepared.sha
+    retained = checkpoints.repo.git.rev_parse(
+        f"refs/neurico/hitl/frontiers/{root.sha}"
+    )
+    assert retained == prepared.sha
+
+
+def test_rejected_candidate_restores_prepared_frontier_workspace(tmp_path):
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("scored root\n", encoding="utf-8")
+    checkpoints = CheckpointManager(tmp_path)
+    root = checkpoints.create_checkpoint("root")
+    frontier = HitlFrontierStore(tmp_path)
+    frontier.initialize_root(
+        node_sha=root.sha,
+        plan_text="plan\n",
+        objective_score={"results": {}},
+        reason_for_acceptance="root",
+    )
+    decisions = iter(
+        [
+            {
+                "choice": "insert",
+                "agent": "resource_finder",
+                "objective": "Find evidence.",
+                "reason": "Evidence is missing.",
+                "premise_idea_id": "I1",
+                "invocation_id": "invocation-1",
+            },
+            {
+                "choice": "proceed",
+                "reason": "Evidence is ready.",
+                "premise_idea_id": "I2",
+                "invocation_id": "invocation-2",
+            },
+        ]
+    )
+
+    class FakeRuntime:
+        def __init__(self):
+            self.manager = type(
+                "Manager",
+                (),
+                {
+                    "begin_proposal_preparation": staticmethod(
+                        lambda _prompt, _parent, callback: callback(next(decisions))
+                    )
+                },
+            )()
+
+        @staticmethod
+        def log_proposal_preparation_decision(**_values):
+            return {"idea_id": "decision"}
+
+    controller = HitlAutoResearchController.__new__(HitlAutoResearchController)
+    controller.work_dir = tmp_path
+    controller.checkpoints = checkpoints
+    controller.hitl_frontier = frontier
+    controller._proposal_hitl_runtime = FakeRuntime
+
+    def run_resource_finder(*_args):
+        artifact.write_text("prepared resources\n", encoding="utf-8")
+        return {"success": True}
+
+    controller.manager_callable_agent_runner = run_resource_finder
+    controller._prepare_next_proposal(root.sha)
+    prepared = frontier.workspace_checkpoint_sha(root.sha)
+    artifact.write_text("rejected candidate\n", encoding="utf-8")
+    controller._restore_rejected_candidate_workspace(
+        parent_sha=root.sha,
+        attempt_id=f"{root.sha}/attempt_1",
+    )
+
+    assert checkpoints.current_sha() == prepared
+    assert artifact.read_text(encoding="utf-8") == "prepared resources\n"
+
+
+def test_continuation_restores_prepared_frontier_workspace(tmp_path):
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("scored root\n", encoding="utf-8")
+    checkpoints = CheckpointManager(tmp_path)
+    root = checkpoints.create_checkpoint("root")
+    frontier = HitlFrontierStore(tmp_path)
+    frontier.initialize_root(
+        node_sha=root.sha,
+        plan_text="plan\n",
+        objective_score={"results": {}},
+        reason_for_acceptance="root",
+    )
+    history_root = tmp_path / ".neurico" / "history"
+    history_root.mkdir(parents=True)
+    frontier.configure_autoresearch_run(
+        history_root=history_root,
+        lineage_source_sha=root.sha,
+        last_iteration=0,
+    )
+    artifact.write_text("prepared resources\n", encoding="utf-8")
+    prepared = checkpoints.create_checkpoint("prepared")
+    frontier.update_workspace_checkpoint(root.sha, prepared.sha)
+    checkpoints.restore_checkpoint(root.sha)
+
+    result = continue_hitl_autoresearch(
+        idea={},
+        idea_id="idea",
+        work_dir=tmp_path,
+        templates_dir=ROOT / "templates",
+        provider="codex",
+        full_permissions=False,
+        scorer_timeout=None,
+        iterations=0,
+        autoresearch_history_dir=None,
+        proposer_timeout=None,
+        comment_timeout=None,
+    )
+
+    assert result["success"] is True
+    assert result["autoresearch"]["current_best_sha"] == root.sha
+    assert checkpoints.current_sha() == prepared.sha
+    assert artifact.read_text(encoding="utf-8") == "prepared resources\n"
 
 
 def test_repeated_stage_runs_preserve_previous_stage_record(tmp_path):
@@ -367,7 +586,7 @@ def _record_pending_invocation(tmp_path: Path, provenance: dict) -> HitlRuntimeS
 
 
 def test_matching_invocation_resumes_through_initial_stage_request(tmp_path):
-    provenance = {"parent_node_id": "parent", "attempt_id": "invocation-1"}
+    provenance = {"parent_node_id": "parent", "invocation_id": "invocation-1"}
     orchestrator = ResearchPipelineOrchestrator(tmp_path, hitl_autoresearch=True)
     orchestrator.state.start_stage("resource_finder", invocation_id="invocation-1")
     _record_pending_invocation(tmp_path, provenance)
@@ -381,12 +600,12 @@ def test_matching_invocation_resumes_through_initial_stage_request(tmp_path):
     with pytest.raises(RuntimeError, match="another invocation"):
         orchestrator._initial_stage_request(
             "resource_finder",
-            provenance={"parent_node_id": "parent", "attempt_id": "invocation-2"},
+            provenance={"parent_node_id": "parent", "invocation_id": "invocation-2"},
         )
 
 
 def test_startup_preserves_matching_held_invocation(tmp_path, monkeypatch):
-    provenance = {"parent_node_id": "parent", "attempt_id": "invocation-1"}
+    provenance = {"parent_node_id": "parent", "invocation_id": "invocation-1"}
     orchestrator = ResearchPipelineOrchestrator(tmp_path, hitl_autoresearch=True)
     orchestrator.state.start_stage("resource_finder", invocation_id="invocation-1")
     orchestrator.state.set_runtime_recovery(
@@ -404,6 +623,34 @@ def test_startup_preserves_matching_held_invocation(tmp_path, monkeypatch):
     assert orchestrator.prepare_initial_resume() is True
     assert checked[0]["provenance"] == provenance
     assert HitlRuntimeState(tmp_path).pending_worker_command()["request_key"] == "request-1"
+
+
+def test_startup_restores_manager_invocation_identity_without_a_worker_request(
+    tmp_path,
+    monkeypatch,
+):
+    provenance = {"parent_node_id": "parent", "invocation_id": "invocation-1"}
+    orchestrator = ResearchPipelineOrchestrator(tmp_path, hitl_autoresearch=True)
+    orchestrator.state.start_stage("resource_finder", invocation_id="invocation-1")
+    orchestrator.state.set_runtime_recovery(
+        "initial_stage",
+        {"stage": "resource_finder", "provenance": provenance, "checkpoint_sha": "base"},
+    )
+    restored = []
+
+    class FakeRollback:
+        @staticmethod
+        def restore(runtime, _message, *, cleanup_label):
+            restored.append((runtime.invocation_id, cleanup_label))
+
+    monkeypatch.setattr(
+        HitlStageRollback,
+        "from_descriptor",
+        classmethod(lambda cls, work_dir, boundary: FakeRollback()),
+    )
+
+    assert orchestrator.prepare_initial_resume() is False
+    assert restored == [("invocation-1", "restored")]
 
 
 def test_completed_invocation_is_reused_after_restart(tmp_path):
