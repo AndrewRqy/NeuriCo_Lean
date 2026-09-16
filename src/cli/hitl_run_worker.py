@@ -135,6 +135,9 @@ def _finalize_stopped_run(
             recovery = ResearchPipelineOrchestrator(
                 work_dir=work_dir,
                 managed_initial_run=True,
+                baseline_construction=(
+                    request.get("operation") == "construct_baseline"
+                ),
                 hitl_mode=request.get("hitl_mode", "full"),
             ).restore_stopped_initial_run()
         else:

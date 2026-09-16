@@ -799,6 +799,19 @@ def construct_managed_baseline(
     selected_mode = _adopt_run_hitl_mode(work_dir, hitl_mode)
     runtime_state = HitlRuntimeState(work_dir)
 
+    def restore_active_rule_maker_boundary() -> None:
+        """Restore the inner managed-stage boundary before the outer workspace."""
+        state = PipelineState(work_dir)
+        if state.get_runtime_recovery("initial_stage") is None:
+            return
+        ResearchPipelineOrchestrator(
+            work_dir=work_dir,
+            templates_dir=templates_dir,
+            managed_initial_run=True,
+            baseline_construction=True,
+            hitl_mode=selected_mode,
+        ).restore_stopped_initial_run()
+
     existing_publication = runtime_state.initial_root_publication_transition()
     if isinstance(existing_publication, dict):
         PipelineState(work_dir).convert_completed_ordinary_to_autoresearch()
@@ -817,8 +830,9 @@ def construct_managed_baseline(
 
     pending_boundary = runtime_state.bootstrap_prepublication_boundary()
     if isinstance(pending_boundary, dict):
+        restore_active_rule_maker_boundary()
         _rollback_bootstrap_prepublication_boundary(
-            work_dir, runtime_state, pending_boundary
+            work_dir, HitlRuntimeState(work_dir), pending_boundary
         )
 
     if HitlFrontierStore(work_dir).exists():
@@ -865,9 +879,16 @@ def construct_managed_baseline(
             work_dir, agent_local_backup, agent_local_existed
         )
 
+    recovery_started = False
+
     def fail_and_restore() -> None:
+        nonlocal recovery_started
+        if recovery_started:
+            return
+        recovery_started = True
+        restore_active_rule_maker_boundary()
         restore_source()
-        _retire_prepublication_boundary(work_dir, runtime_state)
+        _retire_prepublication_boundary(work_dir, HitlRuntimeState(work_dir))
 
     try:
         if prepare_workspace is not None:
