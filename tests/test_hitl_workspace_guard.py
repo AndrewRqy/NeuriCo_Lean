@@ -14,9 +14,15 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from core.hitl_workspace_guard import HitlWorkspaceWriteGuard  # noqa: E402
+from core.hitl_workspace_guard import (  # noqa: E402
+    HitlWorkspaceWriteGuard,
+    WorkspaceGuardScope,
+)
+from core.hitl_runtime_state import HitlRuntimeState, HitlRuntimeStateError  # noqa: E402
 import core.hitl_workspace_guard as workspace_guard  # noqa: E402
 
 
@@ -93,19 +99,179 @@ def test_public_guard_detects_same_size_write_with_restored_mtime(tmp_path):
     assert "README.md" in result["issues"][0]
 
 
-def test_public_guard_prunes_nested_virtual_environments(tmp_path):
+def test_public_guard_detects_new_virtual_environment_marker(tmp_path):
     work_dir = _workspace(tmp_path)
-    environment = work_dir / "results" / "experiment" / "state_env"
-    package = environment / "lib" / "python" / "site-packages" / "package.py"
-    package.parent.mkdir(parents=True)
-    (environment / "pyvenv.cfg").write_text("home = /python\n")
-    package.write_text("VERSION = 1\n")
     guard = HitlWorkspaceWriteGuard.capture_public(work_dir)
 
-    package.write_text("VERSION = 2\n")
+    environment = work_dir / "state_env"
+    environment.mkdir()
+    (environment / "pyvenv.cfg").write_text("home = /python\n")
+    (environment / "payload.txt").write_text("unauthorized\n")
 
     result = guard.require_unchanged()
+    assert not result["valid"]
+    assert "state_env" in result["issues"][0]
+
+
+def test_public_guard_detects_new_cache_named_directory(tmp_path):
+    work_dir = _workspace(tmp_path)
+    guard = HitlWorkspaceWriteGuard.capture_public(work_dir)
+
+    cache = work_dir / "node_modules"
+    cache.mkdir()
+    (cache / "payload.txt").write_text("unauthorized\n")
+
+    result = guard.require_unchanged()
+    assert not result["valid"]
+    assert "node_modules" in result["issues"][0]
+
+
+def test_public_guard_detects_new_builtin_private_root(tmp_path):
+    work_dir = _workspace(tmp_path)
+    guard = HitlWorkspaceWriteGuard.capture_public(work_dir)
+
+    environment = work_dir / ".venv"
+    environment.mkdir()
+    (environment / "pyvenv.cfg").write_text("home = /python\n")
+
+    result = guard.require_unchanged()
+    assert not result["valid"]
+    assert ".venv" in result["issues"][0]
+
+
+def test_public_guard_detects_marker_added_to_existing_directory(tmp_path):
+    work_dir = _workspace(tmp_path)
+    ordinary = work_dir / "ordinary"
+    ordinary.mkdir()
+    (ordinary / "payload.txt").write_text("before\n")
+    guard = HitlWorkspaceWriteGuard.capture_public(work_dir)
+
+    (ordinary / "pyvenv.cfg").write_text("home = /python\n")
+    (ordinary / "payload.txt").write_text("after\n")
+
+    result = guard.require_unchanged()
+    assert not result["valid"]
+    assert "ordinary" in result["issues"][0]
+
+
+def test_public_guard_detects_new_empty_directory(tmp_path):
+    work_dir = _workspace(tmp_path)
+    guard = HitlWorkspaceWriteGuard.capture_public(work_dir)
+
+    (work_dir / "empty").mkdir()
+
+    result = guard.require_unchanged()
+    assert not result["valid"]
+    assert "empty" in result["issues"][0]
+
+
+def test_public_guard_does_not_descend_into_nested_git_metadata(tmp_path, monkeypatch):
+    work_dir = _workspace(tmp_path)
+    metadata = work_dir / "dependency" / ".git"
+    metadata.mkdir(parents=True)
+    (metadata / "large-index").write_bytes(b"metadata")
+    original_scandir = workspace_guard.os.scandir
+
+    def guarded_scandir(path):
+        assert Path(path) != metadata
+        return original_scandir(path)
+
+    monkeypatch.setattr(workspace_guard.os, "scandir", guarded_scandir)
+
+    guard = HitlWorkspaceWriteGuard.capture_public(work_dir)
+    assert guard.require_unchanged()["valid"]
+
+
+def test_public_guard_detects_new_nested_git_metadata(tmp_path):
+    work_dir = _workspace(tmp_path)
+    dependency = work_dir / "dependency"
+    dependency.mkdir()
+    guard = HitlWorkspaceWriteGuard.capture_public(work_dir)
+
+    (dependency / ".git").mkdir()
+
+    result = guard.require_unchanged()
+    assert not result["valid"]
+    assert "dependency/.git" in result["issues"][0]
+
+
+def test_explicit_scope_prunes_only_registered_root(tmp_path, monkeypatch):
+    work_dir = _workspace(tmp_path)
+    immutable = work_dir / "datasets" / "immutable"
+    payload = immutable / "nested" / "payload.bin"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"payload")
+    scope = WorkspaceGuardScope.from_value({"immutable_resource_roots": ["datasets/immutable"]})
+    original_scandir = workspace_guard.os.scandir
+
+    def guarded_scandir(path):
+        assert Path(path) != immutable
+        return original_scandir(path)
+
+    monkeypatch.setattr(workspace_guard.os, "scandir", guarded_scandir)
+
+    guard = HitlWorkspaceWriteGuard.capture_public(work_dir, scope=scope)
+    result = guard.require_unchanged()
+
     assert result["valid"], result["issues"]
+
+
+def test_replacing_registered_root_is_detected(tmp_path):
+    work_dir = _workspace(tmp_path)
+    immutable = work_dir / "datasets" / "immutable"
+    immutable.mkdir(parents=True)
+    scope = {"immutable_resource_roots": ["datasets/immutable"]}
+    guard = HitlWorkspaceWriteGuard.capture_public(work_dir, scope=scope)
+
+    immutable.rename(work_dir / "datasets" / "old")
+    immutable.mkdir()
+
+    result = guard.require_unchanged()
+    assert not result["valid"]
+    assert "datasets/immutable" in result["issues"][0]
+
+
+def test_runtime_scope_requires_existing_roots_and_persists(tmp_path):
+    work_dir = _workspace(tmp_path)
+    state = HitlRuntimeState(work_dir)
+
+    with pytest.raises(HitlRuntimeStateError, match="must exist"):
+        state.set_workspace_guard_scope(runtime_private_roots=["missing"])
+
+    private = work_dir / "runtime-private"
+    private.mkdir()
+    saved = state.set_workspace_guard_scope(runtime_private_roots=["runtime-private"])
+
+    assert saved == {
+        "runtime_private_roots": ["runtime-private"],
+        "immutable_resource_roots": [],
+    }
+    assert HitlRuntimeState(work_dir).workspace_guard_scope() == saved
+
+
+def test_workspace_guard_scope_rejects_unsafe_or_overlapping_roots():
+    with pytest.raises(ValueError, match="workspace-relative"):
+        WorkspaceGuardScope.from_value({"runtime_private_roots": ["../outside"]})
+
+    with pytest.raises(ValueError, match="cannot overlap"):
+        WorkspaceGuardScope.from_value({
+            "runtime_private_roots": ["cache"],
+            "immutable_resource_roots": ["cache/nested"],
+        })
+
+
+def test_public_fingerprint_binds_scope(tmp_path):
+    work_dir = _workspace(tmp_path)
+    private = work_dir / "runtime-private"
+    private.mkdir()
+
+    unscoped = HitlWorkspaceWriteGuard.public_fingerprint(work_dir)
+    scoped = HitlWorkspaceWriteGuard.public_fingerprint(
+        work_dir,
+        scope={"runtime_private_roots": ["runtime-private"]},
+    )
+
+    assert scoped != unscoped
 
 
 def test_explicit_path_guard_retains_content_hashing(tmp_path):

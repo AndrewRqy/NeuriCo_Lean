@@ -54,6 +54,7 @@ from core.scorer import run_scorer
 from core.hitl_scoring_workspace import (
     run_isolated_scorer,
     scoring_source_workspace_fingerprint,
+    scoring_source_workspace_scope,
 )
 from core.hitl_runtime_state import HitlRuntimeState, worker_command_requires_resume
 from core.scoring_seal import (
@@ -276,12 +277,16 @@ BOOTSTRAP_SEALED_PATHS: List[str] = [
 def _require_reviewed_workspace_unchanged(
     work_dir: Path,
     reviewed_fingerprint: str,
+    reviewed_scope: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Refuse a HITL handoff when public artifacts changed after review began."""
     from core.hitl_workspace_guard import HitlWorkspaceWriteGuard
 
     expected = str(reviewed_fingerprint or "").strip()
-    current = HitlWorkspaceWriteGuard.public_fingerprint(work_dir)
+    current = HitlWorkspaceWriteGuard.public_fingerprint(
+        work_dir,
+        scope=reviewed_scope,
+    )
     if not expected or current != expected:
         raise RuntimeError(
             "HITL workspace changed after its reviewed snapshot or has no saved fingerprint; "
@@ -623,9 +628,17 @@ class ResearchPipelineOrchestrator:
                 runtime.pipeline_stage == "experiment_runner"
                 and not self.hitl_autoresearch
             ):
-                _require_reviewed_workspace_unchanged(
-                    self.work_dir, str(pending.get("workspace_fingerprint", ""))
-                )
+                reviewed_scope = pending.get("workspace_fingerprint_scope")
+                if reviewed_scope is None:
+                    _require_reviewed_workspace_unchanged(
+                        self.work_dir, str(pending.get("workspace_fingerprint", ""))
+                    )
+                else:
+                    _require_reviewed_workspace_unchanged(
+                        self.work_dir,
+                        str(pending.get("workspace_fingerprint", "")),
+                        reviewed_scope,
+                    )
                 if validator is not None:
                     validation = validator()
                     if not validation.get("valid"):
@@ -2011,11 +2024,18 @@ class ResearchPipelineOrchestrator:
                     pending,
                     cached_score,
                 )
+                reviewed_scope = scoring_source_workspace_scope(
+                    pending,
+                    cached_score,
+                )
                 if not reviewed_fingerprint:
                     raise RuntimeError(
                         "HITL initial scoring is missing its reviewed workspace fingerprint."
                     )
-                current_fingerprint = HitlWorkspaceWriteGuard.public_fingerprint(self.work_dir)
+                current_fingerprint = HitlWorkspaceWriteGuard.public_fingerprint(
+                    self.work_dir,
+                    scope=reviewed_scope,
+                )
                 if current_fingerprint != reviewed_fingerprint:
                     raise RuntimeError(
                         "The public workspace changed after the worker submitted its reviewed finish "
@@ -2033,7 +2053,10 @@ class ResearchPipelineOrchestrator:
                     stale_results = self.work_dir / "scoring" / "results.json"
                     stale_results.unlink(missing_ok=True)
                     source_workspace_fingerprint = (
-                        HitlWorkspaceWriteGuard.public_fingerprint(self.work_dir)
+                        HitlWorkspaceWriteGuard.public_fingerprint(
+                            self.work_dir,
+                            scope=reviewed_scope,
+                        )
                     )
                     source_sha = checkpoints.create_checkpoint(
                         "HITL initial experiment before isolated scoring"
@@ -2044,6 +2067,7 @@ class ResearchPipelineOrchestrator:
                             "status": "prepared",
                             "source_checkpoint_sha": source_sha,
                             "source_workspace_fingerprint": source_workspace_fingerprint,
+                            "source_workspace_fingerprint_scope": reviewed_scope,
                         },
                     )
                 try:
@@ -2459,10 +2483,18 @@ class ResearchPipelineOrchestrator:
             approved = runtime.phase_finish_result() or {}
             if not approved and self.hitl_autoresearch:
                 approved = self._initial_stage_request(RULE_MAKER_STAGE) or {}
-            _require_reviewed_workspace_unchanged(
-                self.work_dir,
-                str(approved.get("workspace_fingerprint", "")),
-            )
+            reviewed_scope = approved.get("workspace_fingerprint_scope")
+            if reviewed_scope is None:
+                _require_reviewed_workspace_unchanged(
+                    self.work_dir,
+                    str(approved.get("workspace_fingerprint", "")),
+                )
+            else:
+                _require_reviewed_workspace_unchanged(
+                    self.work_dir,
+                    str(approved.get("workspace_fingerprint", "")),
+                    reviewed_scope,
+                )
             self.state.complete_stage(RULE_MAKER_STAGE, True, result.get("outputs"))
             discard_completed_rollback_snapshot()
             return {

@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import agents.autoresearch_proposer as proposer  # noqa: E402
 
 
-def test_results_summary_does_not_descend_into_nested_virtualenv(tmp_path):
+def test_results_summary_does_not_trust_virtualenv_marker(tmp_path):
     results = tmp_path / "results"
     ordinary = results / "experiment_runner" / "metrics.json"
     ordinary.parent.mkdir(parents=True)
@@ -26,7 +26,7 @@ def test_results_summary_does_not_descend_into_nested_virtualenv(tmp_path):
 
     assert "experiment_runner/metrics.json" in paths
     assert not any("site-packages" in path for path in paths)
-    assert not any("state_env" in path for path in paths)
+    assert "experiment_runner/state_embedding/state_env/" in paths
 
 
 def test_results_summary_is_bounded_and_reports_truncation(tmp_path, monkeypatch):

@@ -93,6 +93,10 @@ class HitlRuntimeState:
             "manager_provider": "",
             "worker_continuation": None,
             "pending_worker_command": None,
+            "workspace_guard_scope": {
+                "runtime_private_roots": [],
+                "immutable_resource_roots": [],
+            },
             "next_autoresearch_action": None,
             "rejected_whiteboard_cleanup": None,
             "frontier_decision_transition": None,
@@ -438,6 +442,48 @@ class HitlRuntimeState:
     def pending_worker_command(self) -> Optional[Dict[str, Any]]:
         value = self.snapshot().get("pending_worker_command")
         return value if isinstance(value, dict) and value else None
+
+    def workspace_guard_scope(self) -> Dict[str, Any]:
+        """Return the normalized runtime-owned public-fingerprint scope."""
+        from core.hitl_workspace_guard import WorkspaceGuardScope
+
+        value = self.snapshot().get("workspace_guard_scope")
+        return WorkspaceGuardScope.from_value(value).to_dict()
+
+    def set_workspace_guard_scope(
+        self,
+        *,
+        runtime_private_roots: Any = (),
+        immutable_resource_roots: Any = (),
+    ) -> Dict[str, Any]:
+        """Register exact, existing roots before a worker boundary begins."""
+        from core.hitl_workspace_guard import WorkspaceGuardScope
+
+        scope = WorkspaceGuardScope.from_value({
+            "runtime_private_roots": runtime_private_roots,
+            "immutable_resource_roots": immutable_resource_roots,
+        })
+        for relative in scope.excluded_roots:
+            path = self.work_dir / relative
+            if not path.exists() and not path.is_symlink():
+                raise HitlRuntimeStateError(
+                    "HITL workspace guard roots must exist before registration: "
+                    f"{relative}"
+                )
+            if (
+                relative in scope.runtime_private_roots
+                and not path.is_dir()
+                and not path.is_symlink()
+            ):
+                raise HitlRuntimeStateError(
+                    "HITL runtime-private roots must be directories or symlinks: "
+                    f"{relative}"
+                )
+        with self._locked():
+            self._state = self._load_unlocked() or self._default()
+            self._state["workspace_guard_scope"] = scope.to_dict()
+            self._save_unlocked()
+        return scope.to_dict()
 
     def begin_worker_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
         """Persist one worker command or return its matching retry record."""

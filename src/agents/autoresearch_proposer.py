@@ -611,12 +611,7 @@ def _context_entry_chars(entry: Dict[str, Any]) -> int:
 
 
 def _prune_context_directory(path: Path) -> bool:
-    if path.name in _CONTEXT_DIRECTORY_NAMES_TO_PRUNE:
-        return True
-    try:
-        return (path / "pyvenv.cfg").is_file()
-    except OSError:
-        return False
+    return path.name in _CONTEXT_DIRECTORY_NAMES_TO_PRUNE
 
 
 def _is_hidden_context_path(rel_path: str) -> bool:

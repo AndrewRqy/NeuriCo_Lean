@@ -7,11 +7,11 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from core.hitl_util import sha256_file
 
-_EXCLUDED_PUBLIC_PREFIXES = {
+_BUILTIN_RUNTIME_PRIVATE_ROOTS = {
     ".claude",
     ".codex",
     ".gemini",
@@ -20,19 +20,12 @@ _EXCLUDED_PUBLIC_PREFIXES = {
     ".venv",
     "__pycache__",
     "logs",
+}
+
+_EXCLUDED_PUBLIC_FILES = {
     # Runtime-owned: PipelineState._save() rewrites it during guarded phases,
     # so snapshotting it turns the runtime's own write into a worker violation.
     "STATE.md",
-}
-
-_RUNTIME_PRIVATE_DIRECTORY_NAMES = {
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".tox",
-    ".ipynb_checkpoints",
-    "node_modules",
 }
 
 
@@ -49,6 +42,75 @@ class _FileState:
     link_target: str | None = None
 
 
+@dataclass(frozen=True)
+class WorkspaceGuardScope:
+    """Runtime-owned roots omitted from recursive public traversal.
+
+    These roots are explicit protocol state.  Filesystem names and marker
+    files are never consulted when deciding whether a directory is private or
+    immutable, so a worker cannot hide a new subtree after capture.
+    """
+
+    runtime_private_roots: tuple[str, ...] = ()
+    immutable_resource_roots: tuple[str, ...] = ()
+
+    @classmethod
+    def from_value(cls, value: Any) -> "WorkspaceGuardScope":
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            value = value.to_dict()
+        if not isinstance(value, Mapping):
+            raise ValueError("HITL workspace guard scope must be a mapping.")
+        return cls(
+            runtime_private_roots=cls._normalize_roots(
+                value.get("runtime_private_roots", ()),
+                field="runtime_private_roots",
+            ),
+            immutable_resource_roots=cls._normalize_roots(
+                value.get("immutable_resource_roots", ()),
+                field="immutable_resource_roots",
+            ),
+        )._validated()
+
+    @staticmethod
+    def _normalize_roots(values: Any, *, field: str) -> tuple[str, ...]:
+        if values is None:
+            return ()
+        if not isinstance(values, (list, tuple)):
+            raise ValueError(f"HITL workspace guard {field} must be a list.")
+        normalized = {HitlWorkspaceWriteGuard._normalize_relative(str(value)) for value in values}
+        return tuple(sorted(normalized))
+
+    def _validated(self) -> "WorkspaceGuardScope":
+        private = set(self.runtime_private_roots)
+        immutable = set(self.immutable_resource_roots)
+        overlap = sorted(private & immutable)
+        if overlap:
+            raise ValueError(
+                "HITL workspace guard roots cannot be both runtime-private and immutable: "
+                + ", ".join(overlap)
+            )
+        roots = sorted(private | immutable)
+        for index, root in enumerate(roots):
+            for other in roots[index + 1 :]:
+                if other.startswith(root + "/"):
+                    raise ValueError(
+                        "HITL workspace guard roots cannot overlap: " f"{root}, {other}"
+                    )
+        return self
+
+    def to_dict(self) -> dict[str, list[str]]:
+        return {
+            "runtime_private_roots": list(self.runtime_private_roots),
+            "immutable_resource_roots": list(self.immutable_resource_roots),
+        }
+
+    @property
+    def excluded_roots(self) -> tuple[str, ...]:
+        return tuple(sorted(set(self.runtime_private_roots) | set(self.immutable_resource_roots)))
+
+
 class HitlWorkspaceWriteGuard:
     """Compare a bounded workspace view at one runtime-owned phase boundary.
 
@@ -63,23 +125,42 @@ class HitlWorkspaceWriteGuard:
         work_dir: Path,
         baseline: dict[str, _FileState],
         tracked_paths: tuple[str, ...] | None = None,
+        scope: WorkspaceGuardScope | Mapping[str, Any] | None = None,
     ) -> None:
         self.work_dir = Path(work_dir).resolve()
         self.baseline = dict(baseline)
         self.tracked_paths = tracked_paths
+        self.scope = WorkspaceGuardScope.from_value(scope)
 
     @classmethod
-    def capture_public(cls, work_dir: Path) -> "HitlWorkspaceWriteGuard":
+    def capture_public(
+        cls,
+        work_dir: Path,
+        *,
+        scope: WorkspaceGuardScope | Mapping[str, Any] | None = None,
+    ) -> "HitlWorkspaceWriteGuard":
         root = Path(work_dir).resolve()
-        return cls(root, cls._snapshot(root, include_hidden=False))
+        normalized_scope = WorkspaceGuardScope.from_value(scope)
+        return cls(
+            root,
+            cls._snapshot(root, include_hidden=False, scope=normalized_scope),
+            scope=normalized_scope,
+        )
 
     @classmethod
-    def public_fingerprint(cls, work_dir: Path) -> str:
+    def public_fingerprint(
+        cls,
+        work_dir: Path,
+        *,
+        scope: WorkspaceGuardScope | Mapping[str, Any] | None = None,
+    ) -> str:
         """Return a stable digest of the public workspace at one boundary."""
         root = Path(work_dir).resolve()
-        states = cls._snapshot(root, include_hidden=False)
+        normalized_scope = WorkspaceGuardScope.from_value(scope)
+        states = cls._snapshot(root, include_hidden=False, scope=normalized_scope)
         digest = hashlib.sha256()
-        digest.update(b"neurico-hitl-public-fingerprint-v2\0")
+        digest.update(b"neurico-hitl-public-fingerprint-v3\0")
+        digest.update(repr(normalized_scope.to_dict()).encode("utf-8"))
         for path, state in sorted(states.items()):
             digest.update(path.encode("utf-8"))
             digest.update(repr(state).encode("utf-8"))
@@ -127,57 +208,67 @@ class HitlWorkspaceWriteGuard:
     def _current_snapshot(self) -> dict[str, _FileState]:
         if self.tracked_paths is not None:
             return self._snapshot_paths(self.work_dir, self.tracked_paths, hash_content=True)
-        return self._snapshot(self.work_dir, include_hidden=False)
+        return self._snapshot(
+            self.work_dir,
+            include_hidden=False,
+            scope=self.scope,
+        )
 
     @staticmethod
-    def _snapshot(root: Path, *, include_hidden: bool) -> dict[str, _FileState]:
+    def _snapshot(
+        root: Path,
+        *,
+        include_hidden: bool,
+        scope: WorkspaceGuardScope,
+    ) -> dict[str, _FileState]:
         states: dict[str, _FileState] = {}
-        for current, dir_names, file_names in os.walk(
-            root,
-            topdown=True,
-            followlinks=False,
-        ):
-            current_path = Path(current)
-            dir_names.sort()
-            file_names.sort()
+        excluded_roots = set(scope.excluded_roots) | _BUILTIN_RUNTIME_PRIVATE_ROOTS
+        for relative in sorted(excluded_roots):
+            path = root / relative
+            try:
+                stats = path.lstat()
+            except FileNotFoundError:
+                continue
+            states[relative] = HitlWorkspaceWriteGuard._root_state(path, stats)
 
-            retained_dirs: list[str] = []
-            for name in dir_names:
-                path = current_path / name
+        pending_directories = [root]
+        while pending_directories:
+            current_path = pending_directories.pop()
+            try:
+                with os.scandir(current_path) as iterator:
+                    entries = sorted(iterator, key=lambda entry: entry.name)
+            except OSError:
+                continue
+
+            retained_dirs: list[Path] = []
+            for entry in entries:
+                path = Path(entry.path)
                 relative = path.relative_to(root).as_posix()
                 if not include_hidden and HitlWorkspaceWriteGuard._is_excluded(relative):
                     continue
+                if relative in excluded_roots:
+                    continue
                 try:
-                    stats = path.lstat()
+                    stats = entry.stat(follow_symlinks=False)
                 except FileNotFoundError:
                     continue
-                if stat.S_ISLNK(stats.st_mode):
+                if stat.S_ISDIR(stats.st_mode):
+                    if entry.name == ".git":
+                        states[relative] = HitlWorkspaceWriteGuard._root_state(path, stats)
+                        continue
                     states[relative] = HitlWorkspaceWriteGuard._file_state(
                         path,
                         stats,
                         hash_content=False,
                     )
-                    continue
-                if HitlWorkspaceWriteGuard._is_runtime_private_directory(path):
-                    continue
-                retained_dirs.append(name)
-            dir_names[:] = retained_dirs
-
-            for name in file_names:
-                path = current_path / name
-                relative = path.relative_to(root).as_posix()
-                if not include_hidden and HitlWorkspaceWriteGuard._is_excluded(relative):
-                    continue
-                try:
-                    stats = path.lstat()
-                except FileNotFoundError:
-                    continue
-                if stat.S_ISLNK(stats.st_mode) or stat.S_ISREG(stats.st_mode):
+                    retained_dirs.append(path)
+                elif stat.S_ISLNK(stats.st_mode) or stat.S_ISREG(stats.st_mode):
                     states[relative] = HitlWorkspaceWriteGuard._file_state(
                         path,
                         stats,
                         hash_content=False,
                     )
+            pending_directories.extend(reversed(retained_dirs))
         return states
 
     @staticmethod
@@ -217,6 +308,10 @@ class HitlWorkspaceWriteGuard:
             kind = "file"
             digest = sha256_file(path) if hash_content else None
             link_target = None
+        elif stat.S_ISDIR(stats.st_mode):
+            kind = "directory"
+            digest = None
+            link_target = None
         else:
             kind = "other"
             digest = None
@@ -234,18 +329,28 @@ class HitlWorkspaceWriteGuard:
         )
 
     @staticmethod
-    def _is_runtime_private_directory(path: Path) -> bool:
-        if path.name in _RUNTIME_PRIVATE_DIRECTORY_NAMES:
-            return True
-        try:
-            return (path / "pyvenv.cfg").is_file()
-        except OSError:
-            return False
+    def _root_state(path: Path, stats: os.stat_result) -> _FileState:
+        """Record root identity without observing mutable contents beneath it."""
+        state = HitlWorkspaceWriteGuard._file_state(
+            path,
+            stats,
+            hash_content=False,
+        )
+        return _FileState(
+            kind=state.kind,
+            mode=state.mode,
+            size=0,
+            modified_ns=0,
+            changed_ns=0,
+            device=state.device,
+            inode=state.inode,
+            link_target=state.link_target,
+        )
 
     @staticmethod
     def _is_excluded(relative: str) -> bool:
         parts = Path(relative).parts
-        return bool(parts and (parts[0] in _EXCLUDED_PUBLIC_PREFIXES or ".git" in parts))
+        return bool(len(parts) == 1 and parts[0] in _EXCLUDED_PUBLIC_FILES)
 
     @staticmethod
     def _normalize_relative(path: str) -> str:
