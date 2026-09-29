@@ -1031,7 +1031,12 @@ class ResearchPipelineOrchestrator:
 
         finally:
             if experiment_recovery_armed and not results.get("success", False):
-                self._recover_experiment_runner_from_runtime_checkpoint()
+                if self.hitl_autoresearch:
+                    # Shutdown and restart must select the same durable boundary,
+                    # including a pending or already-scored initial candidate.
+                    self.prepare_initial_resume()
+                else:
+                    self._recover_experiment_runner_from_runtime_checkpoint()
 
             # Sweep any Modal-side resources before the workspace is closed out.
             # Gated on .neurico/modal_resources.json — non-Modal runs are a
@@ -1193,15 +1198,18 @@ class ResearchPipelineOrchestrator:
         if not recovery:
             return
         initial_boundary = self.state.get_runtime_recovery("initial_stage") if self.hitl_autoresearch else None
+        # Validate both halves before retiring score evidence or changing files.
+        rollback = HitlStageRollback.from_descriptor(
+            self.work_dir,
+            {**recovery, "hitl_snapshot_paths": list(HitlGitStateStore.rollback_paths())},
+        )
         self._retire_initial_scoring_refs_before_rollback()
         canceller = getattr(self.hitl_manager, "abandon_worker_request_for_rollback", None)
         if callable(canceller):
             canceller(
                 "The scored HITL experiment did not complete and runtime is restoring the pre-experiment state."
             )
-        checkpoint_sha = str(recovery.get("checkpoint_sha", "")).strip()
-        if not checkpoint_sha:
-            raise RuntimeError("Missing experiment_runner runtime recovery checkpoint_sha")
+        checkpoint_sha = rollback.checkpoint_sha
 
         from core.autoresearch import CheckpointManager
 
@@ -1211,23 +1219,10 @@ class ResearchPipelineOrchestrator:
             checkpoint_sha,
             clean_untracked_public=True,
         )
-        snapshot_ref = str(recovery.get("hitl_snapshot_ref", "")).strip()
-        snapshot_commit = str(recovery.get("hitl_snapshot_commit", "")).strip()
-        if not snapshot_ref or not snapshot_commit:
-            raise RuntimeError(
-                "Missing HITL private-state recovery snapshot for experiment_runner."
-            )
-        if not snapshot_ref.startswith("refs/neurico/hitl-rollback/"):
-            raise RuntimeError("Invalid HITL private-state recovery snapshot reference.")
-        state_store = HitlGitStateStore(self.work_dir)
+        snapshot_ref = rollback.hitl_snapshot.ref
+        state_store = rollback.state_store
         try:
-            state_store.restore(
-                HitlGitSnapshot(
-                    ref=snapshot_ref,
-                    commit_sha=snapshot_commit,
-                    paths=state_store.rollback_paths(),
-                )
-            )
+            state_store.restore(rollback.hitl_snapshot)
         except Exception as exc:
             raise RuntimeError(
                 "Could not restore the armed HITL private-state recovery boundary."

@@ -12,6 +12,8 @@ This module orchestrates the execution of research by:
 from pathlib import Path
 from typing import Optional, Dict, Any
 from functools import wraps
+from contextlib import ExitStack
+from uuid import uuid4
 import inspect
 import logging
 import subprocess
@@ -111,6 +113,32 @@ def _record_github_repository(
     metadata["github_repo_private"] = _github_repository_private(repo_info)
 
 
+def _enter_workspace_run_context(stack, work_dir, *, owner, install_control=True):
+    """Keep the existing lease and stop control alive through runner cleanup."""
+    from core.hitl_lock import hitl_workspace_run_lease
+    from core.hitl_run_control import (
+        HitlRunStopControl, active_hitl_run_stop_control, activate_hitl_run_stop_control,
+    )
+
+    workspace = Path(work_dir).resolve()
+    control = active_hitl_run_stop_control()
+    if control is not None and control.work_dir != workspace:
+        raise RuntimeError("This process already controls a different workspace run.")
+    if control is None and not install_control:
+        stack.enter_context(hitl_workspace_run_lease(workspace, owner=owner))
+        return None
+    owns_control = control is None
+    if owns_control:
+        control = HitlRunStopControl(workspace, uuid4().hex)
+    stack.enter_context(hitl_workspace_run_lease(
+        workspace, owner={**owner, "request_id": control.request_id}, reuse=True,
+    ))
+    if owns_control:
+        stack.enter_context(activate_hitl_run_stop_control(control))
+    raise_if_hitl_run_stop_requested()
+    return control
+
+
 def _with_hitl_workspace_run_ownership(method):
     """Hold the workspace lease around every HITL entry into the shared runner."""
     method_signature = inspect.signature(method)
@@ -126,8 +154,6 @@ def _with_hitl_workspace_run_ownership(method):
         )
         if not hitl_interface:
             return method(self, *args, **kwargs)
-
-        from core.hitl_lock import hitl_workspace_run_lease
 
         idea_id = str(arguments.arguments["idea_id"])
         expected_work_dir = self._hitl_workspace_for_run_ownership(
@@ -154,9 +180,11 @@ def _with_hitl_workspace_run_ownership(method):
             else "fresh"
         )
         hitl_mode = normalize_hitl_mode(arguments.arguments["hitl_mode"])
-        with hitl_workspace_run_lease(
-            work_dir,
-            owner={
+        from core.hitl_run_control import active_hitl_run_stop_control
+
+        owns_control = active_hitl_run_stop_control() is None
+        with ExitStack() as stack:
+            control = _enter_workspace_run_context(stack, work_dir, owner={
                 "idea_id": idea_id,
                 "interface": str(hitl_interface),
                 "mode": mode,
@@ -165,9 +193,7 @@ def _with_hitl_workspace_run_ownership(method):
                 ),
                 "hitl_mode": hitl_mode.value,
                 "provider": str(arguments.arguments["provider"]),
-                "request_id": str(os.environ.get("NEURICO_HITL_REQUEST_ID", "")).strip(),
-            },
-        ):
+            }, install_control=not bool(arguments.arguments["hitl_research"]))
             from core.pipeline_orchestrator import PipelineState
 
             PipelineState.require_compatible_workflow(
@@ -178,7 +204,18 @@ def _with_hitl_workspace_run_ownership(method):
             # waiting to acquire this lease. Honor that request before the
             # runner mutates any research state.
             raise_if_hitl_run_stop_requested()
-            return method(*arguments.args, **arguments.kwargs)
+            host_scope = ExitStack()
+            arguments.arguments["_hitl_host_scope"] = host_scope
+            try:
+                return method(*arguments.args, **arguments.kwargs)
+            finally:
+                # Stop owned manager writers before recovery and lease release,
+                # even when startup or final status publication raises.
+                host_scope.close()
+                if owns_control and control is not None and control.requested() and not arguments.arguments["hitl_research"]:
+                    from core.hitl_autoresearch import recover_interrupted_hitl_autoresearch_attempt
+
+                    recover_interrupted_hitl_autoresearch_attempt(work_dir)
 
     return owned_run
 
@@ -312,6 +349,7 @@ class ResearchRunner:
         hitl_host: Optional[Any] = None,
         hitl_mode: str = "full",
         hitl_work_dir: Optional[Path] = None,
+        _hitl_host_scope: Optional[ExitStack] = None,
     ) -> Dict[str, Any]:
         """
         Execute research for a given idea.
@@ -718,6 +756,19 @@ class ResearchRunner:
             if autoresearch:
                 preserve_initial_inputs = prepare_initial_hitl_resume(work_dir)
 
+        recovered_hitl_attempt = None
+        if hitl and continue_autoresearch:
+            # Recovery can restore the private HITL manager database. Do it before
+            # the host starts accepting conversation messages against that state.
+            from core.hitl_autoresearch import recover_interrupted_hitl_autoresearch_attempt
+
+            recovered_hitl_attempt = recover_interrupted_hitl_autoresearch_attempt(work_dir)
+
+        if recovered_hitl_attempt is not None and recovered_hitl_attempt.recovery_classification in {
+            "pending_worker_request", "frontier_decision_transition",
+        }:
+            preserve_initial_inputs = True
+
         # Create subdirectories
         (work_dir / "logs").mkdir(parents=True, exist_ok=True)
         (work_dir / "results").mkdir(parents=True, exist_ok=True)
@@ -740,20 +791,11 @@ class ResearchRunner:
 
             issues = staged_function_mismatches(work_dir, idea)
             if issues:
-                raise RuntimeError("Cannot resume reviewed initial inputs: " + "; ".join(issues))
+                raise RuntimeError("Cannot resume reviewed inputs: " + "; ".join(issues))
             stage_local_resources(work_dir, idea, preserve_existing=True)
         else:
             stage_local_resources(work_dir, idea)
 
-        recovered_hitl_attempt = None
-        if hitl and continue_autoresearch:
-            # Recovery can restore the private HITL manager database. Do it before
-            # the host starts accepting conversation messages against that state.
-            from core.hitl_autoresearch import recover_interrupted_hitl_autoresearch_attempt
-
-            recovered_hitl_attempt = recover_interrupted_hitl_autoresearch_attempt(work_dir)
-
-        owns_hitl_host = False
         if hitl:
             from core.hitl_lock import select_hitl_manager_provider
             from core.hitl_manager_inbox import HitlManagerInbox
@@ -781,8 +823,11 @@ class ResearchRunner:
                     project_root=self.project_root,
                     title=title,
                 )
+                # Managed entry always supplies its cleanup scope. Register
+                # immediately after successful startup, before provider setup.
+                assert _hitl_host_scope is not None
                 hitl_host.start()
-                owns_hitl_host = True
+                _hitl_host_scope.callback(hitl_host.stop)
             set_manager_provider = getattr(hitl_host.manager, "set_provider", None)
             if not callable(set_manager_provider):
                 raise RuntimeError("The HITL host cannot select a manager backend.")
@@ -861,8 +906,6 @@ class ResearchRunner:
                     push_existing=hitl_work_dir is not None,
                     publish_github=not hitl_stop_requested,
                 )
-                if owns_hitl_host:
-                    hitl_host.stop()
 
             result = {
                 "work_dir": work_dir,
@@ -926,8 +969,6 @@ class ResearchRunner:
                     success,
                     push_existing=hitl_work_dir is not None,
                 )
-                if owns_hitl_host:
-                    hitl_host.stop()
 
             result = {
                 "work_dir": work_dir,
@@ -1130,8 +1171,6 @@ class ResearchRunner:
                     push_existing=hitl_work_dir is not None,
                     publish_github=not hitl_stop_requested,
                 )
-                if owns_hitl_host:
-                    hitl_host.stop()
 
             # Return result info
             result = {

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import json
 import os
 import re
@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from core.config_loader import ConfigLoader  # noqa: E402
 from core.hitl_paths import hitl_launch_requests_dir, hitl_launch_status_path  # noqa: E402
+from core.hitl_lock import HitlWorkspaceRunActiveError, hitl_workspace_run_lease  # noqa: E402
 from core.hitl_mode import normalize_hitl_mode  # noqa: E402
 from core.hitl_run_control import (  # noqa: E402
     HitlRunStopControl,
@@ -189,6 +190,7 @@ def main() -> int:
     claimed = _claim_request(args.request)
     request: Dict[str, Any] = {}
     control: HitlRunStopControl | None = None
+    run_scope = ExitStack()
     try:
         request = _load_request(claimed)
         work_dir = Path(str(request["work_dir"])).resolve()
@@ -212,59 +214,71 @@ def main() -> int:
         continuation = request["mode"] == "continue"
         log_path = work_dir / "logs" / "hitl_runtime.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with activate_hitl_run_stop_control(control):
-            if control.requested():
-                raise HitlRunStopRequested("HITL run stopped before startup completed.")
-            atomic_write_json(
-                hitl_launch_status_path(work_dir),
-                {
-                    "status": "running",
-                    "pid": os.getpid(),
-                    "request_id": request["request_id"],
-                    "started_at": started_at,
-                    "updated_at": started_at,
-                    "mode": request["mode"],
-                    "workflow": request["workflow"],
+        run_scope.enter_context(hitl_workspace_run_lease(
+            work_dir,
+            owner={
+                "request_id": request_id,
+                "idea_id": request["idea_id"],
+                "provider": request["provider"],
+                "mode": request["mode"],
+                "workflow": request["workflow"],
+                "hitl_mode": hitl_mode,
+                "interface": request["interface"],
+            },
+        ))
+        run_scope.enter_context(activate_hitl_run_stop_control(control))
+        if control.requested():
+            raise HitlRunStopRequested("HITL run stopped before startup completed.")
+        atomic_write_json(
+            hitl_launch_status_path(work_dir),
+            {
+                "status": "running",
+                "pid": os.getpid(),
+                "request_id": request["request_id"],
+                "started_at": started_at,
+                "updated_at": started_at,
+                "mode": request["mode"],
+                "workflow": request["workflow"],
+                "hitl_mode": hitl_mode,
+                "provider": request["provider"],
+            },
+        )
+        with log_path.open("a", encoding="utf-8") as output:
+            with redirect_stdout(output), redirect_stderr(output):
+                github_requested = bool(request.get("github", False))
+                runner = ResearchRunner(
+                    project_root=project_root,
+                    use_github=github_requested,
+                    github_org=os.getenv("GITHUB_ORG", ""),
+                    github_required=github_requested,
+                )
+                # The runtime-owned GitHub manager has captured its
+                # credential. Everything launched by this dedicated run
+                # process inherits the credential-free environment below.
+                remove_github_credentials(os.environ)
+                run_args = {
+                    "provider": str(request["provider"]),
+                    "write_paper": bool(request.get("write_paper", False)),
+                    "paper_style": request.get("paper_style") or None,
                     "hitl_mode": hitl_mode,
-                    "provider": request["provider"],
-                },
-            )
-            with log_path.open("a", encoding="utf-8") as output:
-                with redirect_stdout(output), redirect_stderr(output):
-                    github_requested = bool(request.get("github", False))
-                    runner = ResearchRunner(
-                        project_root=project_root,
-                        use_github=github_requested,
-                        github_org=os.getenv("GITHUB_ORG", ""),
-                        github_required=github_requested,
+                    "hitl_work_dir": work_dir,
+                }
+                if request["workflow"] == "ordinary":
+                    run_args["hitl_research"] = str(request["interface"])
+                else:
+                    run_args.update(
+                        autoresearch_iterations=int(request.get("iterations", 1)),
+                        hitl_autoresearch=(
+                            None if continuation else str(request["interface"])
+                        ),
+                        hitl_continue_autoresearch=(
+                            str(request["interface"]) if continuation else None
+                        ),
                     )
-                    # The runtime-owned GitHub manager has captured its
-                    # credential. Everything launched by this dedicated run
-                    # process inherits the credential-free environment below.
-                    remove_github_credentials(os.environ)
-                    run_args = {
-                        "provider": str(request["provider"]),
-                        "write_paper": bool(request.get("write_paper", False)),
-                        "paper_style": request.get("paper_style") or None,
-                        "hitl_mode": hitl_mode,
-                        "hitl_work_dir": work_dir,
-                    }
-                    if request["workflow"] == "ordinary":
-                        run_args["hitl_research"] = str(request["interface"])
-                    else:
-                        run_args.update(
-                            autoresearch_iterations=int(request.get("iterations", 1)),
-                            hitl_autoresearch=(
-                                None if continuation else str(request["interface"])
-                            ),
-                            hitl_continue_autoresearch=(
-                                str(request["interface"]) if continuation else None
-                            ),
-                        )
-                    result = runner.run_research(
-                        str(request["idea_id"]),
-                        **run_args,
-                    )
+                result = runner.run_research(
+                    str(request["idea_id"]),
+                    **run_args,
+                )
         if control.requested() and not bool(result.get("success", False)):
             return _finalize_stopped_run(
                 work_dir=work_dir,
@@ -301,6 +315,9 @@ def main() -> int:
                 control=control,
             )
         raise
+    except HitlWorkspaceRunActiveError:
+        # A losing launch must not overwrite the current owner's live status.
+        raise
     except Exception as exc:
         if request.get("work_dir"):
             failed_at = utc_now()
@@ -320,6 +337,7 @@ def main() -> int:
             )
         raise
     finally:
+        run_scope.close()
         claimed.unlink(missing_ok=True)
 
 

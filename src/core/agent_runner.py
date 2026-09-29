@@ -343,10 +343,12 @@ def run_prebuilt_cli_agent(
                 return_code = process.wait()
         else:
             return_code = process.wait()
-            if process_group_id is not None:
-                background_processes_terminated = _terminate_lingering_process_group(
-                    process_group_id
-                )
+        # A stopped/timed-out parent may exit before a child that ignores TERM.
+        # Reuse the retained group ID after reaping the parent in every case.
+        if process_group_id is not None:
+            background_processes_terminated = _terminate_lingering_process_group(
+                process_group_id
+            )
         reader.join(timeout=5)
         _flush_output()
 

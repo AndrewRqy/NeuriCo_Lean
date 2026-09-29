@@ -769,6 +769,7 @@ def _archive_failed_hitl_attempt(
     attempt_id: str,
     phase: str,
     reason: str,
+    attempt_directory_removed: bool = True,
 ) -> Path:
     """Preserve a small, noncanonical runtime incident record before cleanup.
 
@@ -792,7 +793,7 @@ def _archive_failed_hitl_attempt(
         "attempt_id": attempt_id,
         "phase": phase,
         "reason": reason,
-        "attempt_directory_removed": True,
+        "attempt_directory_removed": attempt_directory_removed,
     }
     incident_path = archive_dir / "runtime_incident.json"
     atomic_write_json(incident_path, payload, ensure_ascii=True, indent=2)
@@ -938,17 +939,18 @@ def recover_interrupted_hitl_attempt_if_needed(work_dir: Path) -> Optional[HitlR
         parent_sha=current_best_sha,
         attempt_id=marker,
         phase="interrupted_recovery",
+        attempt_directory_removed=False,
         reason=(
             "Runtime recovered an interrupted HITL attempt before it reached a "
             "frontier decision."
         ),
     )
-    shutil.rmtree(attempt_dir, ignore_errors=True)
+    # Keep the existing attempt history and logs after retiring its active marker.
     return HitlRecoveryResult(
         marker=marker,
         restored_checkpoint_sha=current_best_sha,
         removed_attempt_dir=attempt_dir,
-        attempt_dir_removed=True,
+        attempt_dir_removed=False,
         recovery_classification=classification,
     )
 
