@@ -827,6 +827,62 @@ class HitlPaths:
         return self.tool_bin_dir / "view_current_frontier"
 
 
+def log_frontier_decision_record(
+    work_dir: Path,
+    *,
+    proposal_idea_id: str,
+    accepted: bool,
+    reason: str,
+    provenance: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persist one manager-finalized frontier decision without starting a manager."""
+    log = HitlIdeaLog(work_dir)
+    parent_node_id = str(provenance.get("parent_node_id", "")).strip()
+    attempt_id = str(provenance.get("attempt_id", "")).strip()
+    for existing in log.records():
+        if (
+            parent_node_id
+            and attempt_id
+            and existing.get("parent_node_id") == parent_node_id
+            and existing.get("attempt_id") == attempt_id
+            and existing.get("idea_type") == "decision"
+            and existing.get("actor") == "manager"
+            and existing.get("decision_needed")
+            == "Should the scored candidate be retained in the HITL research frontier?"
+        ):
+            return existing
+    premises = [proposal_idea_id]
+    from core.hitl_runtime_state import HitlRuntimeState
+
+    pending_request = HitlRuntimeState(work_dir).pending_worker_command()
+    scoring_review_idea_id = str(
+        (pending_request or {}).get("scoring_review_idea_id", "")
+    ).strip()
+    if scoring_review_idea_id and scoring_review_idea_id not in premises:
+        premises.append(scoring_review_idea_id)
+    record = {
+        "pipeline_stage": "experiment_runner",
+        "hitl_stage": "review",
+        "idea_type": "decision",
+        "idea_category": "method_choice",
+        "level": "B",
+        "actor": "manager",
+        "premises": premises,
+        "context": "Manager reviewed the scored AutoResearch candidate against its active frontier direction.",
+        "related_artifacts": [],
+        "decision_needed": "Should the scored candidate be retained in the HITL research frontier?",
+        "options": [
+            "Accept candidate into the frontier.",
+            "Reject candidate and restore its parent frontier node.",
+        ],
+        "decision": "O1" if accepted else "O2",
+        "manager_feedback": str(reason).strip(),
+        "raised": False,
+    }
+    _apply_runtime_provenance(record, provenance)
+    return log.append(record, idempotent=True)
+
+
 class HitlRuntime:
     """Small orchestration helper for one plan-centered HITL stage."""
 
@@ -2101,48 +2157,13 @@ class HitlRuntime:
         provenance: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Finalize the manager's strategic scored-candidate decision."""
-        parent_node_id = str(provenance.get("parent_node_id", "")).strip()
-        attempt_id = str(provenance.get("attempt_id", "")).strip()
-        for existing in self.log.records():
-            if (
-                parent_node_id
-                and attempt_id
-                and existing.get("parent_node_id") == parent_node_id
-                and existing.get("attempt_id") == attempt_id
-                and existing.get("idea_type") == "decision"
-                and existing.get("actor") == "manager"
-                and existing.get("decision_needed")
-                == "Should the scored candidate be retained in the HITL research frontier?"
-            ):
-                return existing
-        premises = [proposal_idea_id]
-        pending_request = self._pending_worker_command()
-        scoring_review_idea_id = str(
-            (pending_request or {}).get("scoring_review_idea_id", "")
-        ).strip()
-        if scoring_review_idea_id and scoring_review_idea_id not in premises:
-            premises.append(scoring_review_idea_id)
-        record = {
-            "pipeline_stage": "experiment_runner",
-            "hitl_stage": "review",
-            "idea_type": "decision",
-            "idea_category": "method_choice",
-            "level": "B",
-            "actor": "manager",
-            "premises": premises,
-            "context": "Manager reviewed the scored AutoResearch candidate against its active frontier direction.",
-            "related_artifacts": [],
-            "decision_needed": "Should the scored candidate be retained in the HITL research frontier?",
-            "options": [
-                "Accept candidate into the frontier.",
-                "Reject candidate and restore its parent frontier node.",
-            ],
-            "decision": "O1" if accepted else "O2",
-            "manager_feedback": str(reason).strip(),
-            "raised": False,
-        }
-        _apply_runtime_provenance(record, provenance)
-        return self.log.append(record, idempotent=True)
+        return log_frontier_decision_record(
+            self.work_dir,
+            proposal_idea_id=proposal_idea_id,
+            accepted=accepted,
+            reason=reason,
+            provenance=provenance,
+        )
 
     def log_frontier_maintenance_decision(
         self,

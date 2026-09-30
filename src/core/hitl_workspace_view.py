@@ -520,14 +520,39 @@ class HitlWorkspaceView:
                 )
             if launch_state == "stopped":
                 exhausted = launch_status.get("reason") == "budget_exhausted"
+                budget_finalization = str(
+                    launch_status.get("budget_finalization", "")
+                ).strip()
+                if exhausted and budget_finalization == "selected_node_restored":
+                    detail = (
+                        "The time limit was reached and the currently selected "
+                        "completed result was restored."
+                    )
+                    next_step = (
+                        "Review the selected result, then start again with a new "
+                        "time limit or no limit."
+                    )
+                elif exhausted and budget_finalization == "no_selected_node":
+                    detail = (
+                        "The time limit was reached before a completed result was "
+                        "selected. Recoverable state was preserved."
+                    )
+                    next_step = (
+                        "Start again with a new time limit or no limit to continue."
+                    )
+                else:
+                    detail = "The run stopped and recoverable progress was preserved."
+                    next_step = (
+                        "Review the saved progress, then start again with a new time "
+                        "limit or no limit."
+                        if exhausted
+                        else "Continue research when ready."
+                    )
                 return projected(
                     "stopped",
                     "Time budget exhausted" if exhausted else "Stopped",
-                    "The run stopped and recoverable progress was preserved.",
-                    next_step=(
-                        "Review the saved progress, then start again with a new time limit or no limit."
-                        if exhausted else "Continue research when ready."
-                    ),
+                    detail,
+                    next_step=next_step,
                     record=launch_status,
                     active=False,
                     display_stage="Stopped",

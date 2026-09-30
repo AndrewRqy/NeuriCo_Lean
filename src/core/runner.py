@@ -213,9 +213,17 @@ def _with_hitl_workspace_run_ownership(method):
                 # even when startup or final status publication raises.
                 host_scope.close()
                 if owns_control and control is not None and control.requested() and not arguments.arguments["hitl_research"]:
-                    from core.hitl_autoresearch import recover_interrupted_hitl_autoresearch_attempt
+                    if control.stop_reason() == "budget_exhausted":
+                        from core.hitl_autoresearch import finalize_budget_exhausted_autoresearch
 
-                    recover_interrupted_hitl_autoresearch_attempt(work_dir)
+                        finalize_budget_exhausted_autoresearch(
+                            work_dir,
+                            request_id=control.request_id,
+                        )
+                    else:
+                        from core.hitl_autoresearch import recover_interrupted_hitl_autoresearch_attempt
+
+                        recover_interrupted_hitl_autoresearch_attempt(work_dir)
 
     return owned_run
 
@@ -528,6 +536,12 @@ class ResearchRunner:
             constraints = idea_spec.get("constraints", {})
             if not isinstance(constraints, dict):
                 raise ValueError("Idea constraints must be an object.")
+            from core.hitl_autoresearch import finalize_previous_budget_exhaustion_if_needed
+
+            finalize_previous_budget_exhaustion_if_needed(
+                Path(hitl_work_dir),
+                current_request_id=control.request_id,
+            )
             control.configure_budget(time_limit_seconds)
             raise_if_hitl_run_stop_requested()
 

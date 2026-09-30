@@ -138,9 +138,17 @@ def _finalize_stopped_run(
                 hitl_mode=request.get("hitl_mode", "full"),
             ).restore_stopped_initial_run()
         else:
-            from core.hitl_autoresearch import recover_interrupted_hitl_autoresearch_attempt
+            if stop_reason == "budget_exhausted":
+                from core.hitl_autoresearch import finalize_budget_exhausted_autoresearch
 
-            recovery = recover_interrupted_hitl_autoresearch_attempt(work_dir)
+                recovery = finalize_budget_exhausted_autoresearch(
+                    work_dir,
+                    request_id=str(request.get("request_id", "")),
+                )
+            else:
+                from core.hitl_autoresearch import recover_interrupted_hitl_autoresearch_attempt
+
+                recovery = recover_interrupted_hitl_autoresearch_attempt(work_dir)
         stopped_at = utc_now()
         status: Dict[str, Any] = {
             "status": "stopped",
@@ -154,7 +162,12 @@ def _finalize_stopped_run(
             "reason": stop_reason,
         }
         if recovery is not None:
-            if isinstance(recovery, dict):
+            if hasattr(recovery, "outcome"):
+                status["budget_finalization"] = str(recovery.outcome)
+                status["checkpoint_sha"] = str(
+                    recovery.restored_checkpoint_sha or ""
+                )
+            elif isinstance(recovery, dict):
                 status["resume_from"] = str(recovery.get("stage", ""))
                 status["checkpoint_sha"] = str(recovery.get("checkpoint_sha", ""))
             else:
@@ -178,7 +191,13 @@ def _finalize_stopped_run(
                 "provider": request.get("provider", ""),
                 "recovery_required": True,
                 "reason": stop_reason,
-                "message": f"Run stopped, but rollback could not finish: {recovery_error}",
+                "message": (
+                    "Time budget expired, but selected-result finalization could not "
+                    "finish: "
+                    if stop_reason == "budget_exhausted"
+                    else "Run stopped, but rollback could not finish: "
+                )
+                + str(recovery_error),
             },
         )
         return 1
@@ -282,7 +301,7 @@ def main() -> int:
                     str(request["idea_id"]),
                     **run_args,
                 )
-        if control.requested() and not bool(result.get("success", False)):
+        if control.requested():
             return _finalize_stopped_run(
                 work_dir=work_dir,
                 request=request,
@@ -324,6 +343,11 @@ def main() -> int:
     except Exception as exc:
         if request.get("work_dir"):
             failed_at = utc_now()
+            stop_reason = (
+                control.stop_reason()
+                if control is not None and control.requested()
+                else ""
+            )
             atomic_write_json(
                 hitl_launch_status_path(Path(str(request["work_dir"]))),
                 {
@@ -335,7 +359,16 @@ def main() -> int:
                     "workflow": request.get("workflow", "autoresearch"),
                     "hitl_mode": request.get("hitl_mode", "full"),
                     "provider": request.get("provider", ""),
-                    "message": f"Research could not start: {str(exc).strip() or exc.__class__.__name__}",
+                    **(
+                        {"reason": stop_reason, "recovery_required": True}
+                        if stop_reason
+                        else {}
+                    ),
+                    "message": (
+                        "Time budget expired, but selected-result finalization failed: "
+                        if stop_reason == "budget_exhausted"
+                        else "Research could not start: "
+                    ) + (str(exc).strip() or exc.__class__.__name__),
                 },
             )
         raise
