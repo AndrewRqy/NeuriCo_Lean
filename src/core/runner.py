@@ -2143,6 +2143,9 @@ def main():
             print(f"GitHub: {result['github_url']}")
         print("=" * 80)
 
+    except HitlRunStopRequested as stop:
+        print(f"\nResearch stopped: {stop}")
+        return
     except Exception as e:
         print(f"\n❌ Error: {e}", file=sys.stderr)
         sys.exit(1)
