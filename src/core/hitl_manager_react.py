@@ -815,6 +815,7 @@ class HitlManager:
         self._thread.start()
 
     def stop(self) -> None:
+        self._invalidate_turns()
         self._stop.set()
         self._turns.put(_Turn("runtime", ""))
         cancel_active = getattr(self.backend, "cancel_active", None)
