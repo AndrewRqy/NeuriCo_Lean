@@ -206,13 +206,20 @@ def _with_hitl_workspace_run_ownership(method):
             raise_if_hitl_run_stop_requested()
             host_scope = ExitStack()
             arguments.arguments["_hitl_host_scope"] = host_scope
+            stopped = False
             try:
-                return method(*arguments.args, **arguments.kwargs)
+                result = method(*arguments.args, **arguments.kwargs)
             finally:
                 # Stop owned manager writers before recovery and lease release,
                 # even when startup or final status publication raises.
                 host_scope.close()
-                if owns_control and control is not None and control.requested() and not arguments.arguments["hitl_research"]:
+                stopped = (
+                    owns_control
+                    and control is not None
+                    and control.requested()
+                    and not arguments.arguments["hitl_research"]
+                )
+                if stopped:
                     if control.stop_reason() == "budget_exhausted":
                         from core.hitl_autoresearch import finalize_budget_exhausted_autoresearch
 
@@ -224,6 +231,9 @@ def _with_hitl_workspace_run_ownership(method):
                         from core.hitl_autoresearch import recover_interrupted_hitl_autoresearch_attempt
 
                         recover_interrupted_hitl_autoresearch_attempt(work_dir)
+            if stopped:
+                raise HitlRunStopRequested(f"HITL run stopped: {control.stop_reason()}.")
+            return result
 
     return owned_run
 
