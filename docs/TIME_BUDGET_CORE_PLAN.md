@@ -1,133 +1,132 @@
-# Minimal AutoResearch time budget: design and reuse map
+# Managed AutoResearch time budget: reviewed minimal design
 
-Status: deadline design only; prerequisite recovery fixes are in progress on `time-budget`. The audit baseline is `d71bace2cc77cab404ac205ae5c68ad2fe46f25f`. See the recovery implementation plan for current changes and validation.
+Status: per-Start optional CLI/web input, launch-scoped deadline persistence, managed YAML filtering and current runtime budget context are implemented locally on 2026-09-29, uncommitted. The earlier YAML-based workspace deadline has been replaced. Full execution enforcement is still pending: blocking provider calls and remote cancellation are not yet bounded by the run deadline. Platform scope: macOS/Linux; modes: Full HITL and Auto through CLI/web. Plain `--autoresearch`, standalone bootstrap, Windows support and benchmark adapters are excluded.
 
-This is the active scope, superseding the broader proposals in the earlier benchmark and stop/resume documents. Those remain supporting analysis, not additional implementation requirements. Intended destination: NeuriCo main.
+This document supersedes the earlier budget proposals. Historical reviews remain evidence, not additional requirements. Before each implementation step, discuss the concrete gap, existing mechanism to reuse, smallest change and verification. Test changes remain local and uncommitted at the user's request.
 
-## Scope update: managed recovery first
+## Foundation review: existing mechanisms to reuse
 
-The supported scope is **Full HITL and Auto through the CLI and webpage**, including their initial baseline, iterations and continuation. These modes already share the managed controller and recovery mechanisms. Plain `--autoresearch` is outdated and excluded, as are ordinary unscored research and benchmark adapters. Standalone bootstrap commands are included only if actual supported call paths or necessary shared dependencies establish their relevance.
-
-The [recovery implementation plan](AUTORESEARCH_RECOVERY_IMPLEMENTATION_PLAN.md) governs current work, scope cleanup, validation and sequencing. The [original audit](AUTORESEARCH_RECOVERY_REVIEW.md) includes historical legacy findings; those are not additional delivery requirements. No legacy per-decision persistence or scoring-framework expansion is planned.
-
-Reuse the existing workspace lease, stop control, stage/attempt recovery, durable requests, isolated scoring and publication replay. Preserve the latest validated progress and use the nearest safe existing boundary when rollback is necessary. Scoring outcomes remain manager-owned. Recovery reconnects their handoff and replays recorded decisions; it does not choose a new scorer failure policy. Stop owned writers and validate dependencies before destructive restoration.
-
-The approved scope cleanup is complete: legacy-only and standalone-bootstrap additions were removed, Windows-specific additions were subsequently removed at the user's request, and all 317 remaining tests pass on macOS. Managed lifecycle/restoration ordering has since been verified and a reproduced manager-host shutdown gap fixed; the full suite now has 343 passing tests on macOS. The local recovery review is now closed; a follow-up source check found no additional confirmed scoring/replay defect. Real remote lifecycle verification remains outstanding. The next topic is the deadline policy; no deadline code has been implemented. Each implementation step requires a root-cause explanation, a minimal fix using existing mechanisms, a regression test and user agreement before editing. Platform scope is macOS/Linux; Windows support is deferred to a separate later fix. Current progress and platform/backend limitations are recorded in the recovery implementation plan.
-
-The deadline design below is subsequent proposed work, not authorization to implement it now. It must attach to the repaired managed lifecycle without introducing another recovery system.
-
-## Decision
-
-Add one small run-budget policy to the existing execution, stop, recovery, and reporting paths. The policy answers when the deadline is, how much usable time remains, and whether an operation may start. Existing mechanisms decide what to execute, how to cancel it, what result is accepted, and how interrupted state is recovered.
-
-## First implementation contract
-
-Scope is manager-based Full HITL and Auto through the CLI and webpage, including baseline construction and continuation. Plain `--autoresearch` and standard research do not activate this policy. Shared helpers may be improved where required, with compatibility checks for other callers.
-
-- Input: explicit `idea.constraints.time_limit` in seconds. Omission keeps current behavior. The schema/prompt's implicit one-hour default must not create a runtime budget.
-- Start: after validating the request and resolving the workspace, before resource preparation, baseline work, or manager execution. Initial baseline and all iterations share one deadline. Do not start a new budget when the runner internally switches from baseline construction to continuation.
-- Accounting: wall time, including provider calls, research, scoring, retries, human waits, and downtime. Existing iteration counts remain an additional stopping condition. No pause accounting or automatic extension.
-- Resume: load the existing budget before dispatch. A different launch ID, changed idea duration, or rollback cannot reset it. Reject conflicting saved/requested settings rather than silently starting over.
-- Stop: request `budget_exhausted` through existing run control. No further research calls, retries, worker replacement, or paper generation. Existing recovery determines the accepted state and disposition of pending work.
-- Result: extend existing results/status with a stop reason and budget snapshot; retain accepted checkpoint/frontier references. Keep cleanup errors visible without replacing the exhaustion cause.
-
-## Concrete shape of the change
-
-**One small `RunBudget` helper** in a focused core module. Its public operations are `remaining_seconds()`, `timeout_for(existing_timeout)`, and `snapshot()`, plus create/load at the run boundary. A nonpositive research allowance is handled by the existing stop control before any operation starts. The helper does not execute or cancel anything.
-
-**One immutable timing record**, proposed `.neurico/run_budget.json`, written through the existing atomic helper. Store a version, budget identity, start and deadline. Exclude it from checkpoints, private-state restoration, and agent-editable research state. No periodically updated remaining-time counter. Creation/loading uses existing workspace ownership/locking; reuse the managed ownership lifetime through finalization instead of allowing competing coordinators or inventing another lock service.
-
-**One active run control.** Attach the optional budget to the existing control/context so nested workers and manager threads use the same policy. Extend the existing stop exception/record with a reason while preserving current callers. Ensure activation covers fresh and continuation paths and is removed on exit; no process-wide budget can leak into the next run.
-
-**Existing execution adapters enforce it.** Immediately before each call, calculate `min(existing operation cap, remaining usable time)`; when the old cap is `None`, use remaining usable time. The existing supervisor, backend call boundaries, and wait/retry loops enforce that allowance. Keep a bounded internal shutdown grace within the original deadline; it does not grant extra research time. Classify a total-budget stop distinctly from an ordinary stage timeout.
-
-**Existing prompts/status explain it.** Render total, remaining-at-render-time, absolute deadline and current operation cap from that same helper. Tell agents to choose work that fits and leave time for scoring/saving an accepted result. Runtime enforcement remains authoritative. Refresh at existing launch/manager-turn boundaries; do not introduce another timer, status service, or MCP tool. Status countdowns derive from the deadline rather than cached decreasing values.
-
-This is a ceiling on the existing search loop. It does not automatically choose the number or duration of experiments, reserve a full final evaluation, or promise a final accepted model if the first attempt consumes the budget.
-
-## Reuse map
-
-Line references refer to the reviewed revision.
-
-| Responsibility | Existing mechanism | Minimal integration |
+| Existing capability | Source | Finding |
 |---|---|---|
-| Duration input | `ideas/schema.yaml:225`, `src/core/idea_manager.py` validation | Use explicit `constraints.time_limit`. No second budget field or CLI override is necessary initially. Do not enforce the implicit prompt default. |
-| Run ownership | `ResearchRunner.run_research`, `src/core/runner.py:276` | Create/load one budget before measured setup/research and manager startup; continuation reloads it. |
-| Persistence | `atomic_write_json`, `src/core/hitl_util.py:58`; public/private checkpoint exclusions | One budget record outside rollback. Reuse atomic persistence and existing workspace ownership checks. |
-| Worker execution | `run_prebuilt_cli_agent`, `src/core/agent_runner.py:223` | Derive the effective timeout from the existing operation cap and remaining allowance at launch. Reuse its polling and process-group cancellation. |
-| Stop propagation | `HitlRunStopControl` and `HitlRunStopRequested`, `src/core/hitl_run_control.py:77` / `:21` | Extend existing control with an explicit reason and optional shared budget. Use it across supported managed entry points; no parallel stop channel or mass rename. |
-| Worker replacement | `run_worker_with_replacements`, `src/core/hitl_stage_runtime.py:23` | Reuse stop checks; check admission before dispatch and preserve the actual stop reason. |
-| Attempt retries | `src/core/hitl_autoresearch.py:1338` | Propagate exhaustion before generic failure handling; do not relaunch or record it as objective failure/provider outage. |
-| Manager calls | `_send` / `_send_once`, `src/core/hitl_manager_react.py:2316`; `LLMBackend.send` / `cancel_active`, `src/interactive/llm_backend.py:88` / `:65` | Pass remaining allowance through existing timeout support; bound result waits, MCP startup and retries. Reuse manager cancellation and stale-turn invalidation. |
-| Verifier | `_call_verifier_api`, `src/agents/eval_verifier.py:390` | Cap its existing total async timeout; do not introduce another supervisor. |
-| Managed initial-stage recovery | `prepare_initial_resume`, `src/core/pipeline_orchestrator.py`; `HitlStageRollback`, `src/core/hitl_stage_runtime.py:161` | Reuse stage boundaries and completed-stage behavior. |
-| HITL attempt recovery | `recover_interrupted_hitl_attempt_if_needed`, `src/core/hitl_autoresearch.py:849` | Keep existing pending-worker, pending-decision and rollback classifications. Budget policy does not choose a new recovery action. |
-| HITL decision persistence | `_commit_frontier_decision`, `src/core/hitl_autoresearch.py:1785`; transition records in `src/core/hitl_runtime_state.py:826` | Reuse replay of already-recorded decisions. Prevent the expired continuation tail from launching manager/frontier maintenance or research. |
-| Continuation | Existing managed continuation dispatch and runtime/frontier recovery | Check original deadline before research dispatch. Recovery grants no additional time. |
-| Reporting | `_finalize_stopped_run`, `src/cli/hitl_run_worker.py:116`; runner results; `HitlWorkspaceView.live_status`, `src/core/hitl_workspace_view.py:95` | Add reason and budget snapshot to existing results/status. Distinguish accepted-result availability from cleanup errors. |
-| Agent awareness | Existing research/proposer/worker prompt builders and manager context | One snapshot renderer for total, remaining and absolute deadline. Refresh at existing launch/turn boundaries. No new MCP tool required initially. |
+| Duration input | `ideas/schema.yaml`, `src/core/idea_manager.py`, `src/templates/prompt_generator.py` | `idea.constraints.time_limit` exists in seconds. Schema/prompt defaults mention one hour; idea validation does not establish a runtime deadline. Disabling the implicit default does not suppress an explicit YAML value. Full HITL/Auto must instead use optional CLI/web launch input exclusively. Validate that input as a positive integer number of seconds, excluding booleans. |
+| Shared lifecycle | `src/core/runner.py`, `src/cli/hitl_run_worker.py` | Direct/detached managed entries share the workspace lease and active stop control. The owned manager stops before outer recovery and lease release. Initialize the budget once inside that ownership lifetime. |
+| Cross-thread stop visibility | `src/core/hitl_run_control.py` | Active control has both a context variable and a process-level fallback; existing manager/scoring threads can already find it. Reuse this, without another global/context registry. |
+| Persistence outside rollback | `src/core/hitl_paths.py`, `src/core/hitl_git_state.py`, `src/core/autoresearch.py` | `.neurico/hitl/control/` holds runtime control records and is excluded from private restoration and public checkpoints. Prefer it over the earlier proposed `.neurico/run_budget.json`. Confirm survival with real-Git tests, including older snapshots. |
+| Worker supervision | `src/core/agent_runner.py:run_prebuilt_cli_agent` | Existing operation timeout, stop polling and process-group cleanup. Managed resource finder, proposer, rule maker and experiment/scoring workers use shared execution paths. However, prompt writing happens synchronously before polling starts; it must also be bounded for budgeted execution. |
+| Manager execution | `src/core/hitl_manager_react.py:_send`, `_send_once`; `src/interactive/llm_backend.py` | Backend supports timeout/cancellation; manager supplies `timeout_seconds=None` and waits on an unbounded queue read. MCP-readiness retries have separate counters and can keep extending startup windows. These must consume the same remaining allowance. |
+| Verifier | `src/agents/eval_verifier.py:_call_verifier_api` | Already has an end-to-end async timeout; cap it from the run allowance. Do not introduce a new verifier supervisor. |
+| Stop propagation and recovery | `src/core/hitl_run_control.py`, `src/core/hitl_stage_runtime.py`, `src/core/hitl_autoresearch.py`, `src/core/pipeline_orchestrator.py` | Cooperative stop checks and pending-request/frontier preservation already exist. Add exhaustion as a stop cause; do not add checkpoint or scorer-decision policy. |
+| Status and agent context | `src/cli/hitl_run_worker.py:_finalize_stopped_run`, `src/core/hitl_workspace_view.py`, manager `_messages`, existing worker prompt builders | Existing stop reporting distinguishes provider unavailability from user stop. It needs an exhaustion reason and a deadline projection. Existing prompts need remaining time rather than repeated full original durations. |
 
-## Genuinely new budget code
+The root gap is missing **run-level time ownership**: operation caps restart at each call and do not account for baseline work, manager calls, retries, replacements or continuation together. Existing recovery is not the owner of that policy.
 
-One focused helper with a testable clock owns initialization/loading, remaining-time calculation, capped operation allowance, and snapshot formatting. It owns no threads, subprocesses, rollback, or result selection.
+## Current agreed contract
 
-Persist immutable identity/timing fields such as `version`, `budget_id`, `started_at`, and `deadline_at`; derive remaining time. Proposed location: `.neurico/run_budget.json`, explicitly excluded from public and private rollback. Existing agent `RunTracker` records are per invocation and launch status is per launch, so neither alone can hold a deadline that spans continuations.
+1. **CLI/web launch input is the sole authority.** Full HITL/Auto accept an optional total duration for each explicit Start. Blank/omitted means no run time limit. Do not default from YAML, schema, earlier runs or saved research plans. YAML time constraints must not become active budget instructions in these modes.
+2. **One deadline per Start.** Reuse the existing launch `request_id`. A later explicit Start can choose a different duration or no limit, even when continuing the same research. Automatic retries, worker replacements, iterations and reattachment within the same request retain that request’s original deadline. Research continuation and budget identity are separate concerns.
+3. **Start after validation and ownership.** Initialize once under the existing workspace lease, before run preparation, resource staging or manager startup. Baseline work and all iterations share the same allowance. This does not establish alignment with an external benchmark harness’s allocation start.
+4. **Count wall time.** Preparation, provider calls, experiments, scoring, retries and human waits consume the allowance. Reattachment to the same request counts elapsed downtime. Live remaining time must not increase on a backward wall-clock adjustment. No pause accounting or per-stage allocation.
+5. **Existing operation limits remain caps.** Use the smaller of an operation’s existing cap and the remaining run allowance. An unlimited operation is bounded when the run has a budget. No run budget does not remove existing operation/provider/backend limits. Iteration count remains an independent stopping condition.
+6. **Expiry uses existing stop/recovery.** Preserve `budget_exhausted`; do not start another research call or retry. Existing deterministic cleanup/recovery preserves accepted results and pending progress. No new rollback or scoring policy. Report cleanup failure separately.
+7. **Preserve source and history.** Ignore YAML time configuration in the managed runtime without deleting it from the submitted idea. Preserve other constraints and reviewed research artifacts. Historical prompts/plans cannot override the current launch budget, including an explicitly unlimited launch.
 
-Use UTC for restart persistence and monotonic timing in a live process. Do not silently replace malformed or conflicting saved state. Omitted budget preserves existing behavior. Legacy runs need an explicit budget start if the user wants to apply one.
+## Pre-change review: how YAML could contradict the launch budget
 
-Fit bounded existing cancellation grace within the total allowance. Start with an internal cleanup allowance instead of another configuration family. Unconfirmed cleanup at the deadline remains visible; it must not be reported as successful enforcement.
+Confirmed in source and local prompt rendering (no provider calls):
 
-## Integration checks before budget implementation
-
-Trace the supported managed paths before proposing further edits. Earlier observations about standalone or legacy launchers are not requirements for this scope.
-
-1. **Worker execution:** pass the remaining allowance through reachable shared execution adapters and existing process-group cleanup. Verify bounded waits, including blocked input, only where these flows use them.
-2. **Manager waits:** bound manager/backend calls and retries from the same deadline; use existing cancellation and stale-response protection. Transport or SDK retry limits alone do not establish a total deadline.
-3. **Retries and finalization:** exhaustion must bypass retries/replacement and prevent new scoring, frontier research or paper generation. Existing deterministic recovery remains available.
-4. **Recovery:** reuse the validated managed request, scorer handoff and frontier publication paths. No legacy decision-persistence change belongs here.
-
-Discuss any newly demonstrated defect and its smallest fix before implementation. These checks are not a general cleanup project.
-
-## Stop and resume contract
-
-Expiry requests a stop with reason `budget_exhausted` through existing control. Cancel owned writers before restoring state; use existing manager invalidation to prevent late responses from writing afterward. Existing stage/attempt recovery remains authoritative.
-
-Do not add a new frozen-attempt state. A pending HITL request retains its current continuation record; the deadline gate prevents its execution after expiry. Do not force every saved decision to complete at shutdown: retain it for existing deterministic recovery when necessary, without entering new research work.
-
-With time remaining, use the current resume flow. After expiry, allow cancellation and deterministic recovery only. Keep the original deadline across launch replacement and checkpoint restoration. New-session/extension commands are outside this first change.
-
-Keep scheduler SIGTERM distinct from deliberate stop, as covered by `tests/test_hitl_timeout_recovery.py`. Following unexpected process death, existing recovery runs with the original budget checked before research dispatch.
-
-Preserving research checkpoints does not guarantee recovery of ignored model weights. A model-artifact preservation subsystem is outside this core change.
-
-## Remote lifecycle mapping
-
-| Backend | Reuse | Missing connection |
+| Path | Current behavior | Minimal correction |
 |---|---|---|
-| Local | Shared supervisor, process-group helpers, manager cancellation | Targeted fixes above. |
-| Modal | Resource sentinel; `app_stop` in `templates/skills/modal-training/scripts/lifecycle.py:301`; artifact-aware teardown at `:632` | Stop recorded owned execution and confirm coverage of its actual job mode. Preserve artifacts; do not substitute destructive teardown for compute cancellation. |
-| DSI Slurm | Workspace lifecycle in `src/core/dsi_slurm_remote.py`; existing skill's held-submission/job bundles; `src/core/dsi_slurm_artifacts.py` | Core currently lacks guaranteed owned-job cancellation. Extend existing submission/lifecycle records for exact ownership and cancellation confirmation; prevent workspace deletion before cleanup. |
+| `runner.py` managed initialization | Reads `idea.constraints.time_limit` directly. | Pass validated launch input to existing control; no YAML fallback. |
+| `hitl_run_control.py` saved record | One immutable workspace deadline reloads across new Starts, even with omitted duration. | Scope the existing record to the existing request ID; a new Start selects its own optional budget. |
+| Experiment execution prompt | `include_implicit_time_limit=False` still renders an explicit YAML value. Local probe rendered `12345 seconds`. | Supply managed runtime idea context without YAML time fields; retain ordinary-mode behavior. |
+| Rule-maker plan/execution/review; experiment plan/review | Serialize the full idea into prompts. Local probes confirmed the explicit field in all three rule-maker phases; experiment plan/review have the same full-idea serialization in source. | Use the same filtered managed idea projection at the shared boundary, avoiding separate prompt-specific budget policies. |
+| Resource finder | Does not explicitly render `time_limit`, but renders legacy `constraints.time`. | Suppress that recognized YAML time field in the managed projection too; preserve unrelated compute/money constraints and research prose. |
+| Workspace `.neurico/idea.yaml` | Resource staging writes a copy with host paths removed, but retains time fields. Existing workspaces can already contain them. | New managed runtime copies must use filtered context. Do not rewrite reviewed inputs/history merely to erase old limits; current runtime instructions must make them non-authoritative. |
+| Saved worker continuation and manager history | Replacement/resume can reuse saved prompts; manager rebuilds messages from persisted research/conversation. | Attach fresh launch-budget context at actual worker/manager dispatch, including replacements and resume, without changing saved request identity or reviewed evidence. |
+| Proposer | No direct YAML time rendering; it reads public planning/report context, which may mention earlier limits. | Same current runtime authority; do not strip or rewrite research reports. |
+| CLI/web launch controls | Existing forms/payload/request have iterations but no time input. | Add one optional launch field consistently through form, launcher, worker and runner. |
 
-Do not add a general scheduler or job-registry framework. Close each backend's narrow lifecycle gap before claiming strict budget support there. Local cancellation alone does not cancel remote jobs; backend-side enforcement must address coordinator death and queue delay. Where existing mechanisms cannot supply this guarantee, strict support remains explicitly unavailable until the gap is closed.
+The root cause is that research specification and invocation policy currently share an idea object, while the new budget record has workspace rather than launch lifetime. Disabling only the runtime YAML read would leave conflicting agent instructions. Disabling only prompt defaults would leave both the explicit YAML value and the old persisted deadline.
 
-## Delivery and checks
+The runner also writes idea metadata back to the submitted YAML. Do not mutate its time constraints in place: use a managed runtime projection at a boundary that keeps source metadata persistence intact. The managed GitHub path attaches a remote; the broad `add_research_metadata` call belongs to the other workspace setup branch. Do not change all metadata writers globally.
 
-Complete the unified-recovery prerequisite above first. The following sequence then applies to the budget feature.
+## Minimal implementation shape
 
-1. Shared policy, persisted deadline, stop reason, continuation gate.
-2. Shared execution integration, manager/verifier allowances, retry gates, prompt awareness.
-3. Existing managed recovery integration, original-deadline continuation and frontier publication replay.
-4. Verify owned-job cancellation for every backend mode advertised as strictly supported. Local execution is the first supported path; reject a budgeted remote mode at preflight until its cancellation integration is verified.
+### Small deadline value and existing control
 
-Keep current iteration counts and explicit zero-iteration behavior. A budget is an additional ceiling, not a new unbounded search mode. Exclude benchmark adapters, new CLI control families, automatic extensions, separate HITL timers, new recovery engines, predictive scheduling and telemetry services.
+Add a small deadline value/helper, owned by `HitlRunStopControl`, with remaining-time calculation, operation allowance and a serializable snapshot. It owns no thread, worker, scheduler, rollback or result selection. Place it with existing run-control code unless size/dependencies justify a small core module.
 
-Verification:
+Reuse `.neurico/hitl/control/budget.json` and the existing atomic writer under the workspace lease. Bind its optional timing to the existing `request_id`; no new session ID, registry or per-agent budget. Preserve timing on reattachment to the same request. A new explicit Start establishes new timing or an explicit unlimited state, never inheriting the previous request’s deadline. Validate same-request records and configuration; do not silently reset active timing. The earlier uncommitted record format lacks request identity and must not be treated as a current launch’s budget. No periodically persisted countdown.
 
-- Fake-clock tests: standard research and unbudgeted AutoResearch stay unchanged; initial stages and iterations share one allowance; restart/rollback/retry cannot reset it; no-budget behavior is unchanged.
-- Short subprocess tests: silent/streaming/blocked-input workers and children surviving parent exit.
-- Extend `test_hitl_mcp_retry_classification.py` and `test_hitl_provider_failure_propagation.py` for exhaustion bypassing retries/replacement while ordinary provider failures retain current handling.
-- Extend `test_hitl_timeout_recovery.py` and `test_hitl_autoresearch_review_fixes.py` for original-deadline continuation, current recovery semantics, and no new research during expired recovery.
-- Managed temporary-workspace test: accept candidate A, exhaust candidate B, restart, retain A and valid B evidence through existing frontier/request state; the expired deadline prevents more research in both Full HITL and Auto.
-- Backend fakes: cancel only owned jobs, retain artifacts and report unconfirmed cleanup. Real lifecycle verification is required before claiming strict remote support.
+Use UTC timestamps for restart persistence and monotonic elapsed time within an invocation. Live operation allowance must not increase when the wall clock moves backward. Restart calculations rely on a trustworthy system clock. Runtime-created timing fields are not agent-editable research configuration.
 
-This scope refinement changes documentation only. Current recovery validation and its limitations are recorded in the recovery implementation plan; the earlier implementation review remains historical evidence. No deadline implementation has been validated.
+Extend existing stop control to recognize expiration and request a reasoned stop. Preserve existing callers and first-established stop causes when user cancellation/provider failure races expiration. Make checks/record publication consistent across the already-shared threads; do not add a second stop channel. An expired record must be noticed before research dispatch even when no prior stop file exists.
+
+### Bound existing execution paths
+
+- Check admission before launching workers and manager/provider calls, including replacements and retries. Refresh allowance at each actual call, not once per iteration.
+- Reuse supervisor stop polling and group termination. Bring prompt input delivery under its bounded lifecycle; otherwise a process that does not read stdin can prevent deadline checks. Account for logging/output draining too rather than assuming only quiet workers can overrun.
+- Pass the allowance into existing manager/backend timeouts and cap MCP startup and retry waits. Replace the unbounded manager result wait with stop/deadline-aware waiting. Reuse cancellation and generation invalidation so late responses cannot mutate the recovered workspace.
+- Existing managed manager providers select the Claude/Codex CLI backends. Do not redesign unrelated API manager modes. The reachable verifier API already provides an async end-to-end timeout and should receive the remaining cap.
+- Preserve `budget_exhausted` through broad exception handlers. A budget stop must not become provider unavailability, objective scorer failure or an invalid attempt that triggers a retry. This is stop propagation, not a new scoring-outcome policy.
+- Continue existing human-wait polling under the same control; Full HITL waiting does not pause the recommended wall-time clock.
+
+Review existing cancellation grace when implementing execution enforcement. Do not add an arbitrary configurable reserve in this foundation or invent per-stage budgets. Cleanup does not allow additional research and may still fail or overrun; report this honestly. A coordinator timer alone cannot guarantee remote compute has stopped by an external benchmark deadline.
+
+### Useful budget awareness
+
+Render one runtime snapshot into existing manager context on each provider turn/retry and into each worker launch/replacement prompt: original total, remaining time at render, absolute deadline and effective operation allowance. Tell agents to choose work that fits and leave time for scoring and saving a valid result. For a long-running worker, the absolute deadline remains useful after its initial remaining-time snapshot becomes stale.
+
+Basic exhaustion reporting uses existing CLI/web status. A live countdown and extra budget displays are deferred. No separate countdown writer, timer service, MCP tool, predictive scheduler or automatic allocation of experiment counts. Keep the backend deadline authoritative even if an agent ignores the prompt. Avoid presenting the original duration as a fresh allowance in downstream prompts.
+
+## Remote limits are a separate integration gate
+
+DSI Slurm's core wrapper creates/removes remote workspaces; this alone does not prove cancellation of submitted jobs. Modal has resource records, app-stop and artifact-aware teardown, but actual job ownership/cancellation coverage still needs verification. Cancelling a local CLI is not sufficient for either.
+
+The first implementation can validate local processes. Do not advertise strict Slurm/Modal enforcement until their existing submitted-job records and backend wall-time/cancellation paths are connected to the same deadline and tested. Do not introduce a general job registry. A local compute setting alone must not be treated as proof that a worker never submits remote jobs through a skill.
+
+Benchmark-specific start alignment, output packaging and adapters are outside this core mechanism. The ten-hour objective must eventually be checked against the benchmark's actual harness deadline and remote enforcement; a local ten-hour timer is not sufficient evidence of leaderboard comparability.
+
+## Approved implementation step: launch-owned optional budget
+
+Implemented below after user approval. Reuse the existing control, ownership, request transport and prompt dispatch; add no recovery or timing service.
+
+1. **Launch input and lifetime.** Add one optional duration field to Full HITL/Auto CLI/web launch configuration, passed through the existing request into the runner. Show explicit units and default to no limit. Validate before starting work; do not read YAML to populate it. Bind the existing saved budget to request identity. Same request retains timing; a new Start may choose any valid duration or no limit. Update exhaustion advice to allow starting again with the user’s chosen budget.
+2. **One managed idea projection.** Exclude `constraints.time_limit` and the recognized legacy `constraints.time` from managed runtime context before downstream prompt generation and new workspace contract writes. Keep the submitted YAML, other constraints, ordinary research and outdated standalone modes unchanged. Trace source metadata persistence so filtering cannot delete the original YAML settings.
+3. **Current authority on every dispatch.** Use the same runtime budget snapshot in existing manager and worker dispatch context, including pending-request resume and replacements. State the current deadline/remaining allowance, or that this Start has no total time limit. Earlier YAML, workspace metadata and historical plans do not set this launch’s budget. Preserve saved request/continuation evidence and reviewed workspace fingerprints. This small context addition belongs in this step because otherwise removing the YAML runtime read alone leaves the contradiction unresolved; live countdown UI and broader awareness features remain deferred.
+4. **Local regression verification.** Cover Full/Auto and CLI/web: YAML-only limits produce unbudgeted launches; conflicting YAML cannot override input; omitted input cannot inherit a prior Start’s budget; new Start accepts a changed budget; retries/reattachment within one request keep the deadline. Check explicit and default YAML limits are absent from new managed contexts, legacy `time` is suppressed, unrelated/source fields survive, ordinary behavior remains, and current launch context reaches resumed/replacement workers without changing pending-request identity. Include the case of an expired prior Start followed by a new unlimited Start. Keep all tests local and uncommitted.
+5. **Review and stop.** Report the source-of-truth changes and actual test coverage. No commit/push without instruction. Discuss full execution enforcement as the following step rather than claiming this makes all blocking calls or remote jobs obey a hard deadline.
+
+Historical foundation tests that asserted a workspace-wide deadline or YAML budget authority have been updated to this contract. Their earlier passing result is not evidence for the new per-Start behavior.
+
+## First delivery result — 2026-09-29 (historical contract)
+
+This result predates the per-Start requirement. Its YAML input and immutable workspace-wide budget semantics are superseded. The existing stop-control, clock calculation, recovery preservation and reason reporting remain reusable. No production code was changed during the subsequent source-of-truth review.
+
+Implemented in existing owners only:
+
+- `hitl_paths.py`: canonical `control/budget.json` path, reusing existing public/private rollback exclusions.
+- `hitl_run_control.py`: lease-checked, immutable budget creation/loading; positive explicit duration validation; UTC epoch start/deadline persistence; remaining time bounded by both live monotonic and wall clocks; repeated attachment does not reset the clock. Existing control recognizes exhaustion, preserves existing stored stop causes and uses the existing exception/stop record. No separate budget class, service, background timer or active context was added.
+- `runner.py`: initialize/reload once after managed request validation and before preparation; reject invalid iteration requests before starting the budget. Expired direct and detached runs stop before resource preparation or manager dispatch. Ordinary/legacy modes remain unbudgeted.
+- `hitl_run_worker.py` and `hitl_workspace_view.py`: preserve `budget_exhausted`, including recovery failure, in existing status. The stopped view identifies exhaustion instead of suggesting ordinary continuation. No countdown UI was added.
+
+Validation: **380 tests passed in 12.36 seconds on macOS** across `tests/`; `git diff --check` passed. New local tests cover absent/invalid/conflicting budgets, ownership, elapsed downtime, repeated attachment, backward clock changes, stop-cause compatibility, public/private Git rollback, expired Full/Auto CLI/web/direct/detached admission, basic status and cleanup failure. Optional PyGithub was disabled only in the test process as in prior validation; actual temporary Git recovery remained enabled. Linux and real provider/GPU/remote execution were not run. All test changes remain local/uncommitted. No new commit or push was made.
+
+Limit: expiration is currently detected at existing cooperative checks and runner admission. Blocking manager waits, worker input delivery, operation timeout caps, verifier calls and remote job enforcement still require the separately agreed enforcement step. This is not yet a strict total-runtime guarantee or benchmark-ready enforcement.
+
+## Per-Start delivery result — 2026-09-29
+
+- CLI and web Start offer an optional time limit in whole seconds, initially blank for no limit. Ten hours is `36000`. The existing launcher/worker request carries `time_limit_seconds`; the direct runner CLI also accepts `--time-limit-seconds`. The shared runner accepts this option only for managed AutoResearch.
+- The existing budget record now includes the launch request ID and records unlimited launches explicitly. A new Start replaces the previous launch’s timing under the workspace lease. Reattaching to the same request requires the same duration and retains the original deadline. A valid old record without launch identity does not impose its deadline on a new Start. Malformed records fail without being silently reset.
+- The runner makes a managed runtime copy after source metadata persistence, removing `constraints.time_limit` and legacy `constraints.time`. Other research constraints and the submitted YAML remain intact. Newly written workspace contracts use the filtered copy. Reconnecting reviewed inputs skips rewriting the workspace contract, preserving pending-request evidence.
+- Existing CLI worker dispatch, manager provider dispatch (including retries/compaction), and verifier API dispatch receive a fresh runtime budget note. It includes total/remaining time and the deadline, or explicitly no total limit. Historical YAML, saved prompts and research plans are not invocation policy. The note is added to outgoing context without rewriting saved continuation records or conversation history. Existing ordinary/legacy flows remain unchanged when no managed budget is configured.
+- Exhaustion continues through the existing stop/recovery path and status reason. The stopped view now explains that another Start can use a new limit or no limit. No new recovery mechanism, timer thread, registry or countdown UI was added.
+
+Validation: **427 tests passed in 12.07 seconds on macOS** across `tests/`; `git diff --check` and JavaScript syntax validation passed. Coverage includes CLI input, web-form interaction logic in a Node DOM harness, actual launch-request serialization/loading, detached worker forwarding, Full/Auto and CLI/web runtime entry, new unlimited Starts after expiry, same-request deadline preservation, backward clock handling, YAML filtering across managed worker phases, source preservation, actual subprocess worker/replacement context, manager dispatch, reviewed contract preservation and existing recovery regressions. Tests remain local and uncommitted. Optional PyGithub was disabled only in the test process; CLI input tests stubbed the unused native terminal renderer because this environment lacks `wcwidth`. Browser layout, real provider/GPU/remote execution and Linux were not tested. No commit or push was made.
+
+## Subsequent steps — discuss separately
+
+1. **Complete execution enforcement:** cap shared worker/manager/verifier calls; bound manager queue/MCP/retry waits and worker input/output handling; suppress budget-triggered retries and fence late responses using existing mechanisms. Extend the existing context note with effective operation allowance as needed; do not introduce a second prompt-budget policy.
+2. **Remote support:** connect and verify existing owned-job limits/cancellation on actual supported backends before claiming strict Slurm/Modal or benchmark enforcement.
+
+Until execution enforcement is complete, this implementation must not be advertised as a hard run-time guarantee. No second recovery mechanism is part of either step.

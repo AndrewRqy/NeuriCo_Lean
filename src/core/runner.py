@@ -349,6 +349,7 @@ class ResearchRunner:
         hitl_host: Optional[Any] = None,
         hitl_mode: str = "full",
         hitl_work_dir: Optional[Path] = None,
+        time_limit_seconds: Optional[int] = None,
         _hitl_host_scope: Optional[ExitStack] = None,
     ) -> Dict[str, Any]:
         """
@@ -496,6 +497,9 @@ class ResearchRunner:
             print("   Bootstrap AutoResearch baseline: enabled")
         print("=" * 80)
 
+        if time_limit_seconds is not None and not (hitl and not hitl_research):
+            raise ValueError("A run time limit is supported only for managed AutoResearch.")
+
         # Load idea
         idea = self.idea_manager.get_idea(idea_id)
         if idea is None:
@@ -510,6 +514,22 @@ class ResearchRunner:
         if paper_style is None:
             domain = idea_spec.get("domain", "general")
             paper_style = ConfigLoader().get_domain_paper_style(domain)
+
+        if hitl and not hitl_research:
+            if type(autoresearch_iterations) is not int or autoresearch_iterations < 0:
+                raise ValueError("AutoResearch iterations must be a non-negative integer.")
+            from core.hitl_run_control import active_hitl_run_stop_control
+
+            control = active_hitl_run_stop_control()
+            if control is None:
+                raise RuntimeError("Managed AutoResearch requires active run control.")
+            if not Path(hitl_work_dir).is_dir():
+                raise ValueError(f"HITL workspace does not exist: {hitl_work_dir}")
+            constraints = idea_spec.get("constraints", {})
+            if not isinstance(constraints, dict):
+                raise ValueError("Idea constraints must be an object.")
+            control.configure_budget(time_limit_seconds)
+            raise_if_hitl_run_stop_requested()
 
         # Update status
         self.idea_manager.update_status(idea_id, "in_progress")
@@ -733,6 +753,17 @@ class ResearchRunner:
 
                 print(f"📁 Working directory: {work_dir}\n")
 
+        if hitl and not hitl_research:
+            # Metadata above is persisted from the original idea. Downstream
+            # workers receive research constraints without YAML run policy.
+            from copy import deepcopy
+
+            idea = deepcopy(idea)
+            idea_spec = idea.get("idea", {})
+            constraints = idea_spec.get("constraints", {})
+            constraints.pop("time_limit", None)
+            constraints.pop("time", None)
+
         preserve_initial_inputs = False
         if hitl_research:
             from core.pipeline_orchestrator import ResearchPipelineOrchestrator
@@ -792,7 +823,10 @@ class ResearchRunner:
             issues = staged_function_mismatches(work_dir, idea)
             if issues:
                 raise RuntimeError("Cannot resume reviewed inputs: " + "; ".join(issues))
-            stage_local_resources(work_dir, idea, preserve_existing=True)
+            stage_local_resources(
+                work_dir, idea, preserve_existing=True,
+                write_workspace_contract=not (hitl and not hitl_research),
+            )
         else:
             stage_local_resources(work_dir, idea)
 
@@ -1886,6 +1920,12 @@ def main():
         help="Timeout for scorer stage in seconds (default: 600 = 10 min, scoring mode only)",
     )
     parser.add_argument(
+        "--time-limit-seconds",
+        type=int,
+        default=None,
+        help="Optional total seconds for this managed AutoResearch Start (default: no limit).",
+    )
+    parser.add_argument(
         "--autoresearch",
         action="store_true",
         help="Run AutoResearch after the initial scored experiment and before paper writing",
@@ -2053,6 +2093,7 @@ def main():
             manifest_trimmer_timeout=args.manifest_trimmer_timeout,
             autoresearch=args.autoresearch,
             autoresearch_iterations=args.autoresearch_iterations,
+            time_limit_seconds=args.time_limit_seconds,
             autoresearch_history_dir=args.autoresearch_history_dir,
             continue_autoresearch=args.continue_autoresearch,
             continue_recover=args.continue_recover,

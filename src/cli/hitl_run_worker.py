@@ -89,6 +89,11 @@ def _load_request(path: Path) -> Dict[str, Any]:
     value["workflow"] = str(value.get("workflow", "autoresearch")).strip().lower()
     if value["workflow"] not in {"ordinary", "autoresearch"}:
         raise ValueError("HITL launch request has an unsupported research workflow.")
+    from core.hitl_run_control import validate_run_time_limit
+
+    value["time_limit_seconds"] = validate_run_time_limit(value.get("time_limit_seconds"))
+    if value["workflow"] != "autoresearch" and value["time_limit_seconds"] is not None:
+        raise ValueError("A run time limit is supported only for managed AutoResearch.")
     value["hitl_mode"] = normalize_hitl_mode(value.get("hitl_mode")).value
 
     identity = _REQUEST_NAME.fullmatch(path.name)
@@ -121,8 +126,9 @@ def _finalize_stopped_run(
     control: HitlRunStopControl,
 ) -> int:
     """Acknowledge a stop only after established recovery finishes."""
+    stop_reason = "user_requested"
     try:
-        stop_record = control.record()
+        stop_reason = control.stop_reason()
         if request.get("workflow") == "ordinary":
             from core.pipeline_orchestrator import ResearchPipelineOrchestrator
 
@@ -135,11 +141,6 @@ def _finalize_stopped_run(
             from core.hitl_autoresearch import recover_interrupted_hitl_autoresearch_attempt
 
             recovery = recover_interrupted_hitl_autoresearch_attempt(work_dir)
-        stop_reason = (
-            "provider_unavailable"
-            if str(stop_record.get("requested_by", "")).strip() == "provider_unavailable"
-            else "user_requested"
-        )
         stopped_at = utc_now()
         status: Dict[str, Any] = {
             "status": "stopped",
@@ -176,6 +177,7 @@ def _finalize_stopped_run(
                 "hitl_mode": request.get("hitl_mode", "full"),
                 "provider": request.get("provider", ""),
                 "recovery_required": True,
+                "reason": stop_reason,
                 "message": f"Run stopped, but rollback could not finish: {recovery_error}",
             },
         )
@@ -268,6 +270,7 @@ def main() -> int:
                 else:
                     run_args.update(
                         autoresearch_iterations=int(request.get("iterations", 1)),
+                        time_limit_seconds=request.get("time_limit_seconds"),
                         hitl_autoresearch=(
                             None if continuation else str(request["interface"])
                         ),

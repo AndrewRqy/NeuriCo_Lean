@@ -507,6 +507,11 @@ def run_eval_verifier(
     except Exception as exc:
         return failure_result(FAILURE_KIND_EVIDENCE_INVALID, type(exc).__name__)
 
+    from core.hitl_run_control import current_hitl_run_budget_prompt
+
+    budget_context = current_hitl_run_budget_prompt(work_dir)
+    if budget_context:
+        messages = [*messages, {'role': 'system', 'content': budget_context}]
     try:
         content, backend, model = _call_verifier_api(messages, timeout)
     except VerifierResponseInvalidError as exc:

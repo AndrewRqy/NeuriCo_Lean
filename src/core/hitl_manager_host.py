@@ -977,6 +977,7 @@ class HitlTerminalChannel(UserChannel):
             )
             hitl_mode = "auto" if auto else "full"
             iterations = 1
+            time_limit_seconds = None
             if workflow == "autoresearch":
                 iterations = self._read_integer(
                     "Iterations [2] (1-100): ",
@@ -985,6 +986,23 @@ class HitlTerminalChannel(UserChannel):
                     maximum=100,
                     cancellable=True,
                 )
+                while True:
+                    raw_limit = self._read_setting(
+                        "Time limit in seconds [no limit] (blank for none): ",
+                        "", cancellable=True,
+                    )
+                    if not raw_limit:
+                        break
+                    try:
+                        from core.hitl_run_control import validate_run_time_limit
+
+                        time_limit_seconds = validate_run_time_limit(int(raw_limit))
+                        break
+                    except ValueError:
+                        self._write_block(self._ui.system(
+                            "Enter a positive whole number of seconds, or leave blank for no limit.",
+                            tone="error",
+                        ))
             write_paper = self._read_yes_no(
                 "Write paper? [Y/n]: ", default=True, cancellable=True
             )
@@ -1008,7 +1026,8 @@ class HitlTerminalChannel(UserChannel):
                     "write_paper": write_paper,
                     "paper_style": paper_style,
                     "github": github,
-                    **({"iterations": iterations} if workflow == "autoresearch" else {}),
+                    **({"iterations": iterations, "time_limit_seconds": time_limit_seconds}
+                       if workflow == "autoresearch" else {}),
                 }
             )
         except _HitlPromptCancelled:

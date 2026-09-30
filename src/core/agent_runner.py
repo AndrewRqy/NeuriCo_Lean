@@ -240,6 +240,13 @@ def run_prebuilt_cli_agent(
     backend setup/cleanup. This helper only handles subprocess execution,
     sanitized output streaming, optional wall-clock timeout, and reaping.
     """
+    from core.hitl_run_control import current_hitl_run_budget_prompt
+
+    budget_context = current_hitl_run_budget_prompt(work_dir)
+    if budget_context:
+        # Apply after restoring/composing saved prompts; do not rewrite the
+        # continuation record or let its previous budget govern a new Start.
+        prompt = prompt + "\n\n" + budget_context
     log_file.parent.mkdir(parents=True, exist_ok=True)
     transcript_file.parent.mkdir(parents=True, exist_ok=True)
 

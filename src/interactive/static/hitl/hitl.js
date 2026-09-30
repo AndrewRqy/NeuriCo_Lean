@@ -14,7 +14,7 @@
     graphScroll: {}, drawerScroll: {}, sidebarCollapsed: false,
     conversationScroll: { top: 0, nearBottom: true, captured: false },
     managerStatusSeq: -1,
-    runDraft: { workflow: "autoresearch", hitlMode: "auto", iterations: 2, writePaper: true, paperStyle: "auto", github: false },
+    runDraft: { workflow: "autoresearch", hitlMode: "auto", iterations: 2, timeLimitSeconds: "", writePaper: true, paperStyle: "auto", github: false },
     portal: null, ideas: [], selectedIdeaId: initialIdeaId, catalogBusy: false,
     creatingIdea: false, ideaSchema: null, ideaDraft: {}, ideaSubmitError: "",
     renamingIdeaId: "", draggedIdeaId: "",
@@ -848,6 +848,7 @@
     const workflow = q("select", { id: "run-workflow", "data-focus-key": "run-workflow", ...(workflowLocked ? { disabled: "disabled", title: "The workspace research workflow cannot be changed" } : {}) }); [["autoresearch", "AutoResearch"], ["ordinary", "Ordinary"]].forEach(([value, label]) => workflow.append(q("option", { value, text: label }))); workflow.value = state.runDraft.workflow; workflow.onchange = () => { state.runDraft.workflow = workflow.value; render({ preserveScroll: true }); };
     const hitlMode = q("select", { id: "run-hitl-mode", "data-focus-key": "run-hitl-mode" }); [["full", "No"], ["auto", "Yes"]].forEach(([value, label]) => hitlMode.append(q("option", { value, text: label }))); hitlMode.value = state.runDraft.hitlMode; hitlMode.onchange = () => { state.runDraft.hitlMode = hitlMode.value; };
     const iterations = q("input", { id: "run-iterations", type: "number", min: "1", max: "100", step: "1", required: "required", value: state.runDraft.iterations, "data-focus-key": "run-iterations" }); iterations.oninput = () => { state.runDraft.iterations = iterations.value; iterations.setCustomValidity(""); };
+    const timeLimit = q("input", { id: "run-time-limit", type: "number", min: "1", step: "1", placeholder: "No limit", value: state.runDraft.timeLimitSeconds, "data-focus-key": "run-time-limit" }); timeLimit.oninput = () => { state.runDraft.timeLimitSeconds = timeLimit.value; timeLimit.setCustomValidity(""); };
     const paper = q("input", { id: "run-paper", type: "checkbox", "data-focus-key": "run-paper" }); paper.checked = state.runDraft.writePaper; paper.onchange = () => { state.runDraft.writePaper = paper.checked; };
     const github = q("input", { id: "run-github", type: "checkbox", "data-focus-key": "run-github" }); github.checked = state.runDraft.github; github.onchange = () => { state.runDraft.github = github.checked; };
     const style = q("select", { id: "run-style", "data-focus-key": "run-style" }); [["auto", "Automatic"], ["neurips", "NeurIPS"], ["icml", "ICML"], ["acl", "ACL"]].forEach(([value, label]) => style.append(q("option", { value, text: label }))); style.value = state.runDraft.paperStyle; style.onchange = () => { state.runDraft.paperStyle = style.value; };
@@ -863,10 +864,20 @@
       }
       iterations.setCustomValidity("");
       const payload = { provider: provider.value, workflow: workflow.value, hitl_mode: hitlMode.value, write_paper: paper.checked, paper_style: style.value, github: github.checked };
-      if (autoresearch) payload.iterations = iterationValue;
+      if (autoresearch) {
+        const duration = timeLimit.value.trim() ? Number(timeLimit.value) : null;
+        if (timeLimit.validity.badInput || (duration !== null && (!Number.isSafeInteger(duration) || duration <= 0))) {
+          timeLimit.setCustomValidity("Enter a positive whole number of seconds, or leave blank for no limit.");
+          timeLimit.reportValidity();
+          timeLimit.focus();
+          return;
+        }
+        payload.iterations = iterationValue;
+        payload.time_limit_seconds = duration;
+      }
       launchRun(payload);
     };
-    return q("section", { class: "run-panel" }, [q("div", { class: "run-title" }, [q("h2", { text: title }), icon("×", "Close research setup", () => { state.runPanel = false; render(); })]), row("Model", provider), row("Research", workflow), row("Auto", hitlMode), workflow.value === "autoresearch" ? row("Iterations", iterations) : null, q("label", { class: "check-row" }, [paper, q("span", { text: "Write paper" })]), row("Style", style), q("label", { class: "check-row" }, [github, q("span", { text: "Publish to GitHub" })]), q("div", { class: "run-actions" }, [icon("▶", title, start, "run-start")])]);
+    return q("section", { class: "run-panel" }, [q("div", { class: "run-title" }, [q("h2", { text: title }), icon("×", "Close research setup", () => { state.runPanel = false; render(); })]), row("Model", provider), row("Research", workflow), row("Auto", hitlMode), workflow.value === "autoresearch" ? row("Iterations", iterations) : null, workflow.value === "autoresearch" ? row("Time limit (seconds, optional)", timeLimit) : null, q("label", { class: "check-row" }, [paper, q("span", { text: "Write paper" })]), row("Style", style), q("label", { class: "check-row" }, [github, q("span", { text: "Publish to GitHub" })]), q("div", { class: "run-actions" }, [icon("▶", title, start, "run-start")])]);
   }
   function conversation() {
     const shell = q("main", { class: "conversation-shell" }); const thread = q("div", { class: "thread" }); const request = state.snapshot?.inbox?.pending_request; const requestId = String(request?.conversation_record_id || "");

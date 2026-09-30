@@ -106,6 +106,11 @@ class HitlRunController:
                 raise ValueError("Iterations must be a whole number.")
             if not 1 <= iterations <= 100:
                 raise ValueError("Iterations must be between 1 and 100.")
+        from core.hitl_run_control import validate_run_time_limit
+
+        time_limit_seconds = validate_run_time_limit(payload.get("time_limit_seconds"))
+        if workflow != "autoresearch" and time_limit_seconds is not None:
+            raise ValueError("A run time limit is supported only for managed AutoResearch.")
         style = str(payload.get("paper_style", "auto")).strip().lower()
         if style not in {"auto", "neurips", "icml", "acl"}:
             raise ValueError("Choose a supported paper style.")
@@ -179,6 +184,7 @@ class HitlRunController:
             }
             if workflow == "autoresearch":
                 request["iterations"] = iterations
+                request["time_limit_seconds"] = time_limit_seconds
             requests_dir = hitl_launch_requests_dir(ConfigLoader().get_workspace_parent_dir())
             requests_dir.mkdir(parents=True, exist_ok=True)
             request_path = requests_dir / f"request.{self.idea_id}.{request_id}.json"

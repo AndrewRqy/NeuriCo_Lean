@@ -2373,6 +2373,11 @@ class HitlManager:
         mcp_startup_timeout_seconds: Optional[float] = None,
     ) -> Any:
         """Run one manager provider turn without a wall-clock deadline."""
+        from core.hitl_run_control import current_hitl_run_budget_prompt
+
+        budget_context = current_hitl_run_budget_prompt(self.work_dir)
+        if budget_context:
+            messages = [*messages, {"role": "system", "content": budget_context}]
         result: "queue.Queue[tuple[bool, Any]]" = queue.Queue(maxsize=1)
 
         parameters: Dict[str, inspect.Parameter] = {}

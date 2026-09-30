@@ -394,6 +394,7 @@ class HitlWorkspaceView:
                 ),
                 "updated_at": self._record_timestamp(record),
                 "next_action": next_step,
+                "reason": str(record.get("reason", "")) if isinstance(record, dict) else "",
             }
 
         human_request = unresolved and bool(
@@ -518,11 +519,15 @@ class HitlWorkspaceView:
                     display_phase="",
                 )
             if launch_state == "stopped":
+                exhausted = launch_status.get("reason") == "budget_exhausted"
                 return projected(
                     "stopped",
-                    "Stopped",
+                    "Time budget exhausted" if exhausted else "Stopped",
                     "The run stopped and recoverable progress was preserved.",
-                    next_step="Continue research when ready.",
+                    next_step=(
+                        "Review the saved progress, then start again with a new time limit or no limit."
+                        if exhausted else "Continue research when ready."
+                    ),
                     record=launch_status,
                     active=False,
                     display_stage="Stopped",
