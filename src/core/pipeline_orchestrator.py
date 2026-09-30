@@ -2363,6 +2363,8 @@ class ResearchPipelineOrchestrator:
             return build_manager_conformance_report(
                 verdict, extract_eval_contract(idea)
             )
+        except HitlRunStopRequested:
+            raise
         except Exception as exc:
             # Keep arbitrary provider/runtime exception prose out of manager
             # and console channels. Every failure at this advisory boundary

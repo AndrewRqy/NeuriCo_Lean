@@ -2498,13 +2498,18 @@ class HitlRuntime:
 
         Only runs past the plan phase, where the evaluator exists. A reporter
         that raises degrades to an ``UNAVAILABLE`` note rather than failing the
-        review, so a verifier fault never blocks the rule maker.
+        review, so a verifier fault never blocks the rule maker. A run stop
+        propagates to the existing cancellation path instead.
         """
+        from core.hitl_run_control import HitlRunStopRequested
+
         reporter = self._scoring_conformance_reporter
         if not callable(reporter) or hitl_stage == "plan":
             return ""
         try:
             return str(reporter() or "")
+        except HitlRunStopRequested:
+            raise
         except Exception as exc:
             print(f"⚠️  Scoring conformance report unavailable: {exc}")
             return (

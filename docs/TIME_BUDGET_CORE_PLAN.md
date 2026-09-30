@@ -1,6 +1,6 @@
 # Managed AutoResearch time budget: reviewed minimal design
 
-Status: per-Start optional CLI/web input, launch-scoped deadline persistence, managed YAML filtering and current runtime budget context are implemented locally on 2026-09-29, uncommitted. The earlier YAML-based workspace deadline has been replaced. Full execution enforcement is still pending: blocking provider calls and remote cancellation are not yet bounded by the run deadline. Platform scope: macOS/Linux; modes: Full HITL and Auto through CLI/web. Plain `--autoresearch`, standalone bootstrap, Windows support and benchmark adapters are excluded.
+Status: per-Start optional CLI/web input, launch-scoped deadline persistence, managed YAML filtering and current runtime budget context are committed locally as `d3ec644`. The verifier-only cancellation fix is implemented locally on 2026-09-30 and remains uncommitted. The earlier YAML-based workspace deadline has been replaced. The blocked-worker-input issue and remote cancellation verification remain deferred; this is not yet a strict end-to-end runtime guarantee. Platform scope: macOS/Linux; modes: Full HITL and Auto through CLI/web. Plain `--autoresearch`, standalone bootstrap, Windows support and benchmark adapters are excluded.
 
 This document supersedes the earlier budget proposals. Historical reviews remain evidence, not additional requirements. Before each implementation step, discuss the concrete gap, existing mechanism to reuse, smallest change and verification. Test changes remain local and uncommitted at the user's request.
 
@@ -124,9 +124,80 @@ Limit: expiration is currently detected at existing cooperative checks and runne
 
 Validation: **427 tests passed in 12.07 seconds on macOS** across `tests/`; `git diff --check` and JavaScript syntax validation passed. Coverage includes CLI input, web-form interaction logic in a Node DOM harness, actual launch-request serialization/loading, detached worker forwarding, Full/Auto and CLI/web runtime entry, new unlimited Starts after expiry, same-request deadline preservation, backward clock handling, YAML filtering across managed worker phases, source preservation, actual subprocess worker/replacement context, manager dispatch, reviewed contract preservation and existing recovery regressions. Tests remain local and uncommitted. Optional PyGithub was disabled only in the test process; CLI input tests stubbed the unused native terminal renderer because this environment lacks `wcwidth`. Browser layout, real provider/GPU/remote execution and Linux were not tested. No commit or push was made.
 
-## Subsequent steps — discuss separately
+## Active-stop verification — 2026-09-30
 
-1. **Complete execution enforcement:** cap shared worker/manager/verifier calls; bound manager queue/MCP/retry waits and worker input/output handling; suppress budget-triggered retries and fence late responses using existing mechanisms. Extend the existing context note with effective operation allowance as needed; do not introduce a second prompt-budget policy.
-2. **Remote support:** connect and verify existing owned-job limits/cancellation on actual supported backends before claiming strict Slurm/Modal or benchmark enforcement.
+Focused local verification: **118 passed, 4 expected failures in 19.80 seconds**. Ten new active-path cases pass; four strict expected-failure cases reproduce two shared cancellation gaps under both user Stop and budget expiry. Tests are local/uncommitted. No production code changed during this verification.
 
-Until execution enforcement is complete, this implementation must not be advertised as a hard run-time guarantee. No second recovery mechanism is part of either step.
+Verified with real local subprocesses and simulated provider responses:
+
+- An active worker stops through the existing supervisor without launching a replacement.
+- The mechanical scorer and an unanswered human wait respond to the same stop control.
+- Full/Auto runner expiry unwinds a manager wait, calls existing provider cancellation, and stops the manager before recovery. This also ends repeated provider-startup retries. The unbounded queue read inside manager dispatch alone is not evidence that another manager cancellation mechanism is required.
+- A worker that never reads its input blocks `stdin.write` before the supervisor enters stop polling. Both budget expiry and user Stop are delayed. Tests kill/reap their own child during teardown.
+- An in-flight verifier API call observes its own API timeout but not the shared run stop. Both stop causes leave that request waiting; tests release the simulated response during teardown.
+
+Existing deadline persistence, recovery, provider-failure propagation and scheduler-signal regression tests also passed in the focused suite. Real providers and remote Slurm/Modal workloads were not exercised.
+
+## Implemented plan: verifier cancellation only
+
+Status: implemented locally on 2026-09-30 after user approval; uncommitted. The user deferred the blocked-worker-input fix. This step does not change worker prompt delivery, manager shutdown, remote backends or recovery policy.
+
+### Root cause and existing mechanisms
+
+The verifier's asynchronous API request already has an end-to-end `asyncio.wait_for` timeout, and `_call_verifier_api_async` closes its client in `finally`. However, the wait never observes the active run's shared stop control. In addition, three broad exception handlers convert `HitlRunStopRequested` into an API-failure result or an advisory unavailable report. Fault injection reproduced all three conversions; the existing timeout/client-cleanup test and conformance suite passed (29 tests).
+
+Reuse the existing run stop control, `HitlRunStopRequested`, async task cancellation, API timeout, client cleanup and outer managed recovery. No new thread, timer service, cancellation registry, configuration or persisted state.
+
+### 1. Make the existing API wait interruptible
+
+File: `src/agents/eval_verifier.py`, `_call_verifier_api`.
+
+- When running under the shared run control, check stop before submitting the request.
+- Await the existing API coroutine as one task, checking shared cancellation at the existing 0.1-second polling cadence while it is pending. Keep the current end-to-end API timeout around the entire wait; do not restart that timeout at each poll or create a second budget calculation.
+- On user Stop or budget exhaustion, cancel and await the pending task before propagating `HitlRunStopRequested`. Reuse the existing `finally: await client.close()`; do not add another client-close path.
+- Check stop before accepting a completed response so a response arriving with an observed cancellation does not become a new verdict. Cleanup must not replace the established stop cause with an ordinary API error.
+- Calls without an active run control keep their existing timeout behavior. An unlimited managed run must still respond to user Stop.
+
+### 2. Preserve cancellation through the three existing handlers
+
+Add a specific `except HitlRunStopRequested: raise` before broad failure handling at:
+
+| File | Boundary |
+|---|---|
+| `src/agents/eval_verifier.py` | API-call handling in `run_eval_verifier` |
+| `src/core/pipeline_orchestrator.py` | `_scoring_conformance_report` |
+| `src/core/hitl.py` | `_scoring_conformance_report_for_review` |
+
+This lets the existing stop path take over before a cancelled verification becomes a manager report. Ordinary API errors, invalid responses and advisory reports retain their existing behavior. The verifier remains advisory in managed review; the manager still owns research decisions. No scoring handoff or checkpoint-selection changes.
+
+### 3. Verify the complete narrow change locally
+
+Use simulated async API clients and existing run controls; no provider credentials or remote compute are needed.
+
+- Normal response still returns normally; the existing API timeout still cancels the request and closes the client.
+- User Stop in an unlimited run and budget expiry in a limited run interrupt an in-flight request, await cleanup and preserve the original stop reason.
+- A stop already present prevents API submission. A stop observed as the response completes prevents publishing a new verdict/report.
+- Inject the stop exception at each of the three boundaries and through the connected conformance-report chain: it escapes unchanged, without an unavailable advisory or further manager-review call. Existing cached conformance-report replay remains unchanged.
+- Convert the two verifier expected-failure reproducers in `tests/test_budget_active_stop.py` into passing regression tests. Keep the two worker-input expected failures as the explicitly deferred issue.
+- Run the verifier, conformance-report and active-stop tests first; then run the full local suite once the change is stable. Keep every test change local and uncommitted.
+
+### Completion boundary
+
+Done means the pending verifier request responds to both stop causes, its existing client cleanup completes, and cancellation reaches the existing managed stop/recovery flow without being reclassified as a verifier fault. No new mechanism is introduced. Report the results and stop for discussion before another implementation step; do not commit or push unless requested.
+
+## Verifier cancellation delivery — 2026-09-30
+
+Production changes are confined to three files:
+
+- `src/agents/eval_verifier.py`: retain the active run control for the lifetime of the API call; check it before submission and during the existing async wait; cancel and await the request on stop while retaining the original end-to-end API timeout. Reuse the existing client-close `finally`. Preserve an observed stop if request cleanup raises. Pass `HitlRunStopRequested` through the verifier API error handler.
+- `src/core/pipeline_orchestrator.py`: pass the stop exception through `_scoring_conformance_report`.
+- `src/core/hitl.py`: pass the stop exception through `_scoring_conformance_report_for_review`.
+
+No worker-input, manager-shutdown, recovery, remote-backend or scoring-policy changes. Existing advisory error reports and cached report replay remain unchanged.
+
+Validation: focused verifier/conformance/active-stop tests: **126 passed, 2 expected failures**. Full local suite: **451 passed, 2 expected failures in 26.92 seconds on macOS**. The two expected failures are the explicitly deferred blocked-worker-input cases (user Stop and budget expiry); both verifier reproducers now pass. Added local regressions cover cancellation and client cleanup for both stop causes, cleanup errors preserving the stop reason, stop before submission, stop arriving with a response, normal managed completion, unchanged API timeout, all three exception handlers, and the connected report handoff. `git diff --check` passed. Tests use local processes and simulated API clients; no live provider or remote compute was invoked. Optional PyGithub was disabled only in the test process, consistent with prior validation. All test changes remain local/uncommitted. No commit or push was made for this fix.
+
+## Deferred work
+
+- **Worker input delivery:** deferred at the user's request. The local reproducer remains; production prompt delivery stays unchanged.
+- **Remote verification:** separately exercise existing Slurm/Modal owned-job cancellation before claiming strict remote or benchmark deadline enforcement. This verifier-only fix makes no new remote guarantees.
