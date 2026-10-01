@@ -17,8 +17,8 @@ from neurico_harbor_agent.agent import (
 )
 from neurico_harbor_agent.run_autoresearch import execute_autoresearch
 from neurico_harbor_agent.runtime import (
+    CodexInferenceConnection,
     HarborAutoResearchTask,
-    HostedInferenceConnection,
     build_autoresearch_environment,
     build_harbor_idea,
 )
@@ -43,8 +43,8 @@ def test_harbor_instruction_uses_neurico_idea_contract(tmp_path: Path) -> None:
     assert len(idea["metadata"]["instruction_sha256"]) == 64
 
 
-def test_hosted_gateway_uses_neutral_credential_and_full_model() -> None:
-    connection = HostedInferenceConnection.from_environment(
+def test_hosted_gateway_uses_neutral_credential_and_full_model(tmp_path: Path) -> None:
+    connection = CodexInferenceConnection.from_environment(
         {
             "HOSTED_INFERENCE_TOKEN": "secret",
             "HOSTED_INFERENCE_URL": "https://gateway.example/v1",
@@ -52,42 +52,58 @@ def test_hosted_gateway_uses_neutral_credential_and_full_model() -> None:
         requested_model="openrouter/example/model",
     )
     assert connection.backend_model == "openrouter/example/model"
-    environment = connection.claude_environment()
-    assert environment["ANTHROPIC_API_KEY"] == "secret"
-    assert environment["ANTHROPIC_BASE_URL"] == "https://gateway.example/v1"
-    assert environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "openrouter/example/model"
+    environment = connection.prepare_codex_home(tmp_path / "codex-home")
+    config = (tmp_path / "codex-home" / "config.toml").read_text()
+    assert environment["HOSTED_INFERENCE_TOKEN"] == "secret"
+    assert 'model = "openrouter/example/model"' in config
+    assert 'base_url = "https://gateway.example/v1"' in config
+    assert 'env_key = "HOSTED_INFERENCE_TOKEN"' in config
+    assert "secret" not in config
 
 
-def test_direct_anthropic_mode_strips_provider_prefix() -> None:
-    connection = HostedInferenceConnection.from_environment(
-        {"HOSTED_INFERENCE_TOKEN": "secret"},
-        requested_model="anthropic/claude-sonnet-5",
+def test_chatgpt_auth_mode_strips_openai_provider_prefix(tmp_path: Path) -> None:
+    auth_file = tmp_path / "mounted-auth.json"
+    auth_file.write_text('{"tokens": {}}')
+    connection = CodexInferenceConnection.from_environment(
+        {"NEURICO_CODEX_AUTH_FILE": str(auth_file)},
+        requested_model="openai/gpt-5.6-sol",
     )
-    assert connection.backend_model == "claude-sonnet-5"
+    assert connection.mode == "chatgpt"
+    assert connection.backend_model == "gpt-5.6-sol"
 
 
-def test_direct_non_anthropic_model_is_rejected() -> None:
-    with pytest.raises(ValueError, match="requires an Anthropic model"):
-        HostedInferenceConnection.from_environment(
-            {"HOSTED_INFERENCE_TOKEN": "secret"},
-            requested_model="openai/gpt-5.6-sol",
+def test_direct_non_openai_model_is_rejected(tmp_path: Path) -> None:
+    auth_file = tmp_path / "mounted-auth.json"
+    auth_file.write_text('{"tokens": {}}')
+    with pytest.raises(ValueError, match="requires an OpenAI model"):
+        CodexInferenceConnection.from_environment(
+            {"NEURICO_CODEX_AUTH_FILE": str(auth_file)},
+            requested_model="anthropic/claude-sonnet-5",
         )
 
 
-def test_environment_exposes_locked_claude_and_temporary_idea_registry(tmp_path: Path) -> None:
-    connection = HostedInferenceConnection(
-        requested_model="anthropic/test-model",
-        token="secret",
+def test_environment_exposes_locked_codex_and_isolated_home(tmp_path: Path) -> None:
+    auth_file = tmp_path / "mounted-auth.json"
+    auth_file.write_text('{"tokens": {}}')
+    connection = CodexInferenceConnection(
+        requested_model="openai/test-model",
+        mode="chatgpt",
+        auth_file=auth_file,
     )
     ideas_dir = tmp_path / "control" / "ideas"
+    codex_home = tmp_path / "control" / "codex-home"
     environment = build_autoresearch_environment(
         {"PATH": "/usr/bin"},
         connection,
         ideas_dir=ideas_dir,
+        codex_home=codex_home,
     )
     assert environment["NEURICO_IDEAS"] == str(ideas_dir)
+    assert environment["CODEX_HOME"] == str(codex_home)
+    assert (codex_home / "auth.json").read_text() == '{"tokens": {}}'
+    assert 'model = "test-model"' in (codex_home / "config.toml").read_text()
     first_path = Path(environment["PATH"].split(os.pathsep)[0])
-    assert (first_path / "claude").is_file()
+    assert (first_path / "codex").is_file()
 
 
 def test_iteration_override_must_be_positive() -> None:
@@ -149,7 +165,7 @@ def test_child_entrypoint_invokes_existing_autoresearch_runner(
     assert captured["idea"]["idea"]["metadata"]["local_workspace"] == str(tmp_path)
     assert captured["run"] == {
         "idea_id": "harbor-idea",
-        "provider": "claude",
+        "provider": "codex",
         "full_permissions": True,
         "multi_agent": True,
         "skip_resource_finder": False,
@@ -175,10 +191,12 @@ def test_acp_prompt_launches_autoresearch_not_direct_inference(
     monkeypatch.setattr(agent_module, "run_autoresearch_process", fake_autoresearch)
 
     async def run_prompt() -> None:
+        auth_file = tmp_path / "auth.json"
+        auth_file.write_text('{"tokens": {}}')
         agent = NeuricoHarborAgent(
             {
-                "NEURICO_MODEL": "anthropic/test-model",
-                "ANTHROPIC_API_KEY": "secret",
+                "NEURICO_MODEL": "openai/test-model",
+                "NEURICO_CODEX_AUTH_FILE": str(auth_file),
             }
         )
         session = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
@@ -193,6 +211,7 @@ def test_acp_prompt_launches_autoresearch_not_direct_inference(
     assert captured["task"].workspace == tmp_path
     assert captured["iterations"] == 1
     assert captured["connection"].backend_model == "test-model"
+    assert captured["connection"].mode == "chatgpt"
 
 
 def test_autoresearch_failure_fails_the_acp_turn(
@@ -204,10 +223,12 @@ def test_autoresearch_failure_fails_the_acp_turn(
     monkeypatch.setattr(agent_module, "run_autoresearch_process", failing_autoresearch)
 
     async def run_prompt() -> None:
+        auth_file = tmp_path / "auth.json"
+        auth_file.write_text('{"tokens": {}}')
         agent = NeuricoHarborAgent(
             {
-                "NEURICO_MODEL": "anthropic/test-model",
-                "ANTHROPIC_API_KEY": "secret",
+                "NEURICO_MODEL": "openai/test-model",
+                "NEURICO_CODEX_AUTH_FILE": str(auth_file),
             }
         )
         session = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
@@ -230,7 +251,7 @@ def test_stdio_acp_handshake_and_model_selection(tmp_path: Path) -> None:
 
     async def exercise_protocol() -> None:
         environment = dict(os.environ)
-        environment["NEURICO_MODEL"] = "anthropic/test-model"
+        environment["NEURICO_MODEL"] = "openai/test-model"
         async with spawn_agent_process(
             RecordingClient(),
             sys.executable,
@@ -247,13 +268,13 @@ def test_stdio_acp_handshake_and_model_selection(tmp_path: Path) -> None:
             assert session.config_options is not None
             model_option = session.config_options[0]
             assert model_option.id == "model"
-            assert model_option.current_value == "anthropic/test-model"
+            assert model_option.current_value == "openai/test-model"
 
             response = await connection.set_config_option(
                 session_id=session.session_id,
                 config_id="model",
-                value="anthropic/test-model",
+                value="openai/test-model",
             )
-            assert response.config_options[0].current_value == "anthropic/test-model"
+            assert response.config_options[0].current_value == "openai/test-model"
 
     asyncio.run(exercise_protocol())

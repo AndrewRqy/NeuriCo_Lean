@@ -32,7 +32,7 @@ def execute_autoresearch(
     runner = ResearchRunner(use_github=False)
     return runner.run_research(
         idea_id=idea_id,
-        provider="claude",
+        provider="codex",
         full_permissions=True,
         multi_agent=True,
         skip_resource_finder=False,

@@ -1,9 +1,9 @@
 # NeuriCo Harbor agent
 
 This directory is the locked ACP runtime for using NeuriCo AutoResearch as a
-Harbor agent. The adapter is deliberately thin: it converts Harbor's prompt
-through NeuriCo's existing local-idea converter and launches the existing
-fresh AutoResearch workflow in Harbor's supplied repository.
+Harbor agent. The adapter converts Harbor's prompt through NeuriCo's existing
+local-idea converter and launches the existing fresh AutoResearch workflow in
+Harbor's supplied repository, using NeuriCo's Codex provider.
 
 ## Contract
 
@@ -21,76 +21,50 @@ fresh AutoResearch workflow in Harbor's supplied repository.
   remains the authoritative benchmark result after the agent exits.
 - One AutoResearch improvement iteration is used by default, matching
   NeuriCo's CLI default. `NEURICO_HARBOR_AUTORESEARCH_ITERATIONS` may select a
-  larger positive count. This changes the search depth within one Harbor trial;
-  it does not change Harbor's number of independent attempts.
-- This first adapter does not add a new whole-run time-budget policy. NeuriCo's
+  larger positive count. This changes search depth within one Harbor trial; it
+  does not change Harbor's number of independent attempts.
+- This adapter does not add a new whole-run time-budget policy. NeuriCo's
   existing stage limits still apply, Harbor may cancel the ACP run, and a
   later NeuriCo feature can map one global budget across AutoResearch stages.
 - The requested Harbor model is advertised as an ACP session configuration
-  option and is pinned for every Claude-backed NeuriCo stage.
-- The adapter reads `HOSTED_INFERENCE_TOKEN` and only applies
-  `HOSTED_INFERENCE_URL` when Harbor supplies it. For local runs,
-  `ANTHROPIC_API_KEY` and optional `ANTHROPIC_BASE_URL` are accepted.
-- NeuriCo's idea registry is kept in a temporary control directory outside the
-  task repository. Research state and the retained best implementation remain
-  in Harbor's workspace.
+  option and written to an isolated `CODEX_HOME`, pinning every Codex-backed
+  NeuriCo stage to the same model.
+- Local runs use a Codex login cache supplied through
+  `NEURICO_CODEX_AUTH_FILE`. The adapter copies it into the isolated run home;
+  it never writes the mounted source file.
+- Hosted runs may instead supply `HOSTED_INFERENCE_TOKEN` together with
+  `HOSTED_INFERENCE_URL`. Direct OpenAI API mode accepts `OPENAI_API_KEY` and
+  optional `OPENAI_BASE_URL`.
+- NeuriCo's idea registry and Codex home are kept in a temporary control
+  directory outside the task repository. Research state and the retained best
+  implementation remain in Harbor's workspace.
 - Harbor runs its own verifier after NeuriCo exits; the adapter does not inspect
   or translate Harbor's verifier.
 
-The locked runtime includes the Claude Agent SDK because its wheel contains the
-Claude executable used by NeuriCo's existing provider integration. This avoids
-installing an unpinned CLI during a task and works in task images without
-Node.js.
+The Python source runtime exposes a locked `codex` launcher. It uses an already
+available Codex CLI only when its version exactly matches the adapter pin;
+otherwise it installs `@openai/codex@0.147.0` into the execution user's cache.
+This mirrors Harbor's own Codex-agent installation strategy while keeping the
+NeuriCo source manifest compatible with Harbor's `python-uv` runtime.
 
-## Hosted Harbor
+## Local Harbor with ChatGPT authentication
 
-Use the repository root as `source.path` and point `source.manifest` at this
-directory:
-
-```json
-{
-  "agents": [
-    {
-      "name": "acp",
-      "source": {
-        "type": "github",
-        "repo": "ChicagoHAI/neurico",
-        "path": ".",
-        "manifest": "integrations/harbor/harbor-agent.json"
-      },
-      "model_name": "anthropic/claude-sonnet-5",
-      "env": {
-        "NEURICO_HARBOR_AUTORESEARCH_ITERATIONS": "1"
-      },
-      "secrets": ["ANTHROPIC_API_KEY"]
-    }
-  ]
-}
-```
-
-Pin `source.ref` to a commit SHA for a reproducible production run. Gateway
-credential mode is supported. Direct credential mode currently requires an
-Anthropic model because this adapter deliberately ships one locked backend.
-
-## Local protocol smoke test
+First authenticate the host Codex CLI and confirm the active method:
 
 ```bash
-cd integrations/harbor
-uv sync --frozen
-NEURICO_MODEL=anthropic/claude-sonnet-5 \
-ANTHROPIC_API_KEY=... \
-uv run python -m neurico_harbor_agent
+codex login
+codex login status
 ```
 
-That command starts the stdio ACP server. A full local Harbor run uses the
-same Git source manifest through `agent.name: acp`:
+Then expose only the cached login file to the task container. A local job
+configuration looks like this:
 
 ```yaml
 agents:
   - name: acp
-    model_name: anthropic/claude-sonnet-5
+    model_name: openai/gpt-5.6-sol
     env:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      NEURICO_CODEX_AUTH_FILE: /run/secrets/neurico-codex-auth.json
       NEURICO_HARBOR_AUTORESEARCH_ITERATIONS: "1"
     kwargs:
       source:
@@ -98,11 +72,44 @@ agents:
         ref: <branch-tag-or-commit>
         source_dir: .
         manifest_path: integrations/harbor/harbor-agent.json
+
+environment:
+  type: docker
+  mounts:
+    - type: bind
+      source: /absolute/host/path/to/.codex/auth.json
+      target: /run/secrets/neurico-codex-auth.json
+      read_only: true
 ```
 
-Use a branch while developing and a commit SHA once the integration is
-stable. This executes on the local machine's Harbor/Docker stack; it does not
-submit a hosted job.
+Use a branch while developing and a full commit SHA once the integration is
+stable. This executes on the local Harbor/Docker stack and consumes the Codex
+entitlement of the ChatGPT account represented by the mounted login cache. The
+cache is a secret and must never be committed or included in job artifacts.
+
+## Hosted Harbor
+
+Hosted automation should use a per-user credential, an enterprise Codex access
+token exposed through an appropriate provider, or Harbor's hosted inference
+gateway. Gateway mode is configured with:
+
+```yaml
+agents:
+  - name: acp
+    model_name: openai/gpt-5.6-sol
+    env:
+      NEURICO_HARBOR_AUTORESEARCH_ITERATIONS: "1"
+    kwargs:
+      source:
+        repo_url: https://github.com/ChicagoHAI/neurico
+        ref: <full-commit-sha>
+        source_dir: .
+        manifest_path: integrations/harbor/harbor-agent.json
+```
+
+Supply `HOSTED_INFERENCE_TOKEN` and `HOSTED_INFERENCE_URL` as Harbor secrets,
+not literal configuration values. The gateway must expose an OpenAI Responses
+API-compatible endpoint.
 
 The adapter intentionally does not accept raw NeuriCo command-line arguments.
 Benchmark controls are added as individually validated `NEURICO_HARBOR_*`
@@ -113,10 +120,11 @@ control; model choice belongs to Harbor, and paper generation remains off.
 ## Contract tests
 
 ```bash
+cd integrations/harbor
 uv sync --frozen --extra dev
 uv run --frozen --extra dev pytest -q tests/contract_checks.py
 ```
 
 The suite includes a real stdio ACP handshake and model-selection round trip.
 AutoResearch execution is replaced at the process boundary during contract
-tests, so the tests do not spend model credits.
+tests, so the tests do not consume model usage.
