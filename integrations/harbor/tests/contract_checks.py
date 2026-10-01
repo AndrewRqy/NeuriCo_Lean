@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from acp.interfaces import Client
 from neurico_harbor_agent.agent import (
     NeuricoHarborAgent,
     _autoresearch_iterations,
+    _autoresearch_time_limit,
     _remove_created_workspace_venv,
     _terminate_process_tree,
     _text_from_prompt,
@@ -112,6 +114,15 @@ def test_iteration_override_must_be_positive() -> None:
     assert _autoresearch_iterations({"NEURICO_HARBOR_AUTORESEARCH_ITERATIONS": "3"}) == 3
     with pytest.raises(ValueError, match="at least 1"):
         _autoresearch_iterations({"NEURICO_HARBOR_AUTORESEARCH_ITERATIONS": "0"})
+
+
+def test_time_limit_override_is_optional_and_positive() -> None:
+    assert _autoresearch_time_limit({}) is None
+    assert _autoresearch_time_limit({"NEURICO_HARBOR_TIME_LIMIT_SECONDS": "1740"}) == 1740
+    with pytest.raises(ValueError, match="greater than 0"):
+        _autoresearch_time_limit({"NEURICO_HARBOR_TIME_LIMIT_SECONDS": "0"})
+    with pytest.raises(ValueError, match="must be a number"):
+        _autoresearch_time_limit({"NEURICO_HARBOR_TIME_LIMIT_SECONDS": "later"})
 
 
 def test_cancellation_terminates_autoresearch_process_group() -> None:
@@ -219,6 +230,47 @@ def test_child_entrypoint_invokes_manager_driven_auto_hitl_runner(
     assert "autoresearch" not in captured["run"]
 
 
+def test_child_time_limit_uses_hitl_stop_and_returns_last_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeManager:
+        def __init__(self, ideas_dir: Path):
+            pass
+
+        def submit_idea(self, idea: dict[str, Any], validate: bool) -> str:
+            return "harbor-idea"
+
+    class FakeRunner:
+        def __init__(self, *, use_github: bool):
+            pass
+
+        def run_research(self, **kwargs: Any) -> dict[str, Any]:
+            from src.core.hitl_run_control import raise_if_hitl_run_stop_requested
+
+            while True:
+                raise_if_hitl_run_stop_requested()
+                threading.Event().wait(0.005)
+
+    monkeypatch.setattr(runner_module, "IdeaManager", FakeManager)
+    monkeypatch.setattr(runner_module, "ResearchRunner", FakeRunner)
+    monkeypatch.setattr(
+        "src.core.hitl_autoresearch.recover_interrupted_hitl_autoresearch_attempt",
+        lambda _workspace: None,
+    )
+
+    result = execute_autoresearch(
+        instruction="Run until the benchmark budget expires.",
+        workspace=tmp_path,
+        ideas_dir=tmp_path / "ideas",
+        time_limit_seconds=0.02,
+    )
+
+    assert result["stopped"] is True
+    assert result["time_limit_reached"] is True
+    control_dir = tmp_path / ".neurico" / "hitl" / "control"
+    assert not list(control_dir.glob("stop.harbor-*.json"))
+
+
 def test_acp_prompt_launches_autoresearch_not_direct_inference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -242,6 +294,7 @@ def test_acp_prompt_launches_autoresearch_not_direct_inference(
             {
                 "NEURICO_MODEL": "openai/test-model",
                 "NEURICO_CODEX_AUTH_FILE": str(auth_file),
+                "NEURICO_HARBOR_TIME_LIMIT_SECONDS": "1740",
             }
         )
         session = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
@@ -255,6 +308,7 @@ def test_acp_prompt_launches_autoresearch_not_direct_inference(
     assert captured["task"].instruction == instruction
     assert captured["task"].workspace == tmp_path
     assert captured["iterations"] == 1
+    assert captured["time_limit_seconds"] == 1740
     assert captured["connection"].backend_model == "test-model"
     assert captured["connection"].mode == "chatgpt"
     assert not (tmp_path / ".venv").exists()

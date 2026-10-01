@@ -30,9 +30,14 @@ for human input.
   larger positive count. This changes search depth within one Harbor trial; it
   does not change Harbor's number of independent attempts or limit the
   manager's stage-level repair and replacement decisions.
-- This adapter does not add a new whole-run time-budget policy. NeuriCo's
-  managed stages run under Harbor's outer agent timeout and cancellation. A
-  later NeuriCo feature can map one global budget across AutoResearch stages.
+- `NEURICO_HARBOR_TIME_LIMIT_SECONDS` optionally gives NeuriCo a whole-run
+  budget. When it expires, the existing HITL stop control asks the active
+  worker to stop, restores any interrupted AutoResearch attempt, retains the
+  last valid checkpoint, and exits before Harbor starts its verifier. Set this
+  below Harbor's agent timeout so cooperative recovery and `.venv` cleanup have
+  time to finish; for example, use 1740 seconds with a 1800-second Harbor
+  timeout. If cooperative shutdown itself stalls, the adapter terminates the
+  isolated NeuriCo process group after a 30-second grace period.
 - The requested Harbor model is advertised as an ACP session configuration
   option and written to an isolated `CODEX_HOME`, pinning every Codex-backed
   NeuriCo stage to the same model.
@@ -80,6 +85,7 @@ agents:
     env:
       NEURICO_CODEX_AUTH_FILE: /run/secrets/neurico-codex-auth.json
       NEURICO_HARBOR_AUTORESEARCH_ITERATIONS: "1"
+      NEURICO_HARBOR_TIME_LIMIT_SECONDS: "1740"
     kwargs:
       source:
         repo_url: https://github.com/ChicagoHAI/neurico
@@ -113,6 +119,7 @@ agents:
     model_name: openai/gpt-5.6-sol
     env:
       NEURICO_HARBOR_AUTORESEARCH_ITERATIONS: "1"
+      NEURICO_HARBOR_TIME_LIMIT_SECONDS: "1740"
     kwargs:
       source:
         repo_url: https://github.com/ChicagoHAI/neurico
@@ -128,8 +135,9 @@ API-compatible endpoint.
 The adapter intentionally does not accept raw NeuriCo command-line arguments.
 Benchmark controls are added as individually validated `NEURICO_HARBOR_*`
 environment variables so a Harbor config cannot silently enable unrelated
-research-publication behavior. At present, iteration count is the only such
-control; model choice belongs to Harbor, and paper generation remains off.
+research-publication behavior. Iteration count and the optional whole-run time
+limit are the only such controls; model choice belongs to Harbor, and paper
+generation remains off.
 
 ## Contract tests
 
