@@ -41,8 +41,8 @@ from acp.schema import (
 )
 
 from .runtime import (
+    CodexInferenceConnection,
     HarborAutoResearchTask,
-    HostedInferenceConnection,
     build_autoresearch_environment,
 )
 
@@ -113,7 +113,7 @@ async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
 async def run_autoresearch_process(
     *,
     task: HarborAutoResearchTask,
-    connection: HostedInferenceConnection,
+    connection: CodexInferenceConnection,
     base_environment: dict[str, str],
     iterations: int,
     emit: OutputHandler,
@@ -125,10 +125,12 @@ async def run_autoresearch_process(
         instruction_file = control_dir / "instruction.txt"
         instruction_file.write_text(task.instruction, encoding="utf-8")
         ideas_dir = control_dir / "ideas"
+        codex_home = control_dir / "codex-home"
         environment = build_autoresearch_environment(
             base_environment,
             connection,
             ideas_dir=ideas_dir,
+            codex_home=codex_home,
         )
 
         process = await asyncio.create_subprocess_exec(
@@ -176,7 +178,7 @@ class NeuricoHarborAgent(Agent):
     ) -> InitializeResponse:
         return InitializeResponse(
             protocol_version=protocol_version,
-            agent_info=Implementation(name="neurico", version="0.1.0"),
+            agent_info=Implementation(name="neurico", version="0.2.0"),
         )
 
     def _requested_model(self) -> str:
@@ -291,7 +293,7 @@ class NeuricoHarborAgent(Agent):
             instruction=_text_from_prompt(prompt),
             workspace=session.cwd,
         )
-        connection = HostedInferenceConnection.from_environment(
+        connection = CodexInferenceConnection.from_environment(
             self._environment,
             requested_model=session.model,
         )
