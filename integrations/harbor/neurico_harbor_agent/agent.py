@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
+import stat
 import sys
 import tempfile
 from collections.abc import Awaitable, Callable
@@ -88,6 +90,40 @@ def _autoresearch_iterations(environment: dict[str, str]) -> int:
     if iterations < 1:
         raise ValueError("NEURICO_HARBOR_AUTORESEARCH_ITERATIONS must be at least 1")
     return iterations
+
+
+def _path_entry_exists(path: Path) -> bool:
+    """Return whether a path entry exists without following a symlink."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _remove_created_workspace_venv(workspace: Path, *, existed_before: bool) -> bool:
+    """Remove only a workspace ``.venv`` created during this Harbor run."""
+    if existed_before:
+        return False
+
+    workspace = workspace.resolve()
+    if workspace == Path(workspace.anchor):
+        raise RuntimeError(
+            "Refusing to clean a workspace virtual environment under filesystem root"
+        )
+
+    target = workspace / ".venv"
+    try:
+        target_stat = target.lstat()
+    except FileNotFoundError:
+        return False
+
+    if stat.S_ISDIR(target_stat.st_mode) and not stat.S_ISLNK(target_stat.st_mode):
+        shutil.rmtree(target)
+    else:
+        # Never follow a run-created symlink. Unlink the workspace entry only.
+        target.unlink()
+    return True
 
 
 async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
@@ -298,6 +334,7 @@ class NeuricoHarborAgent(Agent):
             requested_model=session.model,
         )
         iterations = _autoresearch_iterations(self._environment)
+        workspace_venv_existed = _path_entry_exists(task.workspace.resolve() / ".venv")
         session.cancelled = False
         session.active_task = asyncio.current_task()
 
@@ -327,5 +364,11 @@ class NeuricoHarborAgent(Agent):
         finally:
             if session.process is not None and session.process.returncode is None:
                 await _terminate_process_tree(session.process)
-            session.process = None
-            session.active_task = None
+            try:
+                _remove_created_workspace_venv(
+                    task.workspace,
+                    existed_before=workspace_venv_existed,
+                )
+            finally:
+                session.process = None
+                session.active_task = None

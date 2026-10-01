@@ -12,6 +12,7 @@ from acp.interfaces import Client
 from neurico_harbor_agent.agent import (
     NeuricoHarborAgent,
     _autoresearch_iterations,
+    _remove_created_workspace_venv,
     _terminate_process_tree,
     _text_from_prompt,
 )
@@ -127,6 +128,44 @@ def test_cancellation_terminates_autoresearch_process_group() -> None:
     asyncio.run(exercise())
 
 
+def test_workspace_venv_cleanup_removes_only_run_created_environment(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pyproject = workspace / "pyproject.toml"
+    pyproject.write_text("[project]\nname = 'research-workspace'\n")
+    venv_file = workspace / ".venv" / "lib" / "dependency.py"
+    venv_file.parent.mkdir(parents=True)
+    venv_file.write_text("installed = True\n")
+
+    assert _remove_created_workspace_venv(workspace, existed_before=False) is True
+    assert not (workspace / ".venv").exists()
+    assert pyproject.is_file()
+
+
+def test_workspace_venv_cleanup_preserves_preexisting_environment(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    venv_file = workspace / ".venv" / "pyvenv.cfg"
+    venv_file.parent.mkdir(parents=True)
+    venv_file.write_text("preexisting = true\n")
+
+    assert _remove_created_workspace_venv(workspace, existed_before=True) is False
+    assert venv_file.is_file()
+
+
+def test_workspace_venv_cleanup_unlinks_symlink_without_following_it(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "keep.txt"
+    outside_file.write_text("keep\n")
+    (workspace / ".venv").symlink_to(outside, target_is_directory=True)
+
+    assert _remove_created_workspace_venv(workspace, existed_before=False) is True
+    assert not (workspace / ".venv").exists()
+    assert outside_file.read_text() == "keep\n"
+
+
 def test_child_entrypoint_invokes_existing_autoresearch_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -185,6 +224,9 @@ def test_acp_prompt_launches_autoresearch_not_direct_inference(
 
     async def fake_autoresearch(**kwargs: Any) -> int:
         captured.update(kwargs)
+        venv_file = kwargs["task"].workspace / ".venv" / "pyvenv.cfg"
+        venv_file.parent.mkdir()
+        venv_file.write_text("created by NeuriCo\n")
         await kwargs["emit"]("AutoResearch output\n")
         return 0
 
@@ -212,12 +254,16 @@ def test_acp_prompt_launches_autoresearch_not_direct_inference(
     assert captured["iterations"] == 1
     assert captured["connection"].backend_model == "test-model"
     assert captured["connection"].mode == "chatgpt"
+    assert not (tmp_path / ".venv").exists()
 
 
 def test_autoresearch_failure_fails_the_acp_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def failing_autoresearch(**kwargs: Any) -> int:
+        venv_file = kwargs["task"].workspace / ".venv" / "pyvenv.cfg"
+        venv_file.parent.mkdir()
+        venv_file.write_text("created by NeuriCo\n")
         return 7
 
     monkeypatch.setattr(agent_module, "run_autoresearch_process", failing_autoresearch)
@@ -239,6 +285,7 @@ def test_autoresearch_failure_fails_the_acp_turn(
             )
 
     asyncio.run(run_prompt())
+    assert not (tmp_path / ".venv").exists()
 
 
 def test_stdio_acp_handshake_and_model_selection(tmp_path: Path) -> None:

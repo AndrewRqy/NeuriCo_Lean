@@ -40,6 +40,11 @@ Harbor's supplied repository, using NeuriCo's Codex provider.
 - NeuriCo's idea registry and Codex home are kept in a temporary control
   directory outside the task repository. Research state and the retained best
   implementation remain in Harbor's workspace.
+- NeuriCo may create a workspace `.venv` while its agents and internal scorer
+  run. After the AutoResearch child process exits, the adapter removes that
+  environment if it did not exist before the Harbor session. Dependency
+  metadata and research artifacts remain, while a benchmark-provided `.venv`
+  is preserved. Harbor's verifier is responsible for its own environment.
 - Harbor runs its own verifier after NeuriCo exits; the adapter does not inspect
   or translate Harbor's verifier.
 
