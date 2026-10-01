@@ -1,9 +1,11 @@
 # NeuriCo Harbor agent
 
-This directory is the locked ACP runtime for using NeuriCo AutoResearch as a
-Harbor agent. The adapter converts Harbor's prompt through NeuriCo's existing
-local-idea converter and launches the existing fresh AutoResearch workflow in
-Harbor's supplied repository, using NeuriCo's Codex provider.
+This directory is the locked ACP runtime for using NeuriCo's manager-driven
+AutoResearch as a Harbor agent. The adapter converts Harbor's prompt through
+NeuriCo's existing local-idea converter and launches fresh HITL AutoResearch in
+headless Auto mode inside Harbor's supplied repository, using NeuriCo's Codex
+provider. Auto mode uses the manager for every review boundary but never waits
+for human input.
 
 ## Contract
 
@@ -13,20 +15,23 @@ Harbor's supplied repository, using NeuriCo's Codex provider.
 - Harbor's complete text prompt is preserved in
   `idea.background.description`. NeuriCo's prompt generator already promotes
   that field as high-priority user instructions.
-- NeuriCo runs its normal fresh AutoResearch resource-finder stage before rule
-  construction. The resource finder may use Harbor's supplied repository and
-  any external sources allowed by the task's Harbor network policy. The scored
-  lifecycle then continues with a baseline experiment, scoring, proposals,
-  candidate experiments, and accept-or-restore checkpointing.
+- NeuriCo runs fresh manager-driven HITL AutoResearch in Auto mode. The manager
+  reviews resource-finder, rule-maker, experiment, and scoring boundaries and
+  may request repairs or replacement workers without human interaction. The
+  resource finder may use Harbor's supplied repository and any external sources
+  allowed by the task's Harbor network policy. The scored lifecycle then
+  continues with a baseline experiment, scoring, proposals, candidate
+  experiments, and manager-governed accept-or-restore checkpointing.
 - The adapter is benchmark-focused. Internal scoring is enabled, while paper
   generation and scribe/notebook output are always disabled. Harbor's verifier
   remains the authoritative benchmark result after the agent exits.
 - One AutoResearch improvement iteration is used by default, matching
   NeuriCo's CLI default. `NEURICO_HARBOR_AUTORESEARCH_ITERATIONS` may select a
   larger positive count. This changes search depth within one Harbor trial; it
-  does not change Harbor's number of independent attempts.
+  does not change Harbor's number of independent attempts or limit the
+  manager's stage-level repair and replacement decisions.
 - This adapter does not add a new whole-run time-budget policy. NeuriCo's
-  existing stage limits still apply, Harbor may cancel the ACP run, and a
+  managed stages run under Harbor's outer agent timeout and cancellation. A
   later NeuriCo feature can map one global budget across AutoResearch stages.
 - The requested Harbor model is advertised as an ACP session configuration
   option and written to an isolated `CODEX_HOME`, pinning every Codex-backed
@@ -134,6 +139,8 @@ uv sync --frozen --extra dev
 uv run --frozen --extra dev pytest -q tests/contract_checks.py
 ```
 
-The suite includes a real stdio ACP handshake and model-selection round trip.
-AutoResearch execution is replaced at the process boundary during contract
-tests, so the tests do not consume model usage.
+The suite includes a real stdio ACP handshake and model-selection round trip,
+and verifies that the child selects headless manager-driven Auto HITL instead
+of ordinary mechanical AutoResearch. Model-backed execution is replaced at the
+process boundary during contract tests, so the tests do not consume model
+usage.

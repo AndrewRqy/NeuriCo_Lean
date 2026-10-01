@@ -1,4 +1,4 @@
-"""Child-process entrypoint for one genuine NeuriCo AutoResearch run."""
+"""Child-process entrypoint for one manager-driven NeuriCo AutoResearch run."""
 
 from __future__ import annotations
 
@@ -19,16 +19,19 @@ def execute_autoresearch(
     ideas_dir: Path,
     iterations: int = 1,
 ) -> dict[str, Any]:
-    """Submit a Harbor task through NeuriCo and run fresh AutoResearch."""
+    """Submit a Harbor task through NeuriCo and run headless Auto HITL AutoResearch."""
     if iterations < 1:
         raise ValueError("AutoResearch iterations must be at least 1")
 
     task = HarborAutoResearchTask(instruction=instruction, workspace=workspace)
-    manager = IdeaManager(ideas_dir)
-    idea_id = manager.submit_idea(build_harbor_idea(task), validate=True)
+    idea_manager = IdeaManager(ideas_dir)
+    idea_id = idea_manager.submit_idea(build_harbor_idea(task), validate=True)
 
-    # The idea metadata points at Harbor's existing repository, so the normal
-    # local runner selects it as the authoritative AutoResearch workspace.
+    # The idea metadata points at Harbor's existing repository, so the local
+    # runner selects it as the authoritative AutoResearch workspace. A direct
+    # runner invocation hosts the manager headlessly; "cli" selects the managed
+    # entry surface without starting a browser, while Auto mode forbids human
+    # escalation and lets the manager resolve every review boundary itself.
     runner = ResearchRunner(use_github=False)
     return runner.run_research(
         idea_id=idea_id,
@@ -39,7 +42,9 @@ def execute_autoresearch(
         write_paper=False,
         scoring_enabled=True,
         benchmark_mode=True,
-        autoresearch=True,
+        hitl_autoresearch="cli",
+        hitl_manager_no_browser=True,
+        hitl_mode="auto",
         autoresearch_iterations=iterations,
     )
 

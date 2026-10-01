@@ -166,7 +166,7 @@ def test_workspace_venv_cleanup_unlinks_symlink_without_following_it(tmp_path: P
     assert outside_file.read_text() == "keep\n"
 
 
-def test_child_entrypoint_invokes_existing_autoresearch_runner(
+def test_child_entrypoint_invokes_manager_driven_auto_hitl_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, Any] = {}
@@ -211,9 +211,12 @@ def test_child_entrypoint_invokes_existing_autoresearch_runner(
         "write_paper": False,
         "scoring_enabled": True,
         "benchmark_mode": True,
-        "autoresearch": True,
+        "hitl_autoresearch": "cli",
+        "hitl_manager_no_browser": True,
+        "hitl_mode": "auto",
         "autoresearch_iterations": 2,
     }
+    assert "autoresearch" not in captured["run"]
 
 
 def test_acp_prompt_launches_autoresearch_not_direct_inference(
