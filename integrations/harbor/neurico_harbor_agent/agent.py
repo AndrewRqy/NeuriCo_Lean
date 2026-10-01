@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import math
 import os
 import shutil
@@ -162,6 +163,23 @@ async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
+async def _stream_process_output(
+    process: asyncio.subprocess.Process,
+    emit: OutputHandler,
+) -> int:
+    """Forward arbitrary-size child output without imposing a line limit."""
+    assert process.stdout is not None
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while chunk := await process.stdout.read(64 * 1024):
+        text = decoder.decode(chunk)
+        if text:
+            await emit(text)
+    final_text = decoder.decode(b"", final=True)
+    if final_text:
+        await emit(final_text)
+    return await process.wait()
+
+
 async def run_autoresearch_process(
     *,
     task: HarborAutoResearchTask,
@@ -211,18 +229,11 @@ async def run_autoresearch_process(
             start_new_session=True,
         )
         register_process(process)
-        assert process.stdout is not None
-
-        async def stream_until_exit() -> int:
-            while line := await process.stdout.readline():
-                await emit(line.decode("utf-8", errors="replace"))
-            return await process.wait()
-
         if time_limit_seconds is None:
-            return await stream_until_exit()
+            return await _stream_process_output(process, emit)
         try:
             return await asyncio.wait_for(
-                stream_until_exit(),
+                _stream_process_output(process, emit),
                 timeout=time_limit_seconds + _COOPERATIVE_SHUTDOWN_GRACE_SECONDS,
             )
         except TimeoutError:

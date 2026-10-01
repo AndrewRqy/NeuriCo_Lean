@@ -15,6 +15,7 @@ from neurico_harbor_agent.agent import (
     _autoresearch_iterations,
     _autoresearch_time_limit,
     _remove_created_workspace_venv,
+    _stream_process_output,
     _terminate_process_tree,
     _text_from_prompt,
 )
@@ -135,6 +136,27 @@ def test_cancellation_terminates_autoresearch_process_group() -> None:
         )
         await _terminate_process_tree(process)
         assert process.returncode is not None
+
+    asyncio.run(exercise())
+
+
+def test_child_output_stream_accepts_events_larger_than_asyncio_line_limit() -> None:
+    async def exercise() -> None:
+        payload_size = 200_000
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            f"import sys; sys.stdout.write('x' * {payload_size})",
+            stdout=asyncio.subprocess.PIPE,
+        )
+        chunks: list[str] = []
+
+        async def emit(text: str) -> None:
+            chunks.append(text)
+
+        return_code = await _stream_process_output(process, emit)
+        assert return_code == 0
+        assert len("".join(chunks)) == payload_size
 
     asyncio.run(exercise())
 
