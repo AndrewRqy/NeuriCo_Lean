@@ -65,7 +65,21 @@ def _cache_root() -> Path:
     return root
 
 
+def _activate_cached_node(root: Path) -> None:
+    """Expose an NVM-installed Node binary to npm's Codex launcher."""
+    node_root = root / f"nvm-{NVM_VERSION}" / "versions" / "node"
+    node_bins = sorted(node_root.glob("*/bin"))
+    if not node_bins:
+        return
+    node_bin = node_bins[-1]
+    current_path = os.environ.get("PATH", os.defpath)
+    path_entries = current_path.split(os.pathsep)
+    if str(node_bin) not in path_entries:
+        os.environ["PATH"] = f"{node_bin}{os.pathsep}{current_path}"
+
+
 def _install_with_npm(root: Path) -> Path:
+    _activate_cached_node(root)
     prefix = root / f"codex-{CODEX_VERSION}"
     executable = prefix / "node_modules" / ".bin" / "codex"
     if executable.is_file() and _reported_version(executable) == CODEX_VERSION:
@@ -122,6 +136,7 @@ def _install_with_npm(root: Path) -> Path:
             }
         )
         subprocess.run(["bash", "-lc", command], check=True, env=install_environment)
+        _activate_cached_node(root)
 
     if not executable.is_file() or _reported_version(executable) != CODEX_VERSION:
         raise RuntimeError(f"Failed to install Codex CLI {CODEX_VERSION}")
