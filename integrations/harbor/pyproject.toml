@@ -1,6 +1,6 @@
 [project]
 name = "neurico-harbor-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "ACP adapter for running NeuriCo AutoResearch in Harbor task environments"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -8,12 +8,12 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "ChicagoHAI" }]
 dependencies = [
     "agent-client-protocol>=0.12.1,<0.13",
-    "claude-agent-sdk>=0.2,<0.3",
     "neurico",
 ]
 
 [project.scripts]
 neurico-harbor-agent = "neurico_harbor_agent.__main__:main"
+codex = "neurico_harbor_agent.codex_bootstrap:main"
 
 [build-system]
 requires = ["hatchling"]
