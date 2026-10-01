@@ -43,6 +43,7 @@ def execute_autoresearch(
         use_scribe=False,
         write_paper=False,
         scoring_enabled=True,
+        benchmark_mode=True,
         autoresearch=True,
         autoresearch_iterations=iterations,
     )

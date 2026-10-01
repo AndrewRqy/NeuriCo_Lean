@@ -16,6 +16,31 @@ CODEX_VERSION = "0.147.0"
 NVM_VERSION = "0.40.2"
 
 
+def _ensure_git_available() -> None:
+    """Install Git when the minimal Harbor task image does not provide it."""
+    if shutil.which("git") is not None:
+        return
+    if os.geteuid() != 0:
+        raise RuntimeError(
+            "NeuriCo AutoResearch requires git; install it in the Harbor task image "
+            "or run the source agent as a user allowed to install system packages"
+        )
+
+    installers = (
+        ("apt-get", ["apt-get", "install", "-y", "-qq", "git"]),
+        ("apk", ["apk", "add", "--no-cache", "git"]),
+        ("dnf", ["dnf", "install", "-y", "git"]),
+        ("yum", ["yum", "install", "-y", "git"]),
+    )
+    for command, arguments in installers:
+        if shutil.which(command) is not None:
+            subprocess.run(arguments, check=True, stdout=sys.stderr, stderr=sys.stderr)
+            if shutil.which("git") is not None:
+                return
+            break
+    raise RuntimeError("NeuriCo AutoResearch requires git, but it could not be installed")
+
+
 def _reported_version(executable: Path) -> str | None:
     try:
         result = subprocess.run(
@@ -157,6 +182,7 @@ def resolve_codex() -> Path:
 
 
 def main() -> None:
+    _ensure_git_available()
     executable = resolve_codex()
     os.execvpe(str(executable), [str(executable), *sys.argv[1:]], os.environ)
 

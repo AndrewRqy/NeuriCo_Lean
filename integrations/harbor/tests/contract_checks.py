@@ -172,6 +172,7 @@ def test_child_entrypoint_invokes_existing_autoresearch_runner(
         "use_scribe": False,
         "write_paper": False,
         "scoring_enabled": True,
+        "benchmark_mode": True,
         "autoresearch": True,
         "autoresearch_iterations": 2,
     }
