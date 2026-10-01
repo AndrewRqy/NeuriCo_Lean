@@ -13,10 +13,11 @@ Harbor's supplied repository, using NeuriCo's Codex provider.
 - Harbor's complete text prompt is preserved in
   `idea.background.description`. NeuriCo's prompt generator already promotes
   that field as high-priority user instructions.
-- Harbor's supplied benchmark repository is treated as the complete resource
-  set, so NeuriCo skips literature/dataset discovery and runs its normal scored
-  AutoResearch lifecycle: rule construction, baseline experiment, scoring,
-  proposal, candidate experiment, and accept-or-restore checkpointing.
+- NeuriCo runs its normal fresh AutoResearch resource-finder stage before rule
+  construction. The resource finder may use Harbor's supplied repository and
+  any external sources allowed by the task's Harbor network policy. The scored
+  lifecycle then continues with a baseline experiment, scoring, proposals,
+  candidate experiments, and accept-or-restore checkpointing.
 - The adapter is benchmark-focused. Internal scoring is enabled, while paper
   generation and scribe/notebook output are always disabled. Harbor's verifier
   remains the authoritative benchmark result after the agent exits.

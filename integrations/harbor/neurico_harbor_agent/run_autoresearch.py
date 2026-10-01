@@ -35,11 +35,6 @@ def execute_autoresearch(
         provider="codex",
         full_permissions=True,
         multi_agent=True,
-        # Harbor has already provisioned the complete benchmark repository.
-        # Treat that workspace as the supplied resource set so AutoResearch
-        # starts with its benchmark scoring and experiment lifecycle rather
-        # than a literature/dataset discovery pass.
-        skip_resource_finder=True,
         use_scribe=False,
         write_paper=False,
         scoring_enabled=True,
