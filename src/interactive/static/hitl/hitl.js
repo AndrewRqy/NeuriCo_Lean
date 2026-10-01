@@ -653,6 +653,9 @@
       q("div", { class: "brand" }, [q("span", { class: "workspace-mark", text: "▱" }), q("span", { class: "workspace-title", text: workspace }), q("span", { class: "page-label", text: state.route === "conversation" ? "Conversation" : "Research" })]),
       q("div", { class: "topbar-spacer" }),
       workspaceStatus(),
+      runIsActive && Number.isFinite(live.budget_deadline_at)
+        ? q("span", { class: "run-budget", "data-budget-deadline": live.budget_deadline_at, title: "Time budget remaining", text: formatBudgetRemaining(live.budget_deadline_at) })
+        : null,
       runIsActive ? q("span", { class: "status-mode", title: "Active research mode", text: `${live.workflow === "ordinary" ? "Ordinary" : "AutoResearch"} · ${live.hitl_mode === "auto" ? "Auto" : "HITL"}` }) : null,
       q("span", { class: `connection ${state.stale ? "warning" : ""}`, text: state.stale ? "Workspace data unavailable" : "Connected" }),
       state.route === "conversation" ? runControl : null,
@@ -668,6 +671,12 @@
     const started = Date.parse(String(startedAt || ""));
     if (!Number.isFinite(started)) return "";
     const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
+    return formatDuration(seconds);
+  }
+  function formatBudgetRemaining(deadline) {
+    return `${formatDuration(Math.max(0, Math.ceil(Number(deadline) - Date.now() / 1000)))} left`;
+  }
+  function formatDuration(seconds) {
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
     const remainder = seconds % 60;
@@ -676,6 +685,9 @@
       : `${minutes}:${String(remainder).padStart(2, "0")}`;
   }
   function updatePhaseTimer() {
+    document.querySelectorAll("[data-budget-deadline]").forEach((element) => {
+      element.textContent = formatBudgetRemaining(element.dataset.budgetDeadline);
+    });
     document.querySelectorAll("[data-phase-started-at]").forEach((element) => {
       element.textContent = formatElapsed(element.dataset.phaseStartedAt);
     });
