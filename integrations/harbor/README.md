@@ -46,7 +46,9 @@ The Python source runtime exposes a locked `codex` launcher. It uses an already
 available Codex CLI only when its version exactly matches the adapter pin;
 otherwise it installs `@openai/codex@0.147.0` into the execution user's cache.
 This mirrors Harbor's own Codex-agent installation strategy while keeping the
-NeuriCo source manifest compatible with Harbor's `python-uv` runtime.
+NeuriCo source manifest compatible with Harbor's `python-uv` runtime. The
+launcher also ensures that Git, which AutoResearch needs for local checkpoints,
+is present in minimal task images.
 
 ## Local Harbor with ChatGPT authentication
 
