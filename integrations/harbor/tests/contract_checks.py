@@ -168,7 +168,7 @@ def test_child_entrypoint_invokes_existing_autoresearch_runner(
         "provider": "codex",
         "full_permissions": True,
         "multi_agent": True,
-        "skip_resource_finder": False,
+        "skip_resource_finder": True,
         "use_scribe": False,
         "write_paper": False,
         "scoring_enabled": True,
