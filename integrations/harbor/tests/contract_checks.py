@@ -230,6 +230,13 @@ def test_child_entrypoint_invokes_manager_driven_auto_hitl_runner(
     assert "autoresearch" not in captured["run"]
 
 
+def test_child_uses_same_hitl_control_module_as_neurico_runner() -> None:
+    import core.hitl_run_control as core_control
+
+    assert runner_module.HitlRunStopControl is core_control.HitlRunStopControl
+    assert runner_module.HitlRunStopRequested is core_control.HitlRunStopRequested
+
+
 def test_child_time_limit_uses_hitl_stop_and_returns_last_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -245,7 +252,7 @@ def test_child_time_limit_uses_hitl_stop_and_returns_last_checkpoint(
             pass
 
         def run_research(self, **kwargs: Any) -> dict[str, Any]:
-            from src.core.hitl_run_control import raise_if_hitl_run_stop_requested
+            from core.hitl_run_control import raise_if_hitl_run_stop_requested
 
             while True:
                 raise_if_hitl_run_stop_requested()
@@ -254,7 +261,7 @@ def test_child_time_limit_uses_hitl_stop_and_returns_last_checkpoint(
     monkeypatch.setattr(runner_module, "IdeaManager", FakeManager)
     monkeypatch.setattr(runner_module, "ResearchRunner", FakeRunner)
     monkeypatch.setattr(
-        "src.core.hitl_autoresearch.recover_interrupted_hitl_autoresearch_attempt",
+        "core.hitl_autoresearch.recover_interrupted_hitl_autoresearch_attempt",
         lambda _workspace: None,
     )
 

@@ -5,17 +5,26 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import signal
+import sys
 import threading
 from typing import Any
 from uuid import uuid4
 
-from src.core.hitl_run_control import (
+# NeuriCo's core modules use the historical top-level ``core`` namespace.
+# The ACP child starts from Harbor's task workspace, so establish the same
+# import roots as NeuriCo's own runner before importing any core module.
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_SRC_ROOT = _PROJECT_ROOT / "src"
+sys.path.insert(0, str(_SRC_ROOT))
+sys.path.insert(0, str(_PROJECT_ROOT))
+
+from core.hitl_run_control import (  # noqa: E402
     HitlRunStopControl,
     HitlRunStopRequested,
     activate_hitl_run_stop_control,
 )
-from src.core.idea_manager import IdeaManager
-from src.core.runner import ResearchRunner
+from core.idea_manager import IdeaManager  # noqa: E402
+from core.runner import ResearchRunner  # noqa: E402
 
 from .runtime import HarborAutoResearchTask, build_harbor_idea
 
@@ -40,10 +49,15 @@ def execute_autoresearch(
     task = HarborAutoResearchTask(instruction=instruction, workspace=workspace)
     control = HitlRunStopControl(workspace, f"harbor-{uuid4().hex}")
     deadline_timer: threading.Timer | None = None
+    deadline_reached = threading.Event()
     previous_sigint: Any = None
 
     def request_stop(requested_by: str) -> None:
         control.request(requested_by=requested_by)
+
+    def request_deadline_stop() -> None:
+        deadline_reached.set()
+        request_stop("harbor_time_limit")
 
     try:
         if threading.current_thread() is threading.main_thread():
@@ -52,8 +66,7 @@ def execute_autoresearch(
         if time_limit_seconds is not None:
             deadline_timer = threading.Timer(
                 time_limit_seconds,
-                request_stop,
-                kwargs={"requested_by": "harbor_time_limit"},
+                request_deadline_stop,
             )
             deadline_timer.daemon = True
             deadline_timer.start()
@@ -84,13 +97,12 @@ def execute_autoresearch(
                     autoresearch_iterations=iterations,
                 )
             except HitlRunStopRequested:
-                stop_record = control.record()
-                from src.core.hitl_autoresearch import (
+                from core.hitl_autoresearch import (
                     recover_interrupted_hitl_autoresearch_attempt,
                 )
 
                 recovery = recover_interrupted_hitl_autoresearch_attempt(workspace)
-                timed_out = stop_record.get("requested_by") == "harbor_time_limit"
+                timed_out = deadline_reached.is_set()
                 reason = "configured time limit" if timed_out else "cancellation request"
                 print(
                     f"NeuriCo stopped cleanly after the {reason}; "
