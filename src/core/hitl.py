@@ -57,6 +57,7 @@ _WORKER_COMMAND_MODULES = {
     "hitl-report-idea": "hitl_report_idea.py",
     "hitl-raise-idea": "hitl_raise_idea.py",
     "hitl-view-ideas": "hitl_view_ideas.py",
+    "hitl-time-budget": "hitl_time_budget.py",
     "hitl-finish-phase": "hitl_finish_phase.py",
     "hitl-resume-worker-request": "hitl_resume_worker_request.py",
     "hitl-submit-proposal": "hitl_submit_proposal.py",
@@ -1223,6 +1224,8 @@ class HitlRuntime:
             proposal_guard = HitlWorkspaceWriteGuard.capture_public(self.work_dir)
             proposal_submission_validator = proposal_guard.require_unchanged
         allowed_worker_commands = self._worker_commands_for_stage(hitl_stage)
+        if self._time_budget_command_available():
+            allowed_worker_commands.add("hitl-time-budget")
         from core.hitl_runtime_state import HitlRuntimeState, worker_command_requires_resume
 
         pending_command = HitlRuntimeState(self.work_dir).pending_worker_command()
@@ -1346,6 +1349,8 @@ class HitlRuntime:
         self.current_hitl_stage = to_stage
         self._tool_context["requires_human_approval"] = False
         self._tool_context["allowed_worker_commands"] = self._worker_commands_for_stage(to_stage)
+        if self._time_budget_command_available():
+            self._tool_context["allowed_worker_commands"].add("hitl-time-budget")
         self._install_stage_guards(to_stage)
         self._write_idea_tool_commands()
         if prompt_block:
@@ -1384,6 +1389,11 @@ class HitlRuntime:
         if command_name not in commands:
             commands.add(command_name)
             self._write_idea_tool_commands()
+
+    def _time_budget_command_available(self) -> bool:
+        from core.hitl_run_control import current_hitl_run_time_usage
+
+        return current_hitl_run_time_usage(self.work_dir) is not None
 
     def _require_worker_command(self, command_name: str) -> None:
         commands = self._tool_context.get("allowed_worker_commands")
@@ -4031,6 +4041,16 @@ class HitlRuntime:
                         runtime._require_worker_command("hitl-view-ideas")
                         result = runtime.view_ideas_for_tool(payload)
                         self._send_json(200, {"ok": True, "text": result["text"]})
+                        return
+                    if self.path == "/time-budget":
+                        runtime._require_worker_command("hitl-time-budget")
+                        from core.hitl_run_control import current_hitl_run_time_usage
+
+                        usage = current_hitl_run_time_usage(runtime.work_dir)
+                        if usage is None:
+                            self._send_json(409, {"error": "No time budget is active for this run."})
+                            return
+                        self._send_json(200, {"ok": True, "usage": usage})
                         return
                     if self.path == "/frontier/current":
                         runtime._require_worker_command("view_current_frontier")

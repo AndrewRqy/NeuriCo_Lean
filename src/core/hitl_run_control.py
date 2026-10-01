@@ -188,7 +188,8 @@ class HitlRunStopControl:
                     f"Absolute deadline (Unix UTC seconds): {deadline:.3f}. "
                     "All stages, iterations, scoring, retries and human waits share this allowance; "
                     "it does not restart for a worker or iteration. Choose work that fits and "
-                    "leave time for scoring and saving progress."
+                    "leave time for scoring and saving progress. Run hitl-time-budget to refresh "
+                    "elapsed and remaining time during this invocation."
                 )
             return (
                 "CURRENT RUN TIME BUDGET (runtime-owned)\n" + timing + "\n"
@@ -209,6 +210,22 @@ class HitlRunStopControl:
                 self._budget_monotonic_deadline - time.monotonic(),
             ))
             return self._remaining_budget
+
+    def time_usage(self) -> Optional[Dict[str, float | int]]:
+        """Return the active bounded run's current elapsed and remaining seconds."""
+        with self._lock:
+            if self._budget is None or self._budget["deadline_at"] is None:
+                return None
+            remaining = self.remaining_seconds()
+            if remaining is None:
+                return None
+            duration = self._budget["duration_seconds"]
+            return {
+                "duration_seconds": duration,
+                "elapsed_seconds": max(0.0, duration - remaining),
+                "remaining_seconds": remaining,
+                "deadline_at": self._budget["deadline_at"],
+            }
 
     def stop_reason(self) -> str:
         requested_by = str(self.record().get("requested_by", "")).strip()
@@ -371,3 +388,11 @@ def current_hitl_run_budget_prompt(work_dir: Path) -> str:
     if control is None or control.work_dir != Path(work_dir).resolve():
         return ""
     return control.budget_prompt()
+
+
+def current_hitl_run_time_usage(work_dir: Path) -> Optional[Dict[str, float | int]]:
+    """Return the active bounded run's current elapsed and remaining seconds."""
+    control = active_hitl_run_stop_control()
+    if control is None or control.work_dir != Path(work_dir).resolve():
+        return None
+    return control.time_usage()
