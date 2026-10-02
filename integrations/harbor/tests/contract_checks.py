@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,9 @@ from acp.interfaces import Client
 from neurico_harbor_agent.agent import (
     NeuricoHarborAgent,
     _autoresearch_iterations,
+    _autoresearch_time_limit,
+    _remove_created_workspace_venv,
+    _stream_process_output,
     _terminate_process_tree,
     _text_from_prompt,
 )
@@ -113,6 +117,15 @@ def test_iteration_override_must_be_positive() -> None:
         _autoresearch_iterations({"NEURICO_HARBOR_AUTORESEARCH_ITERATIONS": "0"})
 
 
+def test_time_limit_override_is_optional_and_positive() -> None:
+    assert _autoresearch_time_limit({}) is None
+    assert _autoresearch_time_limit({"NEURICO_HARBOR_TIME_LIMIT_SECONDS": "1740"}) == 1740
+    with pytest.raises(ValueError, match="greater than 0"):
+        _autoresearch_time_limit({"NEURICO_HARBOR_TIME_LIMIT_SECONDS": "0"})
+    with pytest.raises(ValueError, match="must be a number"):
+        _autoresearch_time_limit({"NEURICO_HARBOR_TIME_LIMIT_SECONDS": "later"})
+
+
 def test_cancellation_terminates_autoresearch_process_group() -> None:
     async def exercise() -> None:
         process = await asyncio.create_subprocess_exec(
@@ -127,7 +140,66 @@ def test_cancellation_terminates_autoresearch_process_group() -> None:
     asyncio.run(exercise())
 
 
-def test_child_entrypoint_invokes_existing_autoresearch_runner(
+def test_child_output_stream_accepts_events_larger_than_asyncio_line_limit() -> None:
+    async def exercise() -> None:
+        payload_size = 200_000
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            f"import sys; sys.stdout.write('x' * {payload_size})",
+            stdout=asyncio.subprocess.PIPE,
+        )
+        chunks: list[str] = []
+
+        async def emit(text: str) -> None:
+            chunks.append(text)
+
+        return_code = await _stream_process_output(process, emit)
+        assert return_code == 0
+        assert len("".join(chunks)) == payload_size
+
+    asyncio.run(exercise())
+
+
+def test_workspace_venv_cleanup_removes_only_run_created_environment(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pyproject = workspace / "pyproject.toml"
+    pyproject.write_text("[project]\nname = 'research-workspace'\n")
+    venv_file = workspace / ".venv" / "lib" / "dependency.py"
+    venv_file.parent.mkdir(parents=True)
+    venv_file.write_text("installed = True\n")
+
+    assert _remove_created_workspace_venv(workspace, existed_before=False) is True
+    assert not (workspace / ".venv").exists()
+    assert pyproject.is_file()
+
+
+def test_workspace_venv_cleanup_preserves_preexisting_environment(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    venv_file = workspace / ".venv" / "pyvenv.cfg"
+    venv_file.parent.mkdir(parents=True)
+    venv_file.write_text("preexisting = true\n")
+
+    assert _remove_created_workspace_venv(workspace, existed_before=True) is False
+    assert venv_file.is_file()
+
+
+def test_workspace_venv_cleanup_unlinks_symlink_without_following_it(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "keep.txt"
+    outside_file.write_text("keep\n")
+    (workspace / ".venv").symlink_to(outside, target_is_directory=True)
+
+    assert _remove_created_workspace_venv(workspace, existed_before=False) is True
+    assert not (workspace / ".venv").exists()
+    assert outside_file.read_text() == "keep\n"
+
+
+def test_child_entrypoint_invokes_manager_driven_auto_hitl_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, Any] = {}
@@ -172,9 +244,60 @@ def test_child_entrypoint_invokes_existing_autoresearch_runner(
         "write_paper": False,
         "scoring_enabled": True,
         "benchmark_mode": True,
-        "autoresearch": True,
+        "hitl_autoresearch": "cli",
+        "hitl_manager_no_browser": True,
+        "hitl_mode": "auto",
         "autoresearch_iterations": 2,
     }
+    assert "autoresearch" not in captured["run"]
+
+
+def test_child_uses_same_hitl_control_module_as_neurico_runner() -> None:
+    import core.hitl_run_control as core_control
+
+    assert runner_module.HitlRunStopControl is core_control.HitlRunStopControl
+    assert runner_module.HitlRunStopRequested is core_control.HitlRunStopRequested
+
+
+def test_child_time_limit_uses_hitl_stop_and_returns_last_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeManager:
+        def __init__(self, ideas_dir: Path):
+            pass
+
+        def submit_idea(self, idea: dict[str, Any], validate: bool) -> str:
+            return "harbor-idea"
+
+    class FakeRunner:
+        def __init__(self, *, use_github: bool):
+            pass
+
+        def run_research(self, **kwargs: Any) -> dict[str, Any]:
+            from core.hitl_run_control import raise_if_hitl_run_stop_requested
+
+            while True:
+                raise_if_hitl_run_stop_requested()
+                threading.Event().wait(0.005)
+
+    monkeypatch.setattr(runner_module, "IdeaManager", FakeManager)
+    monkeypatch.setattr(runner_module, "ResearchRunner", FakeRunner)
+    monkeypatch.setattr(
+        "core.hitl_autoresearch.recover_interrupted_hitl_autoresearch_attempt",
+        lambda _workspace: None,
+    )
+
+    result = execute_autoresearch(
+        instruction="Run until the benchmark budget expires.",
+        workspace=tmp_path,
+        ideas_dir=tmp_path / "ideas",
+        time_limit_seconds=0.02,
+    )
+
+    assert result["stopped"] is True
+    assert result["time_limit_reached"] is True
+    control_dir = tmp_path / ".neurico" / "hitl" / "control"
+    assert not list(control_dir.glob("stop.harbor-*.json"))
 
 
 def test_acp_prompt_launches_autoresearch_not_direct_inference(
@@ -185,6 +308,9 @@ def test_acp_prompt_launches_autoresearch_not_direct_inference(
 
     async def fake_autoresearch(**kwargs: Any) -> int:
         captured.update(kwargs)
+        venv_file = kwargs["task"].workspace / ".venv" / "pyvenv.cfg"
+        venv_file.parent.mkdir()
+        venv_file.write_text("created by NeuriCo\n")
         await kwargs["emit"]("AutoResearch output\n")
         return 0
 
@@ -197,6 +323,7 @@ def test_acp_prompt_launches_autoresearch_not_direct_inference(
             {
                 "NEURICO_MODEL": "openai/test-model",
                 "NEURICO_CODEX_AUTH_FILE": str(auth_file),
+                "NEURICO_HARBOR_TIME_LIMIT_SECONDS": "1740",
             }
         )
         session = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
@@ -210,14 +337,19 @@ def test_acp_prompt_launches_autoresearch_not_direct_inference(
     assert captured["task"].instruction == instruction
     assert captured["task"].workspace == tmp_path
     assert captured["iterations"] == 1
+    assert captured["time_limit_seconds"] == 1740
     assert captured["connection"].backend_model == "test-model"
     assert captured["connection"].mode == "chatgpt"
+    assert not (tmp_path / ".venv").exists()
 
 
 def test_autoresearch_failure_fails_the_acp_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def failing_autoresearch(**kwargs: Any) -> int:
+        venv_file = kwargs["task"].workspace / ".venv" / "pyvenv.cfg"
+        venv_file.parent.mkdir()
+        venv_file.write_text("created by NeuriCo\n")
         return 7
 
     monkeypatch.setattr(agent_module, "run_autoresearch_process", failing_autoresearch)
@@ -239,6 +371,7 @@ def test_autoresearch_failure_fails_the_acp_turn(
             )
 
     asyncio.run(run_prompt())
+    assert not (tmp_path / ".venv").exists()
 
 
 def test_stdio_acp_handshake_and_model_selection(tmp_path: Path) -> None:
