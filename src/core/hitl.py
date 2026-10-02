@@ -943,6 +943,7 @@ class HitlRuntime:
             allow_raised_ideas=True,
             feedback=feedback,
             hitl_mode=self.hitl_mode.value,
+            baseline_construction=bool(self._tool_context.get("baseline_construction")),
             **self._autoresearch_candidate_prompt_context(),
         )
 
@@ -956,6 +957,7 @@ class HitlRuntime:
             allow_raised_ideas=True,
             feedback=feedback,
             hitl_mode=self.hitl_mode.value,
+            baseline_construction=bool(self._tool_context.get("baseline_construction")),
             **self._autoresearch_candidate_prompt_context(),
         )
 
@@ -1115,6 +1117,12 @@ class HitlRuntime:
             hitl_mode=self.hitl_mode,
             request_context=dict(provenance or {}),
             scoring_enabled=bool(self._tool_context.get("allow_scoring_approval")),
+            baseline_construction=bool(
+                self._tool_context.get("baseline_construction")
+            ),
+            baseline_candidate_manifest=dict(
+                self._tool_context.get("baseline_candidate_manifest") or {}
+            ),
         )
         try:
             return finalized["record"]
@@ -1137,6 +1145,8 @@ class HitlRuntime:
         phase_finish_validator: Optional[Callable[[], Dict[str, Any]]] = None,
         scoring_handler: Optional[Callable[[Dict[str, Any]], None]] = None,
         worker_prompt_contexts: Optional[Dict[str, str]] = None,
+        baseline_construction: bool = False,
+        baseline_candidate_manifest: Optional[Dict[str, Any]] = None,
     ) -> None:
         if hitl_stage not in HITL_STAGES:
             raise HitlValidationError(f"Invalid HITL idea tool hitl_stage: {hitl_stage}")
@@ -1191,6 +1201,8 @@ class HitlRuntime:
             "supplied_phase_finish_validator": phase_finish_validator,
             "scoring_handler": scoring_handler,
             "worker_prompt_contexts": dict(worker_prompt_contexts or {}),
+            "baseline_construction": bool(baseline_construction),
+            "baseline_candidate_manifest": dict(baseline_candidate_manifest or {}),
             "allowed_worker_commands": allowed_worker_commands,
         }
         self._install_stage_guards(hitl_stage)
@@ -2344,6 +2356,60 @@ class HitlRuntime:
         }
         return self.log.append(record, idempotent=True)
 
+    def log_baseline_construction_decision(
+        self,
+        *,
+        scoring_review_idea_id: str,
+        approved: bool,
+        context: str,
+        manager_feedback: str,
+    ) -> Dict[str, Any]:
+        """Record review of a bootstrap evaluator for a fixed experiment."""
+        premise = _require_text(
+            scoring_review_idea_id,
+            "scoring_review_idea_id",
+            "Baseline construction scoring decision",
+        )
+        feedback = str(manager_feedback).strip()
+        if not approved:
+            feedback = _require_text(
+                feedback,
+                "manager_feedback",
+                "Baseline evaluator repair decision",
+            )
+        record = {
+            "pipeline_stage": "rule_maker",
+            "hitl_stage": "review",
+            "idea_type": "decision",
+            "idea_category": "evaluation_choice",
+            "level": "B",
+            "actor": "manager",
+            "premises": [premise],
+            "context": _require_text(
+                context,
+                "context",
+                "Baseline construction scoring decision",
+            ),
+            "related_artifacts": [
+                {
+                    "path": "scoring/results.json",
+                    "description": "Runtime-produced score for the completed Ordinary workspace.",
+                }
+            ],
+            "decision_needed": (
+                "Is this evaluator valid for publishing the completed workspace as "
+                "the AutoResearch root?"
+            ),
+            "options": [
+                "Approve the evaluator and publish the scored workspace.",
+                "Return evaluator repair feedback to the rule maker.",
+            ],
+            "decision": "O1" if approved else "O2",
+            "manager_feedback": "" if approved else feedback,
+            "raised": not approved,
+        }
+        return self.log.append(record, idempotent=True)
+
     def scoring_repair_response(
         self,
         *,
@@ -3029,6 +3095,32 @@ class HitlRuntime:
                             "session, then call hitl-finish-phase again.",
                         )
                     ).strip()
+                    if bool(validation.get("restart_stage")):
+                        response = {
+                            "status": "restart_stage",
+                            "feedback": feedback,
+                            "next_phase": "complete",
+                            "instruction": (
+                                "Runtime rejected this worker invocation and will restore the "
+                                "clean stage boundary. Stop this worker session now."
+                            ),
+                            "prompt_block": "",
+                            "final": True,
+                        }
+                        self._phase_finish_result = {
+                            "called": True,
+                            "status": "restart_stage",
+                            "hitl_stage": hitl_stage,
+                            "plan_fingerprint": plan_fingerprint,
+                            "workspace_fingerprint": workspace_fingerprint,
+                            "summary": summary,
+                            "related_artifacts": related_artifacts,
+                            "manager_feedback": feedback,
+                            "context": feedback_context,
+                            "next_phase": "complete",
+                            "final": True,
+                        }
+                        return self._remember_phase_finish_response(request_key, response)
                     self._tool_context["hitl_stage"] = next_stage
                     self.current_hitl_stage = next_stage
                     self._phase_finish_result = {
@@ -3182,6 +3274,12 @@ class HitlRuntime:
                 scoring_enabled=bool(self._tool_context.get("allow_scoring_approval")),
                 scoring_handoff_context=dict(self._tool_context.get("provenance") or {}),
                 verifier_report=self._durable_conformance_report(request_key, hitl_stage),
+                baseline_construction=bool(
+                    self._tool_context.get("baseline_construction")
+                ),
+                baseline_candidate_manifest=dict(
+                    self._tool_context.get("baseline_candidate_manifest") or {}
+                ),
                 on_finalize=persist_phase_review,
                 on_scoring_approval=persist_scoring_approval,
                 hitl_mode=self.hitl_mode,
@@ -3323,6 +3421,13 @@ class HitlRuntime:
             return cancelled
         finish = self.phase_finish_result()
         resolved = self.resolved_worker_response()
+        if finish and finish.get("status") == "restart_stage":
+            self._clear_worker_continuation()
+            return {
+                "approved": False,
+                "restart_stage": True,
+                "error": str(finish.get("manager_feedback", "")).strip(),
+            }
         if resolved and (
             bool(resolved.get("final"))
             or isinstance(resolved.get("scored_candidate"), dict)

@@ -62,7 +62,7 @@ def _claim_request(path: Path) -> Path:
 
 def _load_request(path: Path) -> Dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or value.get("version") not in {1, 2, 3}:
+    if not isinstance(value, dict) or value.get("version") not in {1, 2, 3, 4}:
         raise ValueError("Unsupported HITL launch request.")
     required = (
         "request_id",
@@ -83,11 +83,18 @@ def _load_request(path: Path) -> Dict[str, Any]:
         raise ValueError("HITL launch request has an unsupported source interface.")
     if value["version"] == 2 and not str(value.get("hitl_mode", "")).strip():
         raise ValueError("HITL launch request is missing its HITL mode.")
-    if value["version"] == 3 and not str(value.get("workflow", "")).strip():
+    if value["version"] in {3, 4} and not str(value.get("workflow", "")).strip():
         raise ValueError("HITL launch request is missing its research workflow.")
+    if value["version"] == 4 and not str(value.get("operation", "")).strip():
+        raise ValueError("HITL launch request is missing its operation.")
     value["workflow"] = str(value.get("workflow", "autoresearch")).strip().lower()
     if value["workflow"] not in {"ordinary", "autoresearch"}:
         raise ValueError("HITL launch request has an unsupported research workflow.")
+    value["operation"] = str(value.get("operation", "research")).strip().lower()
+    if value["operation"] not in {"research", "construct_baseline"}:
+        raise ValueError("HITL launch request has an unsupported operation.")
+    if value["operation"] == "construct_baseline" and value["workflow"] != "ordinary":
+        raise ValueError("Baseline construction requires an Ordinary research workspace.")
     value["hitl_mode"] = normalize_hitl_mode(value.get("hitl_mode")).value
 
     identity = _REQUEST_NAME.fullmatch(path.name)
@@ -128,6 +135,9 @@ def _finalize_stopped_run(
             recovery = ResearchPipelineOrchestrator(
                 work_dir=work_dir,
                 managed_initial_run=True,
+                baseline_construction=(
+                    request.get("operation") == "construct_baseline"
+                ),
                 hitl_mode=request.get("hitl_mode", "full"),
             ).restore_stopped_initial_run()
         else:
@@ -146,6 +156,7 @@ def _finalize_stopped_run(
             "updated_at": stopped_at,
             "stopped_at": stopped_at,
             "mode": request.get("mode", ""),
+            "operation": request.get("operation", "research"),
             "workflow": request.get("workflow", "autoresearch"),
             "hitl_mode": request.get("hitl_mode", "full"),
             "provider": request.get("provider", ""),
@@ -171,6 +182,7 @@ def _finalize_stopped_run(
                 "failed_at": failed_at,
                 "updated_at": failed_at,
                 "mode": request.get("mode", ""),
+                "operation": request.get("operation", "research"),
                 "workflow": request.get("workflow", "autoresearch"),
                 "hitl_mode": request.get("hitl_mode", "full"),
                 "provider": request.get("provider", ""),
@@ -224,6 +236,7 @@ def main() -> int:
                     "started_at": started_at,
                     "updated_at": started_at,
                     "mode": request["mode"],
+                    "operation": request.get("operation", "research"),
                     "workflow": request["workflow"],
                     "hitl_mode": hitl_mode,
                     "provider": request["provider"],
@@ -249,7 +262,9 @@ def main() -> int:
                         "hitl_mode": hitl_mode,
                         "hitl_work_dir": work_dir,
                     }
-                    if request["workflow"] == "ordinary":
+                    if request.get("operation") == "construct_baseline":
+                        run_args["hitl_construct_baseline"] = str(request["interface"])
+                    elif request["workflow"] == "ordinary":
                         run_args["hitl_research"] = str(request["interface"])
                     else:
                         run_args.update(
@@ -280,6 +295,7 @@ def main() -> int:
             "completed_at": finished_at,
             "updated_at": finished_at,
             "mode": request["mode"],
+            "operation": request.get("operation", "research"),
             "workflow": request["workflow"],
             "hitl_mode": hitl_mode,
             "provider": request["provider"],
@@ -312,6 +328,7 @@ def main() -> int:
                     "failed_at": failed_at,
                     "updated_at": failed_at,
                     "mode": request.get("mode", ""),
+                    "operation": request.get("operation", "research"),
                     "workflow": request.get("workflow", "autoresearch"),
                     "hitl_mode": request.get("hitl_mode", "full"),
                     "provider": request.get("provider", ""),

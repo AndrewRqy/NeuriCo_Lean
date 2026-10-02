@@ -950,6 +950,18 @@ class HitlTerminalChannel(UserChannel):
             self._write_block(
                 self._ui.system("Type /cancel at any prompt to cancel setup.")
             )
+            operation = "research"
+            if bool(status.get("can_construct_baseline")):
+                operation = self._read_choice(
+                    "Action [ordinary] (ordinary/construct): ",
+                    "ordinary",
+                    {"ordinary", "construct"},
+                    "Choose ordinary or construct.",
+                    cancellable=True,
+                )
+                operation = (
+                    "construct_baseline" if operation == "construct" else "research"
+                )
             provider = self._read_choice(
                 "Model [claude] (claude/codex): ",
                 "claude",
@@ -957,7 +969,9 @@ class HitlTerminalChannel(UserChannel):
                 "Choose claude or codex.",
                 cancellable=True,
             )
-            if bool(status.get("workflow_locked")):
+            if operation == "construct_baseline":
+                workflow = "ordinary"
+            elif bool(status.get("workflow_locked")):
                 workflow = str(status.get("workflow", "autoresearch")).strip().lower()
                 self._write_block(
                     self._ui.system(
@@ -977,7 +991,7 @@ class HitlTerminalChannel(UserChannel):
             )
             hitl_mode = "auto" if auto else "full"
             iterations = 1
-            if workflow == "autoresearch":
+            if operation == "research" and workflow == "autoresearch":
                 iterations = self._read_integer(
                     "Iterations [2] (1-100): ",
                     2,
@@ -985,30 +999,37 @@ class HitlTerminalChannel(UserChannel):
                     maximum=100,
                     cancellable=True,
                 )
-            write_paper = self._read_yes_no(
-                "Write paper? [Y/n]: ", default=True, cancellable=True
-            )
+            write_paper = False
             paper_style = "auto"
-            if write_paper:
-                paper_style = self._read_choice(
-                    "Paper style [auto] (auto/neurips/icml/acl): ",
-                    "auto",
-                    {"auto", "neurips", "icml", "acl"},
-                    "Choose auto, neurips, icml, or acl.",
-                    cancellable=True,
+            if operation == "research":
+                write_paper = self._read_yes_no(
+                    "Write paper? [Y/n]: ", default=True, cancellable=True
                 )
+                if write_paper:
+                    paper_style = self._read_choice(
+                        "Paper style [auto] (auto/neurips/icml/acl): ",
+                        "auto",
+                        {"auto", "neurips", "icml", "acl"},
+                        "Choose auto, neurips, icml, or acl.",
+                        cancellable=True,
+                    )
             github = self._read_yes_no(
                 "Publish to GitHub? [y/N]: ", default=False, cancellable=True
             )
             result = self._run_launcher(
                 {
                     "provider": provider,
+                    "operation": operation,
                     "workflow": workflow,
                     "hitl_mode": hitl_mode,
                     "write_paper": write_paper,
                     "paper_style": paper_style,
                     "github": github,
-                    **({"iterations": iterations} if workflow == "autoresearch" else {}),
+                    **(
+                        {"iterations": iterations}
+                        if operation == "research" and workflow == "autoresearch"
+                        else {}
+                    ),
                 }
             )
         except _HitlPromptCancelled:
@@ -1020,10 +1041,16 @@ class HitlTerminalChannel(UserChannel):
             self._write_block(self._ui.system(str(exc), tone="error"), blank_before=True)
             return {"status": "invalid"}
         mode_label = "Auto" if hitl_mode == "auto" else "HITL"
-        workflow_label = "AutoResearch" if workflow == "autoresearch" else "ordinary research"
+        if operation == "construct_baseline":
+            started = f"Started baseline construction in {mode_label} mode."
+        else:
+            workflow_label = (
+                "AutoResearch" if workflow == "autoresearch" else "ordinary research"
+            )
+            started = f"Started {result['mode']} {workflow_label} in {mode_label} mode."
         self._write_block(
             self._ui.system(
-                f"Started {result['mode']} {workflow_label} in {mode_label} mode.",
+                started,
                 tone="success",
             ),
         )
