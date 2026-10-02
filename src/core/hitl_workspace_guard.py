@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 from dataclasses import dataclass
@@ -44,11 +45,13 @@ class _FileState:
 
 @dataclass(frozen=True)
 class WorkspaceGuardScope:
-    """Runtime-owned roots omitted from recursive public traversal.
+    """Roots removed from the broad public traversal under explicit policies.
 
     These roots are explicit protocol state.  Filesystem names and marker
     files are never consulted when deciding whether a directory is private or
-    immutable, so a worker cannot hide a new subtree after capture.
+    immutable, so a worker cannot hide a new subtree after capture. Runtime-
+    private roots retain only their root identity; immutable roots receive a
+    separate deterministic content digest.
     """
 
     runtime_private_roots: tuple[str, ...] = ()
@@ -115,9 +118,10 @@ class HitlWorkspaceWriteGuard:
     """Compare a bounded workspace view at one runtime-owned phase boundary.
 
     Broad public boundaries use filesystem mutation identity without reading
-    research payloads. Explicit protected paths retain content hashing. HITL
-    workers are expected to follow the runtime protocol; this mechanical gate
-    catches accidental or unauthorized public writes before progression.
+    research payloads. Explicit protected paths and declared immutable resource
+    roots retain content hashing. HITL workers are expected to follow the runtime
+    protocol; this mechanical gate catches accidental or unauthorized public
+    writes before progression.
     """
 
     def __init__(
@@ -159,7 +163,7 @@ class HitlWorkspaceWriteGuard:
         normalized_scope = WorkspaceGuardScope.from_value(scope)
         states = cls._snapshot(root, include_hidden=False, scope=normalized_scope)
         digest = hashlib.sha256()
-        digest.update(b"neurico-hitl-public-fingerprint-v3\0")
+        digest.update(b"neurico-hitl-public-fingerprint-v4\0")
         digest.update(repr(normalized_scope.to_dict()).encode("utf-8"))
         for path, state in sorted(states.items()):
             digest.update(path.encode("utf-8"))
@@ -222,14 +226,28 @@ class HitlWorkspaceWriteGuard:
         scope: WorkspaceGuardScope,
     ) -> dict[str, _FileState]:
         states: dict[str, _FileState] = {}
-        excluded_roots = set(scope.excluded_roots) | _BUILTIN_RUNTIME_PRIVATE_ROOTS
-        for relative in sorted(excluded_roots):
+        runtime_private_roots = (
+            set(scope.runtime_private_roots) | _BUILTIN_RUNTIME_PRIVATE_ROOTS
+        )
+        immutable_roots = set(scope.immutable_resource_roots)
+        excluded_roots = runtime_private_roots | immutable_roots
+        for relative in sorted(runtime_private_roots):
             path = root / relative
             try:
                 stats = path.lstat()
             except FileNotFoundError:
                 continue
             states[relative] = HitlWorkspaceWriteGuard._root_state(path, stats)
+        for relative in sorted(immutable_roots):
+            path = root / relative
+            try:
+                stats = path.lstat()
+            except FileNotFoundError:
+                continue
+            states[relative] = HitlWorkspaceWriteGuard._immutable_root_state(
+                path,
+                stats,
+            )
 
         pending_directories = [root]
         while pending_directories:
@@ -345,6 +363,78 @@ class HitlWorkspaceWriteGuard:
             device=state.device,
             inode=state.inode,
             link_target=state.link_target,
+        )
+
+    @staticmethod
+    def _immutable_root_state(path: Path, stats: os.stat_result) -> _FileState:
+        """Record one deterministic content digest for a declared immutable root."""
+        digest = hashlib.sha256()
+        digest.update(b"neurico-hitl-immutable-root-v1\0")
+
+        def add_entry(
+            entry_path: Path,
+            relative: str,
+            entry_stats: os.stat_result,
+        ) -> None:
+            mode = stat.S_IMODE(entry_stats.st_mode)
+            if stat.S_ISLNK(entry_stats.st_mode):
+                kind = "symlink"
+                value = os.readlink(entry_path)
+            elif stat.S_ISREG(entry_stats.st_mode):
+                kind = "file"
+                value = sha256_file(entry_path)
+            elif stat.S_ISDIR(entry_stats.st_mode):
+                kind = "directory"
+                value = ""
+            else:
+                kind = "other"
+                value = ""
+            payload = json.dumps(
+                [relative, kind, mode, value],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+
+        add_entry(path, ".", stats)
+        if stat.S_ISDIR(stats.st_mode):
+            pending_directories = [path]
+            while pending_directories:
+                current_path = pending_directories.pop()
+                try:
+                    with os.scandir(current_path) as iterator:
+                        entries = sorted(iterator, key=lambda entry: entry.name)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Could not fingerprint immutable resource root: {path}"
+                    ) from exc
+                retained_dirs: list[Path] = []
+                for entry in entries:
+                    entry_path = Path(entry.path)
+                    relative = entry_path.relative_to(path).as_posix()
+                    try:
+                        entry_stats = entry.stat(follow_symlinks=False)
+                        add_entry(entry_path, relative, entry_stats)
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"Could not fingerprint immutable resource root: {path}"
+                        ) from exc
+                    if stat.S_ISDIR(entry_stats.st_mode):
+                        retained_dirs.append(entry_path)
+                pending_directories.extend(reversed(retained_dirs))
+
+        root_state = HitlWorkspaceWriteGuard._root_state(path, stats)
+        return _FileState(
+            kind=root_state.kind,
+            mode=root_state.mode,
+            size=root_state.size,
+            modified_ns=root_state.modified_ns,
+            changed_ns=root_state.changed_ns,
+            device=root_state.device,
+            inode=root_state.inode,
+            sha256=digest.hexdigest(),
+            link_target=root_state.link_target,
         )
 
     @staticmethod

@@ -195,17 +195,19 @@ def test_public_guard_detects_new_nested_git_metadata(tmp_path):
     assert "dependency/.git" in result["issues"][0]
 
 
-def test_explicit_scope_prunes_only_registered_root(tmp_path, monkeypatch):
+def test_explicit_runtime_private_scope_prunes_registered_root(tmp_path, monkeypatch):
     work_dir = _workspace(tmp_path)
-    immutable = work_dir / "datasets" / "immutable"
-    payload = immutable / "nested" / "payload.bin"
+    runtime_private = work_dir / "runtime-private"
+    payload = runtime_private / "nested" / "payload.bin"
     payload.parent.mkdir(parents=True)
     payload.write_bytes(b"payload")
-    scope = WorkspaceGuardScope.from_value({"immutable_resource_roots": ["datasets/immutable"]})
+    scope = WorkspaceGuardScope.from_value(
+        {"runtime_private_roots": ["runtime-private"]}
+    )
     original_scandir = workspace_guard.os.scandir
 
     def guarded_scandir(path):
-        assert Path(path) != immutable
+        assert Path(path) != runtime_private
         return original_scandir(path)
 
     monkeypatch.setattr(workspace_guard.os, "scandir", guarded_scandir)
@@ -214,6 +216,75 @@ def test_explicit_scope_prunes_only_registered_root(tmp_path, monkeypatch):
     result = guard.require_unchanged()
 
     assert result["valid"], result["issues"]
+
+
+def test_registered_immutable_root_detects_nested_content_change(tmp_path):
+    work_dir = _workspace(tmp_path)
+    immutable = work_dir / "datasets" / "immutable"
+    payload = immutable / "nested" / "rows.csv"
+    payload.parent.mkdir(parents=True)
+    payload.write_text("a,b\n1,2\n")
+    original = payload.stat()
+    scope = {"immutable_resource_roots": ["datasets/immutable"]}
+    guard = HitlWorkspaceWriteGuard.capture_public(work_dir, scope=scope)
+    fingerprint = HitlWorkspaceWriteGuard.public_fingerprint(work_dir, scope=scope)
+
+    payload.write_text("a,b\n2,1\n")
+    os.utime(payload, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    result = guard.require_unchanged()
+    assert not result["valid"]
+    assert "datasets/immutable" in result["issues"][0]
+    assert HitlWorkspaceWriteGuard.public_fingerprint(work_dir, scope=scope) != fingerprint
+
+
+@pytest.mark.parametrize("mutation", ["add", "remove", "rename", "empty_directory"])
+def test_registered_immutable_root_detects_tree_changes(tmp_path, mutation):
+    work_dir = _workspace(tmp_path)
+    immutable = work_dir / "datasets" / "immutable"
+    payload = immutable / "rows.csv"
+    immutable.mkdir(parents=True)
+    payload.write_text("row\n")
+    scope = {"immutable_resource_roots": ["datasets/immutable"]}
+    guard = HitlWorkspaceWriteGuard.capture_public(work_dir, scope=scope)
+
+    if mutation == "add":
+        (immutable / "added.csv").write_text("added\n")
+    elif mutation == "remove":
+        payload.unlink()
+    elif mutation == "rename":
+        payload.rename(immutable / "renamed.csv")
+    else:
+        (immutable / "empty").mkdir()
+
+    result = guard.require_unchanged()
+    assert not result["valid"]
+    assert "datasets/immutable" in result["issues"][0]
+
+
+def test_registered_immutable_root_does_not_follow_symlinks(tmp_path):
+    work_dir = _workspace(tmp_path)
+    immutable = work_dir / "datasets" / "immutable"
+    immutable.mkdir(parents=True)
+    private_targets = work_dir / ".neurico" / "targets"
+    private_targets.mkdir(parents=True)
+    first = private_targets / "first.txt"
+    second = private_targets / "second.txt"
+    first.write_text("first\n")
+    second.write_text("second\n")
+    link = immutable / "selected.txt"
+    link.symlink_to(first)
+    scope = {"immutable_resource_roots": ["datasets/immutable"]}
+    guard = HitlWorkspaceWriteGuard.capture_public(work_dir, scope=scope)
+
+    first.write_text("changed outside the immutable root\n")
+    assert guard.require_unchanged()["valid"]
+
+    link.unlink()
+    link.symlink_to(second)
+    result = guard.require_unchanged()
+    assert not result["valid"]
+    assert "datasets/immutable" in result["issues"][0]
 
 
 def test_replacing_registered_root_is_detected(tmp_path):
