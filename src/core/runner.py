@@ -226,8 +226,11 @@ def _with_hitl_workspace_run_ownership(method):
             host_scope = ExitStack()
             arguments.arguments["_hitl_host_scope"] = host_scope
             stopped = False
+            caught_stop = None
             try:
                 result = method(*arguments.args, **arguments.kwargs)
+            except HitlRunStopRequested as stop:
+                caught_stop = stop
             finally:
                 # Stop owned manager writers before recovery and lease release,
                 # even when startup or final status publication raises.
@@ -252,6 +255,8 @@ def _with_hitl_workspace_run_ownership(method):
                         recover_interrupted_hitl_autoresearch_attempt(work_dir)
             if stopped:
                 raise HitlRunStopRequested(f"HITL run stopped: {control.stop_reason()}.")
+            if caught_stop is not None:
+                raise caught_stop
             return result
 
     return owned_run
