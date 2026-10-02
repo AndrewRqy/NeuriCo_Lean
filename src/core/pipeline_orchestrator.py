@@ -698,7 +698,7 @@ class ResearchPipelineOrchestrator:
         while True:
             result = run_stage()
             if hitl_run_stop_requested():
-                return {**result, "success": False, "stopped": True}
+                raise HitlRunStopRequested("HITL run stop requested.")
             if (
                 result.get("success")
                 or result.get("hitl_terminal_failure")
