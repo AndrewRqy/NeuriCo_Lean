@@ -375,17 +375,6 @@ The web interface opens at `http://localhost:7890`. Opening it does not start
 research. Click **Start AutoResearch** in the upper-right corner, review the run
 settings, and start the run.
 
-For Full HITL and Auto, each **Start** accepts an optional **Time limit (seconds)**.
-Leave it blank for no total limit; enter `36000` for ten hours. It covers the
-whole launch, including all iterations and human waits. A later Start can use
-a different limit or no limit; retries within the same Start retain its deadline.
-These modes ignore YAML time settings and use only the CLI/web launch input.
-The direct runner also accepts `--time-limit-seconds` with managed AutoResearch.
-
-Budget expiry currently uses cooperative stop checks. Hard enforcement during
-blocking calls and remote-job cancellation are still pending; see the
-[time-budget implementation plan](docs/TIME_BUDGET_CORE_PLAN.md).
-
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--port N` | `7890` | Use a different port |
