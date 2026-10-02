@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
+import math
 import os
+import shutil
 import signal
+import stat
 import sys
 import tempfile
 from collections.abc import Awaitable, Callable
@@ -54,6 +58,8 @@ ContentBlock = (
     | EmbeddedResourceContentBlock
 )
 OutputHandler = Callable[[str], Awaitable[None]]
+_TIME_LIMIT_EXIT_CODE = 124
+_COOPERATIVE_SHUTDOWN_GRACE_SECONDS = 30.0
 
 
 @dataclass
@@ -90,6 +96,53 @@ def _autoresearch_iterations(environment: dict[str, str]) -> int:
     return iterations
 
 
+def _autoresearch_time_limit(environment: dict[str, str]) -> float | None:
+    raw = environment.get("NEURICO_HARBOR_TIME_LIMIT_SECONDS")
+    if raw is None or not raw.strip():
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError as error:
+        raise ValueError("NEURICO_HARBOR_TIME_LIMIT_SECONDS must be a number") from error
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("NEURICO_HARBOR_TIME_LIMIT_SECONDS must be greater than 0")
+    return seconds
+
+
+def _path_entry_exists(path: Path) -> bool:
+    """Return whether a path entry exists without following a symlink."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _remove_created_workspace_venv(workspace: Path, *, existed_before: bool) -> bool:
+    """Remove only a workspace ``.venv`` created during this Harbor run."""
+    if existed_before:
+        return False
+
+    workspace = workspace.resolve()
+    if workspace == Path(workspace.anchor):
+        raise RuntimeError(
+            "Refusing to clean a workspace virtual environment under filesystem root"
+        )
+
+    target = workspace / ".venv"
+    try:
+        target_stat = target.lstat()
+    except FileNotFoundError:
+        return False
+
+    if stat.S_ISDIR(target_stat.st_mode) and not stat.S_ISLNK(target_stat.st_mode):
+        shutil.rmtree(target)
+    else:
+        # Never follow a run-created symlink. Unlink the workspace entry only.
+        target.unlink()
+    return True
+
+
 async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     """Stop the isolated AutoResearch process group and its provider children."""
     if process.returncode is not None:
@@ -110,12 +163,30 @@ async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
+async def _stream_process_output(
+    process: asyncio.subprocess.Process,
+    emit: OutputHandler,
+) -> int:
+    """Forward arbitrary-size child output without imposing a line limit."""
+    assert process.stdout is not None
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while chunk := await process.stdout.read(64 * 1024):
+        text = decoder.decode(chunk)
+        if text:
+            await emit(text)
+    final_text = decoder.decode(b"", final=True)
+    if final_text:
+        await emit(final_text)
+    return await process.wait()
+
+
 async def run_autoresearch_process(
     *,
     task: HarborAutoResearchTask,
     connection: CodexInferenceConnection,
     base_environment: dict[str, str],
     iterations: int,
+    time_limit_seconds: float | None,
     emit: OutputHandler,
     register_process: Callable[[asyncio.subprocess.Process], None],
 ) -> int:
@@ -133,7 +204,7 @@ async def run_autoresearch_process(
             codex_home=codex_home,
         )
 
-        process = await asyncio.create_subprocess_exec(
+        command = [
             sys.executable,
             "-m",
             "neurico_harbor_agent.run_autoresearch",
@@ -145,6 +216,12 @@ async def run_autoresearch_process(
             str(ideas_dir),
             "--iterations",
             str(iterations),
+        ]
+        if time_limit_seconds is not None:
+            command.extend(["--time-limit-seconds", str(time_limit_seconds)])
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
             cwd=task.workspace,
             env=environment,
             stdout=asyncio.subprocess.PIPE,
@@ -152,10 +229,20 @@ async def run_autoresearch_process(
             start_new_session=True,
         )
         register_process(process)
-        assert process.stdout is not None
-        while line := await process.stdout.readline():
-            await emit(line.decode("utf-8", errors="replace"))
-        return await process.wait()
+        if time_limit_seconds is None:
+            return await _stream_process_output(process, emit)
+        try:
+            return await asyncio.wait_for(
+                _stream_process_output(process, emit),
+                timeout=time_limit_seconds + _COOPERATIVE_SHUTDOWN_GRACE_SECONDS,
+            )
+        except TimeoutError:
+            await emit(
+                "NeuriCo did not finish cooperative deadline cleanup within "
+                f"{_COOPERATIVE_SHUTDOWN_GRACE_SECONDS:g} seconds; terminating its process group.\n"
+            )
+            await _terminate_process_tree(process)
+            return 1
 
 
 class NeuricoHarborAgent(Agent):
@@ -298,6 +385,8 @@ class NeuricoHarborAgent(Agent):
             requested_model=session.model,
         )
         iterations = _autoresearch_iterations(self._environment)
+        time_limit_seconds = _autoresearch_time_limit(self._environment)
+        workspace_venv_existed = _path_entry_exists(task.workspace.resolve() / ".venv")
         session.cancelled = False
         session.active_task = asyncio.current_task()
 
@@ -310,11 +399,19 @@ class NeuricoHarborAgent(Agent):
                 connection=connection,
                 base_environment=self._environment,
                 iterations=iterations,
+                time_limit_seconds=time_limit_seconds,
                 emit=lambda text: self._send_text(session_id, text),
                 register_process=register_process,
             )
             if session.cancelled:
                 return PromptResponse(stop_reason="cancelled")
+            if return_code == _TIME_LIMIT_EXIT_CODE:
+                await self._send_text(
+                    session_id,
+                    "NeuriCo reached its configured run-time limit and stopped cleanly; "
+                    "the workspace is at its last retained checkpoint.\n",
+                )
+                return PromptResponse(stop_reason="end_turn")
             if return_code != 0:
                 raise RuntimeError(
                     f"NeuriCo AutoResearch exited unsuccessfully with status {return_code}"
@@ -327,5 +424,11 @@ class NeuricoHarborAgent(Agent):
         finally:
             if session.process is not None and session.process.returncode is None:
                 await _terminate_process_tree(session.process)
-            session.process = None
-            session.active_task = None
+            try:
+                _remove_created_workspace_venv(
+                    task.workspace,
+                    existed_before=workspace_venv_existed,
+                )
+            finally:
+                session.process = None
+                session.active_task = None
