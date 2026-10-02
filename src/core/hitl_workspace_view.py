@@ -301,6 +301,15 @@ class HitlWorkspaceView:
             else ""
         )
         workflow_locked = bool(pipeline)
+        from core.hitl_autoresearch import managed_baseline_construction_eligibility
+
+        baseline_eligibility = managed_baseline_construction_eligibility(
+            self.work_dir,
+            pipeline_state=pipeline,
+        )
+        can_construct_baseline = bool(
+            owner is None and baseline_eligibility.get("available")
+        )
         pending = runtime.get("pending_worker_command")
         pending = pending if isinstance(pending, dict) else {}
         continuation = runtime.get("worker_continuation")
@@ -335,6 +344,7 @@ class HitlWorkspaceView:
         started_at = str((owner or {}).get("started_at") or "").strip()
         provider = str((owner or {}).get("provider") or "").strip()
         mode = str((owner or {}).get("mode") or "").strip()
+        operation = str((owner or {}).get("operation") or "research").strip()
         workflow = str(
             pipeline_workflow
             or (owner or {}).get("workflow")
@@ -372,6 +382,7 @@ class HitlWorkspaceView:
                 "state": state,
                 "active": active,
                 "can_launch": not active,
+                "can_construct_baseline": can_construct_baseline and not active,
                 "title": title,
                 "detail": detail,
                 "stage": stage,
@@ -380,6 +391,7 @@ class HitlWorkspaceView:
                 "phase_label": visible_phase,
                 "label": label,
                 "mode": mode,
+                "operation": operation if operation in {"research", "construct_baseline"} else "research",
                 "workflow": workflow if workflow in {"ordinary", "autoresearch"} else "autoresearch",
                 "workflow_locked": workflow_locked,
                 "hitl_mode": hitl_mode if hitl_mode in {"full", "auto"} else "full",
@@ -425,6 +437,7 @@ class HitlWorkspaceView:
 
         if owner is None and launch_status:
             mode = str(launch_status.get("mode", mode)).strip()
+            operation = str(launch_status.get("operation", operation)).strip()
             if not workflow_locked:
                 workflow = str(launch_status.get("workflow", workflow)).strip().lower()
             hitl_mode = str(launch_status.get("hitl_mode", hitl_mode)).strip().lower()
@@ -442,6 +455,8 @@ class HitlWorkspaceView:
         def pending_labels() -> tuple[str, str]:
             if manager_review_kind == "initial_scoring":
                 return "Scoring", "Initial result review"
+            if manager_review_kind == "baseline_construction_scoring":
+                return "Scoring", "Baseline review"
             if manager_review_kind == "frontier_scoring":
                 return "Candidate decision", "Accept or reject"
             if manager_review_kind == "scoring_failure":
