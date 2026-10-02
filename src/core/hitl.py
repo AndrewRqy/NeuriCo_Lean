@@ -59,6 +59,7 @@ _WORKER_COMMAND_MODULES = {
     "hitl-report-idea": "hitl_report_idea.py",
     "hitl-raise-idea": "hitl_raise_idea.py",
     "hitl-view-ideas": "hitl_view_ideas.py",
+    "hitl-time-budget": "hitl_time_budget.py",
     "hitl-finish-phase": "hitl_finish_phase.py",
     "hitl-resume-worker-request": "hitl_resume_worker_request.py",
     "hitl-submit-proposal": "hitl_submit_proposal.py",
@@ -829,6 +830,62 @@ class HitlPaths:
         return self.tool_bin_dir / "view_current_frontier"
 
 
+def log_frontier_decision_record(
+    work_dir: Path,
+    *,
+    proposal_idea_id: str,
+    accepted: bool,
+    reason: str,
+    provenance: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persist one manager-finalized frontier decision without starting a manager."""
+    log = HitlIdeaLog(work_dir)
+    parent_node_id = str(provenance.get("parent_node_id", "")).strip()
+    attempt_id = str(provenance.get("attempt_id", "")).strip()
+    for existing in log.records():
+        if (
+            parent_node_id
+            and attempt_id
+            and existing.get("parent_node_id") == parent_node_id
+            and existing.get("attempt_id") == attempt_id
+            and existing.get("idea_type") == "decision"
+            and existing.get("actor") == "manager"
+            and existing.get("decision_needed")
+            == "Should the scored candidate be retained in the HITL research frontier?"
+        ):
+            return existing
+    premises = [proposal_idea_id]
+    from core.hitl_runtime_state import HitlRuntimeState
+
+    pending_request = HitlRuntimeState(work_dir).pending_worker_command()
+    scoring_review_idea_id = str(
+        (pending_request or {}).get("scoring_review_idea_id", "")
+    ).strip()
+    if scoring_review_idea_id and scoring_review_idea_id not in premises:
+        premises.append(scoring_review_idea_id)
+    record = {
+        "pipeline_stage": "experiment_runner",
+        "hitl_stage": "review",
+        "idea_type": "decision",
+        "idea_category": "method_choice",
+        "level": "B",
+        "actor": "manager",
+        "premises": premises,
+        "context": "Manager reviewed the scored AutoResearch candidate against its active frontier direction.",
+        "related_artifacts": [],
+        "decision_needed": "Should the scored candidate be retained in the HITL research frontier?",
+        "options": [
+            "Accept candidate into the frontier.",
+            "Reject candidate and restore its parent frontier node.",
+        ],
+        "decision": "O1" if accepted else "O2",
+        "manager_feedback": str(reason).strip(),
+        "raised": False,
+    }
+    _apply_runtime_provenance(record, provenance)
+    return log.append(record, idempotent=True)
+
+
 class HitlRuntime:
     """Small orchestration helper for one plan-centered HITL stage."""
 
@@ -1179,6 +1236,8 @@ class HitlRuntime:
             proposal_guard = HitlWorkspaceWriteGuard.capture_public(self.work_dir)
             proposal_submission_validator = proposal_guard.require_unchanged
         allowed_worker_commands = self._worker_commands_for_stage(hitl_stage)
+        if self._time_budget_command_available():
+            allowed_worker_commands.add("hitl-time-budget")
         from core.hitl_runtime_state import HitlRuntimeState, worker_command_requires_resume
 
         pending_command = HitlRuntimeState(self.work_dir).pending_worker_command()
@@ -1304,6 +1363,8 @@ class HitlRuntime:
         self.current_hitl_stage = to_stage
         self._tool_context["requires_human_approval"] = False
         self._tool_context["allowed_worker_commands"] = self._worker_commands_for_stage(to_stage)
+        if self._time_budget_command_available():
+            self._tool_context["allowed_worker_commands"].add("hitl-time-budget")
         self._install_stage_guards(to_stage)
         self._write_idea_tool_commands()
         if prompt_block:
@@ -1342,6 +1403,11 @@ class HitlRuntime:
         if command_name not in commands:
             commands.add(command_name)
             self._write_idea_tool_commands()
+
+    def _time_budget_command_available(self) -> bool:
+        from core.hitl_run_control import current_hitl_run_time_usage
+
+        return current_hitl_run_time_usage(self.work_dir) is not None
 
     def _require_worker_command(self, command_name: str) -> None:
         commands = self._tool_context.get("allowed_worker_commands")
@@ -2115,48 +2181,13 @@ class HitlRuntime:
         provenance: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Finalize the manager's strategic scored-candidate decision."""
-        parent_node_id = str(provenance.get("parent_node_id", "")).strip()
-        attempt_id = str(provenance.get("attempt_id", "")).strip()
-        for existing in self.log.records():
-            if (
-                parent_node_id
-                and attempt_id
-                and existing.get("parent_node_id") == parent_node_id
-                and existing.get("attempt_id") == attempt_id
-                and existing.get("idea_type") == "decision"
-                and existing.get("actor") == "manager"
-                and existing.get("decision_needed")
-                == "Should the scored candidate be retained in the HITL research frontier?"
-            ):
-                return existing
-        premises = [proposal_idea_id]
-        pending_request = self._pending_worker_command()
-        scoring_review_idea_id = str(
-            (pending_request or {}).get("scoring_review_idea_id", "")
-        ).strip()
-        if scoring_review_idea_id and scoring_review_idea_id not in premises:
-            premises.append(scoring_review_idea_id)
-        record = {
-            "pipeline_stage": "experiment_runner",
-            "hitl_stage": "review",
-            "idea_type": "decision",
-            "idea_category": "method_choice",
-            "level": "B",
-            "actor": "manager",
-            "premises": premises,
-            "context": "Manager reviewed the scored AutoResearch candidate against its active frontier direction.",
-            "related_artifacts": [],
-            "decision_needed": "Should the scored candidate be retained in the HITL research frontier?",
-            "options": [
-                "Accept candidate into the frontier.",
-                "Reject candidate and restore its parent frontier node.",
-            ],
-            "decision": "O1" if accepted else "O2",
-            "manager_feedback": str(reason).strip(),
-            "raised": False,
-        }
-        _apply_runtime_provenance(record, provenance)
-        return self.log.append(record, idempotent=True)
+        return log_frontier_decision_record(
+            self.work_dir,
+            proposal_idea_id=proposal_idea_id,
+            accepted=accepted,
+            reason=reason,
+            provenance=provenance,
+        )
 
     def log_frontier_maintenance_decision(
         self,
@@ -2566,13 +2597,18 @@ class HitlRuntime:
 
         Only runs past the plan phase, where the evaluator exists. A reporter
         that raises degrades to an ``UNAVAILABLE`` note rather than failing the
-        review, so a verifier fault never blocks the rule maker.
+        review, so a verifier fault never blocks the rule maker. A run stop
+        propagates to the existing cancellation path instead.
         """
+        from core.hitl_run_control import HitlRunStopRequested
+
         reporter = self._scoring_conformance_reporter
         if not callable(reporter) or hitl_stage == "plan":
             return ""
         try:
             return str(reporter() or "")
+        except HitlRunStopRequested:
+            raise
         except Exception as exc:
             print(f"⚠️  Scoring conformance report unavailable: {exc}")
             return (
@@ -4112,6 +4148,16 @@ class HitlRuntime:
                         runtime._require_worker_command("hitl-view-ideas")
                         result = runtime.view_ideas_for_tool(payload)
                         self._send_json(200, {"ok": True, "text": result["text"]})
+                        return
+                    if self.path == "/time-budget":
+                        runtime._require_worker_command("hitl-time-budget")
+                        from core.hitl_run_control import current_hitl_run_time_usage
+
+                        usage = current_hitl_run_time_usage(runtime.work_dir)
+                        if usage is None:
+                            self._send_json(409, {"error": "No time budget is active for this run."})
+                            return
+                        self._send_json(200, {"ok": True, "usage": usage})
                         return
                     if self.path == "/frontier/current":
                         runtime._require_worker_command("view_current_frontier")
