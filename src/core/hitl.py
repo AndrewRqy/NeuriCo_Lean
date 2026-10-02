@@ -12,6 +12,7 @@ from contextlib import contextmanager
 import json
 import logging
 import os
+import re
 import stat
 import hashlib
 import http.server
@@ -4307,6 +4308,47 @@ class RequiredArtifact:
     path: str
     purpose: str
     required: bool
+    any_of_group: Optional[str] = None
+
+
+_ANY_OF_REQUIREMENT_PREFIX = "any-of:"
+_ANY_OF_GROUP_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _normalize_any_of_group(value: str) -> str:
+    group = value.strip().lower()
+    if not _ANY_OF_GROUP_PATTERN.fullmatch(group):
+        raise HitlValidationError(
+            "Any-of artifact group names must start with a lowercase letter or number "
+            "and contain only lowercase letters, numbers, hyphens, or underscores: "
+            f"{value}"
+        )
+    return group
+
+
+def _validate_artifact_requirements(artifacts: Iterable[RequiredArtifact]) -> None:
+    artifact_list = list(artifacts)
+    groups: Dict[str, List[RequiredArtifact]] = {}
+    for artifact in artifact_list:
+        if artifact.required and artifact.any_of_group:
+            raise HitlValidationError(
+                f"Artifact cannot be both individually required and in an any-of group: "
+                f"{artifact.path}"
+            )
+        if artifact.any_of_group:
+            groups.setdefault(artifact.any_of_group, []).append(artifact)
+
+    for group, members in groups.items():
+        if len(members) < 2:
+            raise HitlValidationError(
+                f"Any-of artifact group '{group}' must contain at least two paths."
+            )
+
+    if not any(artifact.required for artifact in artifact_list) and not groups:
+        raise HitlValidationError(
+            "Files-to-produce table must include at least one required artifact or "
+            "any-of artifact group."
+        )
 
 
 def parse_required_artifacts(interface_path: Path) -> List[RequiredArtifact]:
@@ -4345,61 +4387,87 @@ def parse_required_artifacts(interface_path: Path) -> List[RequiredArtifact]:
             raise HitlValidationError(f"Duplicate required artifact path: {rel_path}")
         seen.add(rel_path)
         required_text = cells[2].strip().lower()
-        if required_text not in {"yes", "no", "recommended"}:
+        any_of_group: Optional[str] = None
+        if required_text.startswith(_ANY_OF_REQUIREMENT_PREFIX):
+            any_of_group = _normalize_any_of_group(
+                required_text.removeprefix(_ANY_OF_REQUIREMENT_PREFIX)
+            )
+        elif required_text not in {"yes", "no", "recommended"}:
             raise HitlValidationError(f"Unknown Required value for {rel_path}: {cells[2]}")
         artifacts.append(
             RequiredArtifact(
                 path=rel_path,
                 purpose=cells[1].strip(),
                 required=required_text == "yes",
+                any_of_group=any_of_group,
             )
         )
         row_idx += 1
 
-    if not any(artifact.required for artifact in artifacts):
-        raise HitlValidationError(
-            "Files-to-produce table must include at least one required artifact."
-        )
+    _validate_artifact_requirements(artifacts)
     return artifacts
+
+
+def _verify_required_artifact(root: Path, artifact: RequiredArtifact) -> None:
+    path = root / artifact.path
+    try:
+        path.resolve(strict=False).relative_to(root)
+    except ValueError as exc:
+        raise HitlValidationError(
+            f"Required artifact escapes the workspace: {artifact.path}"
+        ) from exc
+    if path.is_symlink():
+        raise HitlValidationError(f"Required artifact cannot be a symlink: {artifact.path}")
+    if not path.exists():
+        raise HitlValidationError(f"Required artifact missing: {artifact.path}")
+    if artifact.path.endswith("/"):
+        if not path.is_dir():
+            raise HitlValidationError(
+                f"Required artifact should be a directory: {artifact.path}"
+            )
+        if not any(path.iterdir()):
+            raise HitlValidationError(f"Required artifact directory is empty: {artifact.path}")
+        return
+    if not path.is_file():
+        raise HitlValidationError(f"Required artifact should be a file: {artifact.path}")
+    if path.stat().st_size == 0:
+        raise HitlValidationError(f"Required artifact is empty: {artifact.path}")
+    if path.suffix == ".json":
+        json.loads(path.read_text(encoding="utf-8"))
+    elif path.suffix == ".csv":
+        import csv
+
+        with path.open(newline="", encoding="utf-8") as f:
+            next(csv.reader(f), None)
 
 
 def verify_required_artifacts(work_dir: Path, artifacts: Iterable[RequiredArtifact]) -> None:
     root = Path(work_dir).resolve()
-    for artifact in artifacts:
-        if not artifact.required:
-            continue
-        path = root / artifact.path
-        try:
-            path.resolve(strict=False).relative_to(root)
-        except ValueError as exc:
-            raise HitlValidationError(
-                f"Required artifact escapes the workspace: {artifact.path}"
-            ) from exc
-        if path.is_symlink():
-            raise HitlValidationError(
-                f"Required artifact cannot be a symlink: {artifact.path}"
-            )
-        if not path.exists():
-            raise HitlValidationError(f"Required artifact missing: {artifact.path}")
-        if artifact.path.endswith("/"):
-            if not path.is_dir():
-                raise HitlValidationError(
-                    f"Required artifact should be a directory: {artifact.path}"
-                )
-            if not any(path.iterdir()):
-                raise HitlValidationError(f"Required artifact directory is empty: {artifact.path}")
-            continue
-        if not path.is_file():
-            raise HitlValidationError(f"Required artifact should be a file: {artifact.path}")
-        if path.stat().st_size == 0:
-            raise HitlValidationError(f"Required artifact is empty: {artifact.path}")
-        if path.suffix == ".json":
-            json.loads(path.read_text(encoding="utf-8"))
-        elif path.suffix == ".csv":
-            import csv
+    artifact_list = list(artifacts)
+    _validate_artifact_requirements(artifact_list)
 
-            with path.open(newline="", encoding="utf-8") as f:
-                next(csv.reader(f), None)
+    any_of_groups: Dict[str, List[RequiredArtifact]] = {}
+    for artifact in artifact_list:
+        if artifact.any_of_group:
+            any_of_groups.setdefault(artifact.any_of_group, []).append(artifact)
+        elif artifact.required:
+            _verify_required_artifact(root, artifact)
+
+    for group, members in any_of_groups.items():
+        failures: List[str] = []
+        for artifact in members:
+            try:
+                _verify_required_artifact(root, artifact)
+                break
+            except (OSError, ValueError, json.JSONDecodeError, HitlValidationError) as exc:
+                failures.append(str(exc))
+        else:
+            choices = ", ".join(artifact.path for artifact in members)
+            details = "; ".join(failures)
+            raise HitlValidationError(
+                f"Required any-of artifact group '{group}' is unsatisfied; expected at "
+                f"least one valid artifact from: {choices}. Candidate issues: {details}"
+            )
 
 
 def validate_required_artifact_contract(work_dir: Path) -> Dict[str, Any]:
@@ -4422,10 +4490,15 @@ def persist_hitl_required_artifact_contract(work_dir: Path) -> List[RequiredArti
     interface_path = root / "scoring" / "interface.md"
     artifacts = parse_required_artifacts(interface_path)
     payload = {
-        "version": 1,
+        "version": 2,
         "interface_sha256": _sha256_file(interface_path),
         "artifacts": [
-            {"path": artifact.path, "purpose": artifact.purpose, "required": artifact.required}
+            {
+                "path": artifact.path,
+                "purpose": artifact.purpose,
+                "required": artifact.required,
+                "any_of_group": artifact.any_of_group,
+            }
             for artifact in artifacts
         ],
     }
@@ -4450,8 +4523,9 @@ def load_hitl_required_artifact_contract(work_dir: Path) -> List[RequiredArtifac
         raise HitlValidationError(
             "Runtime-required artifact contract is missing or unreadable; rerun rule-maker HITL."
         ) from exc
-    if not isinstance(payload, dict) or payload.get("version") != 1:
+    if not isinstance(payload, dict) or payload.get("version") not in {1, 2}:
         raise HitlValidationError("Runtime-required artifact contract has an invalid version.")
+    version = payload["version"]
     interface_path = root / "scoring" / "interface.md"
     if _sha256_file(interface_path) != payload.get("interface_sha256"):
         raise HitlValidationError(
@@ -4461,18 +4535,31 @@ def load_hitl_required_artifact_contract(work_dir: Path) -> List[RequiredArtifac
     if not isinstance(entries, list):
         raise HitlValidationError("Runtime-required artifact contract has no artifact list.")
     artifacts: List[RequiredArtifact] = []
+    seen: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("required"), bool):
             raise HitlValidationError("Runtime-required artifact contract has an invalid entry.")
+        path = _normalize_required_artifact_path(str(entry.get("path", "")))
+        if path in seen:
+            raise HitlValidationError(f"Duplicate required artifact path: {path}")
+        seen.add(path)
+        raw_any_of_group = entry.get("any_of_group") if version == 2 else None
+        if raw_any_of_group is not None and not isinstance(raw_any_of_group, str):
+            raise HitlValidationError("Runtime-required artifact contract has an invalid entry.")
+        any_of_group = (
+            _normalize_any_of_group(raw_any_of_group) if raw_any_of_group is not None else None
+        )
         artifacts.append(
             RequiredArtifact(
-                path=_normalize_required_artifact_path(str(entry.get("path", ""))),
+                path=path,
                 purpose=str(entry.get("purpose", "")).strip(),
                 required=entry["required"],
+                any_of_group=any_of_group,
             )
         )
     if not artifacts:
         raise HitlValidationError("Runtime-required artifact contract is empty.")
+    _validate_artifact_requirements(artifacts)
     return artifacts
 
 
