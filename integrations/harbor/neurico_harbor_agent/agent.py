@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import codecs
-import math
 import os
 import shutil
 import signal
@@ -96,16 +95,20 @@ def _autoresearch_iterations(environment: dict[str, str]) -> int:
     return iterations
 
 
-def _autoresearch_time_limit(environment: dict[str, str]) -> float | None:
+def _autoresearch_time_limit(environment: dict[str, str]) -> int | None:
     raw = environment.get("NEURICO_HARBOR_TIME_LIMIT_SECONDS")
     if raw is None or not raw.strip():
         return None
     try:
-        seconds = float(raw)
+        seconds = int(raw)
     except ValueError as error:
-        raise ValueError("NEURICO_HARBOR_TIME_LIMIT_SECONDS must be a number") from error
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise ValueError("NEURICO_HARBOR_TIME_LIMIT_SECONDS must be greater than 0")
+        raise ValueError(
+            "NEURICO_HARBOR_TIME_LIMIT_SECONDS must be a positive integer"
+        ) from error
+    if seconds <= 0:
+        raise ValueError(
+            "NEURICO_HARBOR_TIME_LIMIT_SECONDS must be a positive integer"
+        )
     return seconds
 
 
@@ -186,7 +189,7 @@ async def run_autoresearch_process(
     connection: CodexInferenceConnection,
     base_environment: dict[str, str],
     iterations: int,
-    time_limit_seconds: float | None,
+    time_limit_seconds: int | None,
     emit: OutputHandler,
     register_process: Callable[[asyncio.subprocess.Process], None],
 ) -> int:
@@ -408,8 +411,9 @@ class NeuricoHarborAgent(Agent):
             if return_code == _TIME_LIMIT_EXIT_CODE:
                 await self._send_text(
                     session_id,
-                    "NeuriCo reached its configured run-time limit and stopped cleanly; "
-                    "the workspace is at its last retained checkpoint.\n",
+                    "NeuriCo reached its configured run-time limit and completed native "
+                    "AutoResearch budget finalization; the workspace is ready for Harbor's "
+                    "verifier.\n",
                 )
                 return PromptResponse(stop_reason="end_turn")
             if return_code != 0:
