@@ -1,9 +1,11 @@
 # NeuriCo Harbor agent
 
-This directory is the locked ACP runtime for using NeuriCo AutoResearch as a
-Harbor agent. The adapter converts Harbor's prompt through NeuriCo's existing
-local-idea converter and launches the existing fresh AutoResearch workflow in
-Harbor's supplied repository, using NeuriCo's Codex provider.
+This directory is the locked ACP runtime for using NeuriCo's manager-driven
+AutoResearch as a Harbor agent. The adapter converts Harbor's prompt through
+NeuriCo's existing local-idea converter and launches fresh HITL AutoResearch in
+headless Auto mode inside Harbor's supplied repository, using NeuriCo's Codex
+provider. Auto mode uses the manager for every review boundary but never waits
+for human input.
 
 ## Contract
 
@@ -13,21 +15,29 @@ Harbor's supplied repository, using NeuriCo's Codex provider.
 - Harbor's complete text prompt is preserved in
   `idea.background.description`. NeuriCo's prompt generator already promotes
   that field as high-priority user instructions.
-- NeuriCo runs its normal fresh AutoResearch resource-finder stage before rule
-  construction. The resource finder may use Harbor's supplied repository and
-  any external sources allowed by the task's Harbor network policy. The scored
-  lifecycle then continues with a baseline experiment, scoring, proposals,
-  candidate experiments, and accept-or-restore checkpointing.
+- NeuriCo runs fresh manager-driven HITL AutoResearch in Auto mode. The manager
+  reviews resource-finder, rule-maker, experiment, and scoring boundaries and
+  may request repairs or replacement workers without human interaction. The
+  resource finder may use Harbor's supplied repository and any external sources
+  allowed by the task's Harbor network policy. The scored lifecycle then
+  continues with a baseline experiment, scoring, proposals, candidate
+  experiments, and manager-governed accept-or-restore checkpointing.
 - The adapter is benchmark-focused. Internal scoring is enabled, while paper
   generation and scribe/notebook output are always disabled. Harbor's verifier
   remains the authoritative benchmark result after the agent exits.
 - One AutoResearch improvement iteration is used by default, matching
   NeuriCo's CLI default. `NEURICO_HARBOR_AUTORESEARCH_ITERATIONS` may select a
   larger positive count. This changes search depth within one Harbor trial; it
-  does not change Harbor's number of independent attempts.
-- This adapter does not add a new whole-run time-budget policy. NeuriCo's
-  existing stage limits still apply, Harbor may cancel the ACP run, and a
-  later NeuriCo feature can map one global budget across AutoResearch stages.
+  does not change Harbor's number of independent attempts or limit the
+  manager's stage-level repair and replacement decisions.
+- `NEURICO_HARBOR_TIME_LIMIT_SECONDS` optionally gives NeuriCo a whole-run
+  budget. When it expires, the existing HITL stop control asks the active
+  worker to stop, restores any interrupted AutoResearch attempt, retains the
+  last valid checkpoint, and exits before Harbor starts its verifier. Set this
+  below Harbor's agent timeout so cooperative recovery and `.venv` cleanup have
+  time to finish; for example, use 1740 seconds with a 1800-second Harbor
+  timeout. If cooperative shutdown itself stalls, the adapter terminates the
+  isolated NeuriCo process group after a 30-second grace period.
 - The requested Harbor model is advertised as an ACP session configuration
   option and written to an isolated `CODEX_HOME`, pinning every Codex-backed
   NeuriCo stage to the same model.
@@ -40,6 +50,11 @@ Harbor's supplied repository, using NeuriCo's Codex provider.
 - NeuriCo's idea registry and Codex home are kept in a temporary control
   directory outside the task repository. Research state and the retained best
   implementation remain in Harbor's workspace.
+- NeuriCo may create a workspace `.venv` while its agents and internal scorer
+  run. After the AutoResearch child process exits, the adapter removes that
+  environment if it did not exist before the Harbor session. Dependency
+  metadata and research artifacts remain, while a benchmark-provided `.venv`
+  is preserved. Harbor's verifier is responsible for its own environment.
 - Harbor runs its own verifier after NeuriCo exits; the adapter does not inspect
   or translate Harbor's verifier.
 
@@ -70,6 +85,7 @@ agents:
     env:
       NEURICO_CODEX_AUTH_FILE: /run/secrets/neurico-codex-auth.json
       NEURICO_HARBOR_AUTORESEARCH_ITERATIONS: "1"
+      NEURICO_HARBOR_TIME_LIMIT_SECONDS: "1740"
     kwargs:
       source:
         repo_url: https://github.com/ChicagoHAI/neurico
@@ -103,6 +119,7 @@ agents:
     model_name: openai/gpt-5.6-sol
     env:
       NEURICO_HARBOR_AUTORESEARCH_ITERATIONS: "1"
+      NEURICO_HARBOR_TIME_LIMIT_SECONDS: "1740"
     kwargs:
       source:
         repo_url: https://github.com/ChicagoHAI/neurico
@@ -118,8 +135,9 @@ API-compatible endpoint.
 The adapter intentionally does not accept raw NeuriCo command-line arguments.
 Benchmark controls are added as individually validated `NEURICO_HARBOR_*`
 environment variables so a Harbor config cannot silently enable unrelated
-research-publication behavior. At present, iteration count is the only such
-control; model choice belongs to Harbor, and paper generation remains off.
+research-publication behavior. Iteration count and the optional whole-run time
+limit are the only such controls; model choice belongs to Harbor, and paper
+generation remains off.
 
 ## Contract tests
 
@@ -129,6 +147,8 @@ uv sync --frozen --extra dev
 uv run --frozen --extra dev pytest -q tests/contract_checks.py
 ```
 
-The suite includes a real stdio ACP handshake and model-selection round trip.
-AutoResearch execution is replaced at the process boundary during contract
-tests, so the tests do not consume model usage.
+The suite includes a real stdio ACP handshake and model-selection round trip,
+and verifies that the child selects headless manager-driven Auto HITL instead
+of ordinary mechanical AutoResearch. Model-backed execution is replaced at the
+process boundary during contract tests, so the tests do not consume model
+usage.
