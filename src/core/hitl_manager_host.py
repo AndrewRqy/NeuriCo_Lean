@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -61,6 +62,33 @@ def _elapsed_phase_time(started_at: Any) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes}:{seconds:02d}"
+
+
+def _remaining_budget_time(deadline_at: Any) -> str:
+    if type(deadline_at) not in (int, float):
+        return ""
+    seconds = max(0, int(float(deadline_at) - time.time() + 0.999999))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _terminal_status_with_budget(primary: str, budget: str) -> str:
+    suffix = f"  ·  Budget {budget} left" if budget else ""
+    if not suffix:
+        return primary
+    limit = max(1, shutil.get_terminal_size((100, 24)).columns - 3)
+    if len(primary) + len(suffix) <= limit:
+        return primary + suffix
+    available = max(0, limit - len(suffix) - 1)
+    shortened = (
+        primary
+        if len(primary) <= available
+        else primary[: max(0, available - 1)].rstrip() + "…"
+    )
+    return shortened + suffix
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -988,7 +1016,7 @@ class HitlTerminalChannel(UserChannel):
                 )
                 while True:
                     raw_limit = self._read_setting(
-                        "Time limit in seconds [no limit] (blank for none): ",
+                        "Budget (sec) [none]: ",
                         "", cancellable=True,
                     )
                     if not raw_limit:
@@ -1000,7 +1028,7 @@ class HitlTerminalChannel(UserChannel):
                         break
                     except ValueError:
                         self._write_block(self._ui.system(
-                            "Enter a positive whole number of seconds, or leave blank for no limit.",
+                            "Enter a positive whole number of seconds.",
                             tone="error",
                         ))
             write_paper = self._read_yes_no(
@@ -1140,6 +1168,11 @@ class HitlTerminalChannel(UserChannel):
         self._cache_live_status(status)
         visible = dict(status)
         visible["elapsed"] = _elapsed_phase_time(status.get("phase_started_at"))
+        visible["budget_remaining"] = (
+            _remaining_budget_time(status.get("budget_deadline_at"))
+            if bool(status.get("active"))
+            else ""
+        )
         self._write_block(self._ui.expanded_status(visible), blank_before=True)
 
     def _read_run_status(self) -> tuple[Optional[Dict[str, Any]], str]:
@@ -1176,6 +1209,12 @@ class HitlTerminalChannel(UserChannel):
             label = f"● {label}  {elapsed}"
         else:
             label = f"● {label}"
+        budget = (
+            _remaining_budget_time(status.get("budget_deadline_at"))
+            if bool(status.get("active"))
+            else ""
+        )
+        label = _terminal_status_with_budget(label, budget)
         return str(status.get("state", "idle")).strip(), label
 
     def print_help(self) -> None:

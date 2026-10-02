@@ -392,6 +392,9 @@ class HitlTerminalUI:
             mode = terminal_safe_text(live.get("hitl_mode") or "full").strip().lower()
             lines.append(f"  Research: {'Ordinary' if workflow == 'ordinary' else 'AutoResearch'}")
             lines.append(f"  Auto: {'Yes' if mode == 'auto' else 'No'}")
+            budget = terminal_safe_text(live.get("budget_remaining") or "").strip()
+            if budget:
+                lines.append(f"  Budget remaining: {budget}")
         if detail:
             lines.extend(self._wrap_paragraph(detail, indent="  "))
         if next_action:
