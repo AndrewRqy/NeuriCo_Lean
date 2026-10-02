@@ -56,6 +56,7 @@ class WorkspaceGuardScope:
 
     runtime_private_roots: tuple[str, ...] = ()
     immutable_resource_roots: tuple[str, ...] = ()
+    immutable_resource_digests: tuple[tuple[str, str], ...] = ()
 
     @classmethod
     def from_value(cls, value: Any) -> "WorkspaceGuardScope":
@@ -74,6 +75,9 @@ class WorkspaceGuardScope:
                 value.get("immutable_resource_roots", ()),
                 field="immutable_resource_roots",
             ),
+            immutable_resource_digests=cls._normalize_digests(
+                value.get("immutable_resource_digests", {}),
+            ),
         )._validated()
 
     @staticmethod
@@ -84,6 +88,25 @@ class WorkspaceGuardScope:
             raise ValueError(f"HITL workspace guard {field} must be a list.")
         normalized = {HitlWorkspaceWriteGuard._normalize_relative(str(value)) for value in values}
         return tuple(sorted(normalized))
+
+    @staticmethod
+    def _normalize_digests(values: Any) -> tuple[tuple[str, str], ...]:
+        if values is None:
+            return ()
+        if not isinstance(values, Mapping):
+            raise ValueError("HITL workspace guard immutable_resource_digests must be a mapping.")
+        normalized: dict[str, str] = {}
+        for raw_path, raw_digest in values.items():
+            path = HitlWorkspaceWriteGuard._normalize_relative(str(raw_path))
+            digest = str(raw_digest).strip().lower()
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError(
+                    "HITL workspace guard immutable resource digests must be SHA-256 values."
+                )
+            normalized[path] = digest
+        return tuple(sorted(normalized.items()))
 
     def _validated(self) -> "WorkspaceGuardScope":
         private = set(self.runtime_private_roots)
@@ -98,15 +121,32 @@ class WorkspaceGuardScope:
         for index, root in enumerate(roots):
             for other in roots[index + 1 :]:
                 if other.startswith(root + "/"):
-                    raise ValueError(
-                        "HITL workspace guard roots cannot overlap: " f"{root}, {other}"
-                    )
+                    raise ValueError(f"HITL workspace guard roots cannot overlap: {root}, {other}")
+        digest_roots = set(dict(self.immutable_resource_digests))
+        unexpected = sorted(digest_roots - immutable)
+        if unexpected:
+            raise ValueError(
+                "HITL workspace guard has digests for undeclared immutable roots: "
+                + ", ".join(unexpected)
+            )
         return self
 
-    def to_dict(self) -> dict[str, list[str]]:
+    def require_immutable_resource_digests(self) -> "WorkspaceGuardScope":
+        missing = sorted(
+            set(self.immutable_resource_roots) - set(dict(self.immutable_resource_digests))
+        )
+        if missing:
+            raise ValueError(
+                "HITL workspace guard has immutable roots without trusted digests: "
+                + ", ".join(missing)
+            )
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
         return {
             "runtime_private_roots": list(self.runtime_private_roots),
             "immutable_resource_roots": list(self.immutable_resource_roots),
+            "immutable_resource_digests": dict(self.immutable_resource_digests),
         }
 
     @property
@@ -144,7 +184,9 @@ class HitlWorkspaceWriteGuard:
         scope: WorkspaceGuardScope | Mapping[str, Any] | None = None,
     ) -> "HitlWorkspaceWriteGuard":
         root = Path(work_dir).resolve()
-        normalized_scope = WorkspaceGuardScope.from_value(scope)
+        normalized_scope = WorkspaceGuardScope.from_value(
+            scope
+        ).require_immutable_resource_digests()
         return cls(
             root,
             cls._snapshot(root, include_hidden=False, scope=normalized_scope),
@@ -160,10 +202,12 @@ class HitlWorkspaceWriteGuard:
     ) -> str:
         """Return a stable digest of the public workspace at one boundary."""
         root = Path(work_dir).resolve()
-        normalized_scope = WorkspaceGuardScope.from_value(scope)
+        normalized_scope = WorkspaceGuardScope.from_value(
+            scope
+        ).require_immutable_resource_digests()
         states = cls._snapshot(root, include_hidden=False, scope=normalized_scope)
         digest = hashlib.sha256()
-        digest.update(b"neurico-hitl-public-fingerprint-v4\0")
+        digest.update(b"neurico-hitl-public-fingerprint-v5\0")
         digest.update(repr(normalized_scope.to_dict()).encode("utf-8"))
         for path, state in sorted(states.items()):
             digest.update(path.encode("utf-8"))
@@ -180,6 +224,21 @@ class HitlWorkspaceWriteGuard:
             tracked_paths=normalized,
         )
 
+    @classmethod
+    def immutable_resource_digest(cls, work_dir: Path, relative: str) -> str:
+        """Return the deterministic digest for one declared immutable root."""
+        root = Path(work_dir).resolve()
+        normalized = cls._normalize_relative(relative)
+        path = root / normalized
+        try:
+            stats = path.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError(f"Immutable resource root is missing: {normalized}") from exc
+        state = cls._immutable_root_state(path, stats)
+        if not state.sha256:
+            raise ValueError(f"Immutable resource root could not be hashed: {normalized}")
+        return state.sha256
+
     def allow_only(self, paths: Iterable[str]) -> dict[str, object]:
         allowed = {self._normalize_relative(path) for path in paths}
         return self._validate(allowed=allowed)
@@ -187,7 +246,10 @@ class HitlWorkspaceWriteGuard:
     def allow_only_under(self, paths: Iterable[str]) -> dict[str, object]:
         """Allow changes to each path and anything contained beneath it."""
         roots = {self._normalize_relative(path) for path in paths}
-        current = self._current_snapshot()
+        try:
+            current = self._current_snapshot()
+        except RuntimeError as exc:
+            return {"valid": False, "issues": [str(exc)]}
         changed = sorted(
             path
             for path in set(self.baseline) | set(current)
@@ -205,7 +267,10 @@ class HitlWorkspaceWriteGuard:
         return self._validate(allowed=set())
 
     def _validate(self, *, allowed: set[str]) -> dict[str, object]:
-        current = self._current_snapshot()
+        try:
+            current = self._current_snapshot()
+        except RuntimeError as exc:
+            return {"valid": False, "issues": [str(exc)]}
         changed = sorted(
             path
             for path in set(self.baseline) | set(current)
@@ -243,10 +308,9 @@ class HitlWorkspaceWriteGuard:
         scope: WorkspaceGuardScope,
     ) -> dict[str, _FileState]:
         states: dict[str, _FileState] = {}
-        runtime_private_roots = (
-            set(scope.runtime_private_roots) | _BUILTIN_RUNTIME_PRIVATE_ROOTS
-        )
+        runtime_private_roots = set(scope.runtime_private_roots) | _BUILTIN_RUNTIME_PRIVATE_ROOTS
         immutable_roots = set(scope.immutable_resource_roots)
+        immutable_digests = dict(scope.immutable_resource_digests)
         excluded_roots = runtime_private_roots | immutable_roots
         for relative in sorted(runtime_private_roots):
             path = root / relative
@@ -260,11 +324,14 @@ class HitlWorkspaceWriteGuard:
             try:
                 stats = path.lstat()
             except FileNotFoundError:
-                continue
-            states[relative] = HitlWorkspaceWriteGuard._immutable_root_state(
+                raise RuntimeError(f"Immutable resource root is missing: {relative}")
+            state = HitlWorkspaceWriteGuard._immutable_root_state(
                 path,
                 stats,
             )
+            if state.sha256 != immutable_digests[relative]:
+                raise RuntimeError("Immutable resource changed after registration: " + relative)
+            states[relative] = state
 
         pending_directories = [root]
         while pending_directories:

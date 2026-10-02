@@ -35,6 +35,12 @@ def _workspace(tmp_path):
     return work_dir
 
 
+def _register_immutable_scope(work_dir, *roots):
+    return HitlRuntimeState(work_dir).set_workspace_guard_scope(
+        immutable_resource_roots=list(roots)
+    )
+
+
 def test_runtime_state_document_is_outside_the_boundary(tmp_path):
     work_dir = _workspace(tmp_path)
     guard = HitlWorkspaceWriteGuard.capture_public(work_dir)
@@ -225,9 +231,9 @@ def test_registered_immutable_root_detects_nested_content_change(tmp_path):
     payload.parent.mkdir(parents=True)
     payload.write_text("a,b\n1,2\n")
     original = payload.stat()
-    scope = {"immutable_resource_roots": ["datasets/immutable"]}
+    scope = _register_immutable_scope(work_dir, "datasets/immutable")
     guard = HitlWorkspaceWriteGuard.capture_public(work_dir, scope=scope)
-    fingerprint = HitlWorkspaceWriteGuard.public_fingerprint(work_dir, scope=scope)
+    HitlWorkspaceWriteGuard.public_fingerprint(work_dir, scope=scope)
 
     payload.write_text("a,b\n2,1\n")
     os.utime(payload, ns=(original.st_atime_ns, original.st_mtime_ns))
@@ -235,7 +241,8 @@ def test_registered_immutable_root_detects_nested_content_change(tmp_path):
     result = guard.require_unchanged()
     assert not result["valid"]
     assert "datasets/immutable" in result["issues"][0]
-    assert HitlWorkspaceWriteGuard.public_fingerprint(work_dir, scope=scope) != fingerprint
+    with pytest.raises(RuntimeError, match="changed after registration"):
+        HitlWorkspaceWriteGuard.public_fingerprint(work_dir, scope=scope)
 
 
 @pytest.mark.parametrize("mutation", ["add", "remove", "rename", "empty_directory"])
@@ -245,7 +252,7 @@ def test_registered_immutable_root_detects_tree_changes(tmp_path, mutation):
     payload = immutable / "rows.csv"
     immutable.mkdir(parents=True)
     payload.write_text("row\n")
-    scope = {"immutable_resource_roots": ["datasets/immutable"]}
+    scope = _register_immutable_scope(work_dir, "datasets/immutable")
     guard = HitlWorkspaceWriteGuard.capture_public(work_dir, scope=scope)
 
     if mutation == "add":
@@ -274,7 +281,7 @@ def test_registered_immutable_root_does_not_follow_symlinks(tmp_path):
     second.write_text("second\n")
     link = immutable / "selected.txt"
     link.symlink_to(first)
-    scope = {"immutable_resource_roots": ["datasets/immutable"]}
+    scope = _register_immutable_scope(work_dir, "datasets/immutable")
     guard = HitlWorkspaceWriteGuard.capture_public(work_dir, scope=scope)
 
     first.write_text("changed outside the immutable root\n")
@@ -291,7 +298,7 @@ def test_replacing_registered_root_is_detected(tmp_path):
     work_dir = _workspace(tmp_path)
     immutable = work_dir / "datasets" / "immutable"
     immutable.mkdir(parents=True)
-    scope = {"immutable_resource_roots": ["datasets/immutable"]}
+    scope = _register_immutable_scope(work_dir, "datasets/immutable")
     guard = HitlWorkspaceWriteGuard.capture_public(work_dir, scope=scope)
 
     immutable.rename(work_dir / "datasets" / "old")
@@ -316,8 +323,73 @@ def test_runtime_scope_requires_existing_roots_and_persists(tmp_path):
     assert saved == {
         "runtime_private_roots": ["runtime-private"],
         "immutable_resource_roots": [],
+        "immutable_resource_digests": {},
     }
     assert HitlRuntimeState(work_dir).workspace_guard_scope() == saved
+
+
+def test_runtime_scope_captures_immutable_digest_once(tmp_path):
+    work_dir = _workspace(tmp_path)
+    immutable = work_dir / "datasets" / "immutable"
+    immutable.mkdir(parents=True)
+    (immutable / "rows.csv").write_text("a,b\n1,2\n")
+
+    state = HitlRuntimeState(work_dir)
+    saved = state.set_workspace_guard_scope(immutable_resource_roots=["datasets/immutable"])
+    digest = saved["immutable_resource_digests"]["datasets/immutable"]
+
+    assert len(digest) == 64
+    assert HitlRuntimeState(work_dir).workspace_guard_scope() == saved
+    assert state.set_workspace_guard_scope(immutable_resource_roots=["datasets/immutable"]) == saved
+
+
+def test_runtime_scope_does_not_rebaseline_modified_immutable_root(tmp_path):
+    work_dir = _workspace(tmp_path)
+    immutable = work_dir / "datasets" / "immutable"
+    immutable.mkdir(parents=True)
+    payload = immutable / "rows.csv"
+    payload.write_text("a,b\n1,2\n")
+    state = HitlRuntimeState(work_dir)
+    original = state.set_workspace_guard_scope(immutable_resource_roots=["datasets/immutable"])
+
+    payload.write_text("a,b\n2,1\n")
+
+    with pytest.raises(HitlRuntimeStateError, match="changed after registration"):
+        HitlRuntimeState(work_dir).set_workspace_guard_scope(
+            immutable_resource_roots=["datasets/immutable"]
+        )
+    assert HitlRuntimeState(work_dir).workspace_guard_scope() == original
+
+
+def test_registered_immutable_root_without_digest_fails_closed(tmp_path):
+    work_dir = _workspace(tmp_path)
+    immutable = work_dir / "datasets" / "immutable"
+    immutable.mkdir(parents=True)
+    state = HitlRuntimeState(work_dir)
+    with state._locked():
+        state._state = state._load_unlocked() or state._default()
+        state._state["workspace_guard_scope"] = {
+            "runtime_private_roots": [],
+            "immutable_resource_roots": ["datasets/immutable"],
+        }
+        state._save_unlocked()
+
+    with pytest.raises(HitlRuntimeStateError, match="no trusted registration digest"):
+        HitlRuntimeState(work_dir).set_workspace_guard_scope(
+            immutable_resource_roots=["datasets/immutable"]
+        )
+
+
+def test_public_fingerprint_requires_registered_immutable_digest(tmp_path):
+    work_dir = _workspace(tmp_path)
+    immutable = work_dir / "datasets" / "immutable"
+    immutable.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="without trusted digests"):
+        HitlWorkspaceWriteGuard.public_fingerprint(
+            work_dir,
+            scope={"immutable_resource_roots": ["datasets/immutable"]},
+        )
 
 
 def test_workspace_guard_scope_rejects_unsafe_or_overlapping_roots():

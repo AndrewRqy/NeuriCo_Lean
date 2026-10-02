@@ -97,6 +97,7 @@ class HitlRuntimeState:
             "workspace_guard_scope": {
                 "runtime_private_roots": [],
                 "immutable_resource_roots": [],
+                "immutable_resource_digests": {},
             },
             "next_autoresearch_action": None,
             "rejected_whiteboard_cleanup": None,
@@ -460,30 +461,75 @@ class HitlRuntimeState:
         immutable_resource_roots: Any = (),
     ) -> Dict[str, Any]:
         """Register exact, existing roots before a worker boundary begins."""
-        from core.hitl_workspace_guard import WorkspaceGuardScope
+        from core.hitl_workspace_guard import HitlWorkspaceWriteGuard, WorkspaceGuardScope
 
-        scope = WorkspaceGuardScope.from_value({
-            "runtime_private_roots": runtime_private_roots,
-            "immutable_resource_roots": immutable_resource_roots,
-        })
-        for relative in scope.excluded_roots:
+        requested = WorkspaceGuardScope.from_value(
+            {
+                "runtime_private_roots": runtime_private_roots,
+                "immutable_resource_roots": immutable_resource_roots,
+            }
+        )
+        for relative in requested.excluded_roots:
             path = self.work_dir / relative
             if not path.exists() and not path.is_symlink():
                 raise HitlRuntimeStateError(
-                    "HITL workspace guard roots must exist before registration: "
-                    f"{relative}"
+                    f"HITL workspace guard roots must exist before registration: {relative}"
                 )
             if (
-                relative in scope.runtime_private_roots
+                relative in requested.runtime_private_roots
                 and not path.is_dir()
                 and not path.is_symlink()
             ):
                 raise HitlRuntimeStateError(
-                    "HITL runtime-private roots must be directories or symlinks: "
-                    f"{relative}"
+                    f"HITL runtime-private roots must be directories or symlinks: {relative}"
                 )
+        try:
+            current_digests = {
+                relative: HitlWorkspaceWriteGuard.immutable_resource_digest(
+                    self.work_dir,
+                    relative,
+                )
+                for relative in requested.immutable_resource_roots
+            }
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise HitlRuntimeStateError(str(exc)) from exc
         with self._locked():
             self._state = self._load_unlocked() or self._default()
+            existing = WorkspaceGuardScope.from_value(self._state.get("workspace_guard_scope"))
+            removed = sorted(
+                set(existing.immutable_resource_roots) - set(requested.immutable_resource_roots)
+            )
+            if removed:
+                raise HitlRuntimeStateError(
+                    "HITL immutable resource roots cannot be unregistered: " + ", ".join(removed)
+                )
+
+            existing_digests = dict(existing.immutable_resource_digests)
+            trusted_digests: Dict[str, str] = {}
+            for relative in requested.immutable_resource_roots:
+                if relative in existing.immutable_resource_roots:
+                    expected = existing_digests.get(relative)
+                    if not expected:
+                        raise HitlRuntimeStateError(
+                            "HITL immutable resource has no trusted registration digest: "
+                            + relative
+                        )
+                else:
+                    expected = current_digests[relative]
+                current = current_digests[relative]
+                if current != expected:
+                    raise HitlRuntimeStateError(
+                        "HITL immutable resource changed after registration: " + relative
+                    )
+                trusted_digests[relative] = expected
+
+            scope = WorkspaceGuardScope.from_value(
+                {
+                    "runtime_private_roots": requested.runtime_private_roots,
+                    "immutable_resource_roots": requested.immutable_resource_roots,
+                    "immutable_resource_digests": trusted_digests,
+                }
+            ).require_immutable_resource_digests()
             self._state["workspace_guard_scope"] = scope.to_dict()
             self._save_unlocked()
         return scope.to_dict()
