@@ -9,6 +9,7 @@ updates the plan, and resumes from the current workspace state.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import csv
 import json
 import logging
 import os
@@ -4389,10 +4390,13 @@ def _verify_required_artifact(root: Path, artifact: RequiredArtifact) -> None:
     if path.suffix == ".json":
         json.loads(path.read_text(encoding="utf-8"))
     elif path.suffix == ".csv":
-        import csv
-
-        with path.open(newline="", encoding="utf-8") as f:
-            next(csv.reader(f), None)
+        try:
+            with path.open(newline="", encoding="utf-8") as f:
+                next(csv.reader(f), None)
+        except csv.Error as exc:
+            raise HitlValidationError(
+                f"Required artifact contains invalid CSV: {artifact.path}: {exc}"
+            ) from exc
 
 
 def verify_required_artifacts(work_dir: Path, artifacts: Iterable[RequiredArtifact]) -> None:

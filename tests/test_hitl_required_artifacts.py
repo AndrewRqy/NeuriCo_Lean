@@ -1,5 +1,6 @@
 """Tests for HITL experiment-runner artifact contracts."""
 
+import csv
 import hashlib
 import json
 import sys
@@ -100,6 +101,35 @@ def test_verify_any_of_group(tmp_path, outputs, valid):
     else:
         with pytest.raises(HitlValidationError, match="group 'sample-output' is unsatisfied"):
             verify_required_artifacts(tmp_path, artifacts)
+
+
+def test_any_of_group_skips_invalid_csv_candidate(tmp_path):
+    artifacts = parse_required_artifacts(
+        _write_interface(
+            tmp_path,
+            "| `invalid.csv` | CSV samples | any-of:sample-output |\n"
+            "| `fallback.txt` | Text samples | any-of:sample-output |\n",
+        )
+    )
+    (tmp_path / "invalid.csv").write_text(
+        "x" * (csv.field_size_limit() + 1), encoding="utf-8"
+    )
+    (tmp_path / "fallback.txt").write_text("valid fallback\n", encoding="utf-8")
+
+    verify_required_artifacts(tmp_path, artifacts)
+
+
+def test_invalid_required_csv_is_worker_retryable(tmp_path):
+    _write_interface(tmp_path, "| `samples.csv` | CSV samples | yes |\n")
+    persist_hitl_required_artifact_contract(tmp_path)
+    (tmp_path / "samples.csv").write_text(
+        "x" * (csv.field_size_limit() + 1), encoding="utf-8"
+    )
+
+    result = validate_required_artifact_contract(tmp_path)
+
+    assert result["valid"] is False
+    assert "Required artifact contains invalid CSV: samples.csv" in result["issues"][0]
 
 
 def test_v2_contract_round_trip_and_runtime_validation(tmp_path):
