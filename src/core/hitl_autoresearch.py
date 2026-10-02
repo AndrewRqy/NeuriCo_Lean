@@ -84,6 +84,44 @@ HitlCommentModeHook = Callable[..., Dict[str, Any]]
 MAX_ACTIVE_HITL_FRONTIER_NODES = 10
 
 
+def managed_baseline_construction_eligibility(
+    work_dir: Path,
+    *,
+    pipeline_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Report whether a completed Ordinary workspace can become a frontier root."""
+    work_dir = Path(work_dir)
+    if pipeline_state is None:
+        state_path = work_dir / ".neurico" / "pipeline_state.json"
+        try:
+            pipeline_state = json.loads(state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {
+                "available": False,
+                "reason": "Baseline construction requires a completed Ordinary research workspace.",
+            }
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("The workspace pipeline state is unreadable.") from exc
+    if not isinstance(pipeline_state, dict):
+        raise RuntimeError("The workspace pipeline state is invalid.")
+    if str(pipeline_state.get("workflow", "")).strip().lower() != "ordinary":
+        return {
+            "available": False,
+            "reason": "Baseline construction is available only for Ordinary research workspaces.",
+        }
+    if not bool(pipeline_state.get("completed")):
+        return {
+            "available": False,
+            "reason": "Baseline construction requires a successfully completed Ordinary run.",
+        }
+    if HitlFrontierStore(work_dir).exists():
+        return {
+            "available": False,
+            "reason": "This workspace already has an AutoResearch frontier.",
+        }
+    return {"available": True, "reason": ""}
+
+
 def _adopt_run_hitl_mode(work_dir: Path, hitl_mode: HitlMode | str) -> HitlMode:
     """Adopt a run policy without rewriting completed decisions."""
 
@@ -574,7 +612,7 @@ def construct_bootstrap_hitl_baseline(
     print()
 
     work_dir = Path(work_dir)
-    selected_hitl_mode = _adopt_run_hitl_mode(work_dir, hitl_mode)
+    _adopt_run_hitl_mode(work_dir, hitl_mode)
     runtime_state = HitlRuntimeState(work_dir)
 
     # Resume an interrupted (or already-finished) root publication before
@@ -740,6 +778,206 @@ def construct_bootstrap_hitl_baseline(
     _retire_prepublication_boundary(work_dir, runtime_state)
     completed = _commit_initial_root_publication(work_dir, publication)
     return _initial_node_result_from_publication(work_dir, completed, pipeline_result)
+
+
+def construct_managed_baseline(
+    *,
+    idea: Dict[str, Any],
+    idea_id: str,
+    work_dir: Path,
+    templates_dir: Path,
+    provider: str,
+    full_permissions: bool,
+    rule_maker_timeout: Optional[int],
+    scorer_timeout: Optional[int],
+    manifest_trimmer_timeout: int,
+    autoresearch_history_dir: Optional[Path],
+    hitl_mode: HitlMode | str = HitlMode.AUTO,
+    prepare_workspace: Optional[Callable[[Path], None]] = None,
+    manager: Optional[Any] = None,
+    channel: Optional[Any] = None,
+    manager_config: Optional[Dict[str, Any]] = None,
+) -> InitialAutoResearchNodeResult:
+    """Construct a manager-reviewed AutoResearch baseline from Ordinary work."""
+    from core.pipeline_orchestrator import PipelineState, ResearchPipelineOrchestrator
+
+    work_dir = Path(work_dir)
+    if str(idea_id).strip() and work_dir.name != str(idea_id).strip():
+        raise RuntimeError(
+            "Baseline construction idea id does not match its workspace directory."
+        )
+    selected_mode = _adopt_run_hitl_mode(work_dir, hitl_mode)
+    runtime_state = HitlRuntimeState(work_dir)
+
+    def restore_active_rule_maker_boundary() -> None:
+        """Restore the inner managed-stage boundary before the outer workspace."""
+        state = PipelineState(work_dir)
+        if state.get_runtime_recovery("initial_stage") is None:
+            return
+        ResearchPipelineOrchestrator(
+            work_dir=work_dir,
+            templates_dir=templates_dir,
+            managed_initial_run=True,
+            baseline_construction=True,
+            hitl_mode=selected_mode,
+        ).restore_stopped_initial_run()
+
+    existing_publication = runtime_state.initial_root_publication_transition()
+    if isinstance(existing_publication, dict):
+        PipelineState(work_dir).convert_completed_ordinary_to_autoresearch()
+        pipeline_result = _initial_publication_pipeline_result(
+            work_dir, existing_publication
+        )
+        completed = _commit_initial_root_publication(work_dir, existing_publication)
+        _retire_prepublication_boundary(work_dir, runtime_state)
+        return replace(
+            _initial_node_result_from_publication(
+                work_dir, completed, pipeline_result
+            ),
+            mode="construct_baseline",
+            reason="Manager-approved baseline construction initialized AutoResearch.",
+        )
+
+    pending_boundary = runtime_state.bootstrap_prepublication_boundary()
+    if isinstance(pending_boundary, dict):
+        restore_active_rule_maker_boundary()
+        _rollback_bootstrap_prepublication_boundary(
+            work_dir, HitlRuntimeState(work_dir), pending_boundary
+        )
+
+    if HitlFrontierStore(work_dir).exists():
+        return InitialAutoResearchNodeResult(
+            success=True,
+            mode="construct_baseline",
+            work_dir=str(work_dir),
+            reason="AutoResearch frontier already initialized.",
+        )
+
+    PipelineState.require_compatible_workflow(work_dir, "ordinary")
+    ordinary_state = PipelineState(work_dir, workflow="ordinary")
+    if not bool(ordinary_state.state.get("completed")):
+        raise RuntimeError(
+            "Baseline construction requires a successfully completed Ordinary run."
+        )
+
+    checkpoints = CheckpointManager(work_dir)
+    source = checkpoints.create_checkpoint(
+        "Managed baseline: original completed Ordinary workspace"
+    )
+    agent_local_backup = _bootstrap_agent_local_backup_dir(work_dir)
+    if agent_local_backup.exists():
+        shutil.rmtree(agent_local_backup, ignore_errors=True)
+    agent_local_backup.mkdir(parents=True, exist_ok=True)
+    agent_local_existed = _snapshot_bootstrap_agent_local(
+        work_dir, agent_local_backup
+    )
+    runtime_state.begin_bootstrap_prepublication_boundary(
+        {
+            "source_sha": source.sha,
+            "agent_local_backup": str(agent_local_backup),
+            "agent_local_existed": agent_local_existed,
+        }
+    )
+
+    def restore_source() -> None:
+        checkpoints.restore_checkpoint(
+            source.sha,
+            clean_untracked_public=True,
+            remove_hidden_scoring=True,
+        )
+        _restore_bootstrap_agent_local(
+            work_dir, agent_local_backup, agent_local_existed
+        )
+
+    recovery_started = False
+
+    def fail_and_restore() -> None:
+        nonlocal recovery_started
+        if recovery_started:
+            return
+        recovery_started = True
+        restore_active_rule_maker_boundary()
+        restore_source()
+        _retire_prepublication_boundary(work_dir, HitlRuntimeState(work_dir))
+
+    try:
+        if prepare_workspace is not None:
+            prepare_workspace(work_dir)
+        orchestrator = ResearchPipelineOrchestrator(
+            work_dir=work_dir,
+            templates_dir=templates_dir,
+            hitl_manager=manager,
+            hitl_channel=channel,
+            hitl_manager_config=manager_config,
+            managed_initial_run=True,
+            baseline_construction=True,
+            hitl_mode=selected_mode,
+        )
+        pipeline_result = orchestrator.run_managed_baseline_construction(
+            idea=idea,
+            provider=provider,
+            full_permissions=full_permissions,
+            manifest_trimmer_timeout=manifest_trimmer_timeout,
+            rule_maker_timeout=rule_maker_timeout,
+            scorer_timeout=scorer_timeout,
+        )
+        scorer_result = dict(
+            (pipeline_result.get("stages") or {}).get("scorer") or {}
+        )
+        score = scorer_result.get("results")
+        if not pipeline_result.get("success") or not isinstance(score, dict):
+            fail_and_restore()
+            return InitialAutoResearchNodeResult(
+                success=False,
+                mode="construct_baseline",
+                work_dir=str(work_dir),
+                reason="Managed baseline construction failed.",
+                pipeline_result=pipeline_result,
+            )
+
+        atomic_write_json(
+            work_dir / ".neurico" / "pipeline_results.json",
+            pipeline_result,
+        )
+
+        plan_path = work_dir / "plans" / "experiment_runner_plan.md"
+        plan_text = (
+            plan_path.read_text(encoding="utf-8")
+            if plan_path.is_file()
+            else "Baseline constructed from a completed Ordinary research workspace."
+        )
+        history_root, _ = resolve_autoresearch_history_root(
+            work_dir, autoresearch_history_dir
+        )
+        publication = runtime_state.begin_initial_root_publication_transition(
+            {
+                "plan_text": plan_text,
+                "objective_score": {
+                    "scorer_result": scorer_result,
+                    "results": score,
+                },
+                "reason_for_acceptance": (
+                    "Manager approved the constructed evaluator and scored baseline."
+                ),
+                "history_root": encode_hitl_history_root(work_dir, history_root),
+                "scoring_ref": str(scorer_result.get("scoring_ref", "")).strip(),
+            }
+        )
+        orchestrator.state.convert_completed_ordinary_to_autoresearch()
+    except Exception:
+        if runtime_state.initial_root_publication_transition() is None:
+            fail_and_restore()
+        raise
+
+    _retire_prepublication_boundary(work_dir, runtime_state)
+    completed = _commit_initial_root_publication(work_dir, publication)
+    return replace(
+        _initial_node_result_from_publication(
+            work_dir, completed, pipeline_result
+        ),
+        mode="construct_baseline",
+        reason="Manager-approved baseline construction initialized AutoResearch.",
+    )
 
 
 def _initial_frontier_acceptance_reason(work_dir: Path) -> str:

@@ -151,6 +151,7 @@ def _with_hitl_workspace_run_ownership(method):
             arguments.arguments["hitl_research"]
             or arguments.arguments["hitl_autoresearch"]
             or arguments.arguments["hitl_continue_autoresearch"]
+            or arguments.arguments["hitl_construct_baseline"]
         )
         if not hitl_interface:
             return method(self, *args, **kwargs)
@@ -173,6 +174,7 @@ def _with_hitl_workspace_run_ownership(method):
         mode = (
             "continue"
             if arguments.arguments["hitl_continue_autoresearch"]
+            or arguments.arguments["hitl_construct_baseline"]
             or (
                 arguments.arguments["hitl_research"]
                 and (work_dir / ".neurico" / "pipeline_state.json").is_file()
@@ -180,26 +182,43 @@ def _with_hitl_workspace_run_ownership(method):
             else "fresh"
         )
         hitl_mode = normalize_hitl_mode(arguments.arguments["hitl_mode"])
+        baseline_construction = bool(arguments.arguments["hitl_construct_baseline"])
+        workflow = (
+            "ordinary"
+            if arguments.arguments["hitl_research"] or baseline_construction
+            else "autoresearch"
+        )
         from core.hitl_run_control import active_hitl_run_stop_control
 
         owns_control = active_hitl_run_stop_control() is None
         with ExitStack() as stack:
-            control = _enter_workspace_run_context(stack, work_dir, owner={
-                "idea_id": idea_id,
-                "interface": str(hitl_interface),
-                "mode": mode,
-                "workflow": (
-                    "ordinary" if arguments.arguments["hitl_research"] else "autoresearch"
-                ),
-                "hitl_mode": hitl_mode.value,
-                "provider": str(arguments.arguments["provider"]),
-            }, install_control=not bool(arguments.arguments["hitl_research"]))
+            control = _enter_workspace_run_context(
+                stack,
+                work_dir,
+                owner={
+                    "idea_id": idea_id,
+                    "interface": str(hitl_interface),
+                    "mode": mode,
+                    "operation": (
+                        "construct_baseline" if baseline_construction else "research"
+                    ),
+                    "workflow": workflow,
+                    "hitl_mode": hitl_mode.value,
+                    "provider": str(arguments.arguments["provider"]),
+                },
+                install_control=not bool(arguments.arguments["hitl_research"]),
+            )
             from core.pipeline_orchestrator import PipelineState
 
-            PipelineState.require_compatible_workflow(
-                work_dir,
-                "ordinary" if arguments.arguments["hitl_research"] else "autoresearch",
-            )
+            PipelineState.require_compatible_workflow(work_dir, workflow)
+            if baseline_construction:
+                from core.hitl_autoresearch import (
+                    managed_baseline_construction_eligibility,
+                )
+
+                eligibility = managed_baseline_construction_eligibility(work_dir)
+                if not eligibility.get("available"):
+                    raise RuntimeError(str(eligibility.get("reason", "")).strip())
             # A renderer can request stop while the detached worker is still
             # waiting to acquire this lease. Honor that request before the
             # runner mutates any research state.
@@ -217,7 +236,7 @@ def _with_hitl_workspace_run_ownership(method):
                     owns_control
                     and control is not None
                     and control.requested()
-                    and not arguments.arguments["hitl_research"]
+                    and workflow == "autoresearch"
                 )
                 if stopped:
                     if control.stop_reason() == "budget_exhausted":
@@ -362,6 +381,7 @@ class ResearchRunner:
         hitl_research: Optional[str] = None,
         hitl_autoresearch: Optional[str] = None,
         hitl_continue_autoresearch: Optional[str] = None,
+        hitl_construct_baseline: Optional[str] = None,
         hitl_manager_port: int = 7890,
         hitl_manager_no_browser: bool = False,
         hitl_host: Optional[Any] = None,
@@ -396,6 +416,8 @@ class ResearchRunner:
                 ``web`` or ``cli``.
             hitl_continue_autoresearch: Human interface for continuing an
                 existing HITL AutoResearch workspace: ``web`` or ``cli``.
+            hitl_construct_baseline: Human interface for constructing a managed
+                AutoResearch baseline from completed Ordinary research.
             hitl_work_dir: Authoritative workspace selected by the HITL launcher.
                 Internal to managed execution; GitHub publication cannot replace it.
 
@@ -417,6 +439,7 @@ class ResearchRunner:
             "--hitl-research": hitl_research,
             "--hitl-autoresearch": hitl_autoresearch,
             "--hitl-continue-autoresearch": hitl_continue_autoresearch,
+            "managed baseline construction": hitl_construct_baseline,
         }
         invalid_hitl_modes = [
             name for name, mode in hitl_modes.items() if mode not in {None, "web", "cli"}
@@ -426,7 +449,12 @@ class ResearchRunner:
         selected_hitl_modes = [name for name, mode in hitl_modes.items() if mode]
         if len(selected_hitl_modes) > 1:
             raise ValueError("Choose one HITL entry mode: " + ", ".join(selected_hitl_modes))
-        hitl = hitl_research or hitl_autoresearch or hitl_continue_autoresearch
+        hitl = (
+            hitl_research
+            or hitl_autoresearch
+            or hitl_continue_autoresearch
+            or hitl_construct_baseline
+        )
         if hitl_work_dir is not None and not hitl:
             raise ValueError("hitl_work_dir is valid only with a managed research entry mode.")
         selected_hitl_mode = normalize_hitl_mode(hitl_mode)
@@ -469,6 +497,29 @@ class ResearchRunner:
                     + ", ".join(incompatible)
                 + "."
             )
+        if hitl_construct_baseline:
+            incompatible = [
+                name
+                for name, enabled in (
+                    ("--pause-after-resources", pause_after_resources),
+                    ("--enable-scoring", scoring_enabled),
+                    ("--bootstrap-rule-maker", bootstrap_mode),
+                    ("--autoresearch", autoresearch),
+                    ("--continue-autoresearch", continue_autoresearch),
+                    ("--bootstrap-autoresearch-baseline", bootstrap_autoresearch_baseline),
+                    (
+                        "--hitl-bootstrap-autoresearch-baseline",
+                        hitl_bootstrap_autoresearch_baseline,
+                    ),
+                )
+                if enabled
+            ]
+            if incompatible:
+                raise ValueError(
+                    "Managed baseline construction cannot be combined with "
+                    + ", ".join(incompatible)
+                    + "."
+                )
         if hitl and not multi_agent:
             raise ValueError("Managed research requires the multi-agent pipeline.")
         if continue_recover and not continue_autoresearch:
@@ -499,6 +550,7 @@ class ResearchRunner:
                 ("--continue-autoresearch", continue_autoresearch),
                 ("--bootstrap-autoresearch-baseline", bootstrap_autoresearch_baseline),
                 ("--hitl-bootstrap-autoresearch-baseline", hitl_bootstrap_autoresearch_baseline),
+                ("managed baseline construction", bool(hitl_construct_baseline)),
             )
             if enabled
         ]
@@ -824,35 +876,40 @@ class ResearchRunner:
         }:
             preserve_initial_inputs = True
 
-        # Create subdirectories
-        (work_dir / "logs").mkdir(parents=True, exist_ok=True)
-        (work_dir / "results").mkdir(parents=True, exist_ok=True)
-        (work_dir / "artifacts").mkdir(parents=True, exist_ok=True)
-        # Only create notebooks/ when using scribe
-        if use_scribe:
-            (work_dir / "notebooks").mkdir(parents=True, exist_ok=True)
+        if not hitl_construct_baseline:
+            # Create subdirectories
+            (work_dir / "logs").mkdir(parents=True, exist_ok=True)
+            (work_dir / "results").mkdir(parents=True, exist_ok=True)
+            (work_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+            # Only create notebooks/ when using scribe
+            if use_scribe:
+                (work_dir / "notebooks").mkdir(parents=True, exist_ok=True)
 
-        # Copy helper scripts and backend-selected skills to workspace.
-        if not preserve_initial_inputs:
-            self._copy_workspace_resources(work_dir, compute_backend=compute_backend)
+            # Copy helper scripts and backend-selected skills to workspace.
+            if not preserve_initial_inputs:
+                self._copy_workspace_resources(work_dir, compute_backend=compute_backend)
 
-        # Stage user-declared local resources (datasets, functions) into the
-        # workspace and rewrite their paths workspace-relative, so no agent
-        # ever depends on host paths. Hard error if a declared path is gone.
-        if preserve_initial_inputs:
-            # Reconnect the saved contract without refreshing reviewed files
-            # from host-side sources. Integrity checks still use the submitted idea.
-            from core.local_resources import staged_function_mismatches
+            # Stage user-declared local resources (datasets, functions) into the
+            # workspace and rewrite their paths workspace-relative, so no agent
+            # ever depends on host paths. Hard error if a declared path is gone.
+            if preserve_initial_inputs:
+                # Reconnect the saved contract without refreshing reviewed files
+                # from host-side sources. Integrity checks still use the submitted idea.
+                from core.local_resources import staged_function_mismatches
 
-            issues = staged_function_mismatches(work_dir, idea)
-            if issues:
-                raise RuntimeError("Cannot resume reviewed inputs: " + "; ".join(issues))
-            stage_local_resources(
-                work_dir, idea, preserve_existing=True,
-                write_workspace_contract=not (hitl and not hitl_research),
-            )
-        else:
-            stage_local_resources(work_dir, idea)
+                issues = staged_function_mismatches(work_dir, idea)
+                if issues:
+                    raise RuntimeError(
+                        "Cannot resume reviewed initial inputs: " + "; ".join(issues)
+                    )
+                stage_local_resources(
+                    work_dir,
+                    idea,
+                    preserve_existing=True,
+                    write_workspace_contract=not (hitl and not hitl_research),
+                )
+            else:
+                stage_local_resources(work_dir, idea)
 
         if hitl:
             from core.hitl_lock import select_hitl_manager_provider
@@ -890,6 +947,67 @@ class ResearchRunner:
             if not callable(set_manager_provider):
                 raise RuntimeError("The HITL host cannot select a manager backend.")
             set_manager_provider(provider)
+
+        if hitl_construct_baseline:
+            success = False
+            baseline_result: Dict[str, Any] = {}
+            hitl_stop_requested = False
+            github_publication: Optional[Dict[str, Any]] = None
+            try:
+                from core.hitl_autoresearch import construct_managed_baseline
+
+                node_result = construct_managed_baseline(
+                    idea=idea,
+                    idea_id=idea_id,
+                    work_dir=work_dir,
+                    templates_dir=self.project_root / "templates",
+                    provider=provider,
+                    full_permissions=full_permissions,
+                    rule_maker_timeout=None,
+                    scorer_timeout=None,
+                    manifest_trimmer_timeout=manifest_trimmer_timeout,
+                    autoresearch_history_dir=autoresearch_history_dir,
+                    hitl_mode=selected_hitl_mode,
+                    prepare_workspace=lambda baseline_work_dir: self._copy_workspace_resources(
+                        baseline_work_dir,
+                        compute_backend=compute_backend,
+                    ),
+                    manager=hitl_host.manager,
+                    channel=hitl_host.channel,
+                    manager_config=hitl_host.manager.config,
+                )
+                baseline_result = {
+                    "success": node_result.success,
+                    "mode": node_result.mode,
+                    "current_best_sha": node_result.current_best_sha,
+                    "reason": node_result.reason,
+                }
+                success = node_result.success
+            except HitlRunStopRequested:
+                hitl_stop_requested = True
+                raise
+            except Exception as e:
+                print(f"\n❌ Managed baseline construction error: {e}")
+                success = False
+            finally:
+                github_publication = self._finalize_research(
+                    idea_id,
+                    work_dir,
+                    github_url,
+                    title,
+                    provider,
+                    success,
+                    push_existing=hitl_work_dir is not None,
+                    publish_github=not hitl_stop_requested,
+                )
+
+            return {
+                "work_dir": work_dir,
+                "github_url": github_url,
+                "success": success,
+                "construct_baseline": baseline_result,
+                "github_publication": github_publication,
+            }
 
         if continue_autoresearch:
             success = False
