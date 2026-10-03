@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import signal
 import sys
-import threading
 from typing import Any
-from uuid import uuid4
 
 # NeuriCo's core modules use the historical top-level ``core`` namespace.
 # The ACP child starts from Harbor's task workspace, so establish the same
@@ -18,11 +15,7 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 sys.path.insert(0, str(_SRC_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from core.hitl_run_control import (  # noqa: E402
-    HitlRunStopControl,
-    HitlRunStopRequested,
-    activate_hitl_run_stop_control,
-)
+from core.hitl_run_control import HitlRunStopRequested  # noqa: E402
 from core.idea_manager import IdeaManager  # noqa: E402
 from core.runner import ResearchRunner  # noqa: E402
 
@@ -38,90 +31,58 @@ def execute_autoresearch(
     workspace: Path,
     ideas_dir: Path,
     iterations: int = 1,
-    time_limit_seconds: float | None = None,
+    time_limit_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Submit a Harbor task through NeuriCo and run headless Auto HITL AutoResearch."""
     if iterations < 1:
         raise ValueError("AutoResearch iterations must be at least 1")
-    if time_limit_seconds is not None and time_limit_seconds <= 0:
-        raise ValueError("AutoResearch time limit must be greater than 0")
+    if time_limit_seconds is not None and (
+        type(time_limit_seconds) is not int or time_limit_seconds <= 0
+    ):
+        raise ValueError("AutoResearch time limit must be a positive integer")
 
     task = HarborAutoResearchTask(instruction=instruction, workspace=workspace)
-    control = HitlRunStopControl(workspace, f"harbor-{uuid4().hex}")
-    deadline_timer: threading.Timer | None = None
-    deadline_reached = threading.Event()
-    previous_sigint: Any = None
+    idea_manager = IdeaManager(ideas_dir)
+    idea_id = idea_manager.submit_idea(build_harbor_idea(task), validate=True)
 
-    def request_stop(requested_by: str) -> None:
-        control.request(requested_by=requested_by)
-
-    def request_deadline_stop() -> None:
-        deadline_reached.set()
-        request_stop("harbor_time_limit")
-
+    # The idea metadata points at Harbor's existing repository, so the local
+    # runner selects it as the authoritative AutoResearch workspace. A direct
+    # runner invocation hosts the manager headlessly; "cli" selects the managed
+    # entry surface without starting a browser, while Auto mode forbids human
+    # escalation and lets the manager resolve every review boundary itself.
+    # NeuriCo owns the persisted deadline, stop propagation, and selected-node
+    # finalization. The adapter only translates its completed budget stop at the
+    # child-process boundary.
+    runner = ResearchRunner(use_github=False)
     try:
-        if threading.current_thread() is threading.main_thread():
-            previous_sigint = signal.getsignal(signal.SIGINT)
-            signal.signal(signal.SIGINT, lambda _signum, _frame: request_stop("signal:sigint"))
-        if time_limit_seconds is not None:
-            deadline_timer = threading.Timer(
-                time_limit_seconds,
-                request_deadline_stop,
-            )
-            deadline_timer.daemon = True
-            deadline_timer.start()
-
-        with activate_hitl_run_stop_control(control):
-            idea_manager = IdeaManager(ideas_dir)
-            idea_id = idea_manager.submit_idea(build_harbor_idea(task), validate=True)
-
-            # The idea metadata points at Harbor's existing repository, so the local
-            # runner selects it as the authoritative AutoResearch workspace. A direct
-            # runner invocation hosts the manager headlessly; "cli" selects the managed
-            # entry surface without starting a browser, while Auto mode forbids human
-            # escalation and lets the manager resolve every review boundary itself.
-            runner = ResearchRunner(use_github=False)
-            try:
-                return runner.run_research(
-                    idea_id=idea_id,
-                    provider="codex",
-                    full_permissions=True,
-                    multi_agent=True,
-                    use_scribe=False,
-                    write_paper=False,
-                    scoring_enabled=True,
-                    benchmark_mode=True,
-                    hitl_autoresearch="cli",
-                    hitl_manager_no_browser=True,
-                    hitl_mode="auto",
-                    autoresearch_iterations=iterations,
-                )
-            except HitlRunStopRequested:
-                from core.hitl_autoresearch import (
-                    recover_interrupted_hitl_autoresearch_attempt,
-                )
-
-                recovery = recover_interrupted_hitl_autoresearch_attempt(workspace)
-                timed_out = deadline_reached.is_set()
-                reason = "configured time limit" if timed_out else "cancellation request"
-                print(
-                    f"NeuriCo stopped cleanly after the {reason}; "
-                    "the last retained checkpoint remains in the Harbor workspace.",
-                    flush=True,
-                )
-                return {
-                    "success": False,
-                    "stopped": True,
-                    "time_limit_reached": timed_out,
-                    "recovery": recovery,
-                }
-    finally:
-        if deadline_timer is not None:
-            deadline_timer.cancel()
-            deadline_timer.join()
-        control.clear()
-        if previous_sigint is not None:
-            signal.signal(signal.SIGINT, previous_sigint)
+        return runner.run_research(
+            idea_id=idea_id,
+            provider="codex",
+            full_permissions=True,
+            multi_agent=True,
+            use_scribe=False,
+            write_paper=False,
+            scoring_enabled=True,
+            benchmark_mode=True,
+            hitl_autoresearch="cli",
+            hitl_manager_no_browser=True,
+            hitl_mode="auto",
+            autoresearch_iterations=iterations,
+            time_limit_seconds=time_limit_seconds,
+        )
+    except HitlRunStopRequested as stop:
+        if "budget_exhausted" not in str(stop):
+            raise
+        print(
+            "NeuriCo reached its native run-time limit and completed AutoResearch "
+            "budget finalization in the Harbor workspace.",
+            flush=True,
+        )
+        return {
+            "success": False,
+            "stopped": True,
+            "time_limit_reached": True,
+        }
 
 
 def main() -> None:
@@ -130,7 +91,7 @@ def main() -> None:
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--ideas-dir", type=Path, required=True)
     parser.add_argument("--iterations", type=int, default=1)
-    parser.add_argument("--time-limit-seconds", type=float)
+    parser.add_argument("--time-limit-seconds", type=int)
     args = parser.parse_args()
 
     instruction = args.instruction_file.read_text(encoding="utf-8")
