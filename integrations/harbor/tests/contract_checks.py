@@ -1,7 +1,6 @@
 import asyncio
 import os
 import sys
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -120,9 +119,11 @@ def test_iteration_override_must_be_positive() -> None:
 def test_time_limit_override_is_optional_and_positive() -> None:
     assert _autoresearch_time_limit({}) is None
     assert _autoresearch_time_limit({"NEURICO_HARBOR_TIME_LIMIT_SECONDS": "1740"}) == 1740
-    with pytest.raises(ValueError, match="greater than 0"):
+    with pytest.raises(ValueError, match="positive integer"):
         _autoresearch_time_limit({"NEURICO_HARBOR_TIME_LIMIT_SECONDS": "0"})
-    with pytest.raises(ValueError, match="must be a number"):
+    with pytest.raises(ValueError, match="positive integer"):
+        _autoresearch_time_limit({"NEURICO_HARBOR_TIME_LIMIT_SECONDS": "1.5"})
+    with pytest.raises(ValueError, match="positive integer"):
         _autoresearch_time_limit({"NEURICO_HARBOR_TIME_LIMIT_SECONDS": "later"})
 
 
@@ -229,6 +230,7 @@ def test_child_entrypoint_invokes_manager_driven_auto_hitl_runner(
         workspace=tmp_path,
         ideas_dir=tmp_path / "ideas",
         iterations=2,
+        time_limit_seconds=1740,
     )
 
     assert result["success"] is True
@@ -248,18 +250,48 @@ def test_child_entrypoint_invokes_manager_driven_auto_hitl_runner(
         "hitl_manager_no_browser": True,
         "hitl_mode": "auto",
         "autoresearch_iterations": 2,
+        "time_limit_seconds": 1740,
     }
     assert "autoresearch" not in captured["run"]
 
 
-def test_child_uses_same_hitl_control_module_as_neurico_runner() -> None:
-    import core.hitl_run_control as core_control
+def test_child_translates_native_budget_stop_after_neurico_finalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
 
-    assert runner_module.HitlRunStopControl is core_control.HitlRunStopControl
-    assert runner_module.HitlRunStopRequested is core_control.HitlRunStopRequested
+    class FakeManager:
+        def __init__(self, ideas_dir: Path):
+            pass
+
+        def submit_idea(self, idea: dict[str, Any], validate: bool) -> str:
+            return "harbor-idea"
+
+    class FakeRunner:
+        def __init__(self, *, use_github: bool):
+            pass
+
+        def run_research(self, **kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            raise runner_module.HitlRunStopRequested(
+                "HITL run stopped: budget_exhausted."
+            )
+
+    monkeypatch.setattr(runner_module, "IdeaManager", FakeManager)
+    monkeypatch.setattr(runner_module, "ResearchRunner", FakeRunner)
+    result = execute_autoresearch(
+        instruction="Run until the benchmark budget expires.",
+        workspace=tmp_path,
+        ideas_dir=tmp_path / "ideas",
+        time_limit_seconds=20,
+    )
+
+    assert result["stopped"] is True
+    assert result["time_limit_reached"] is True
+    assert captured["time_limit_seconds"] == 20
 
 
-def test_child_time_limit_uses_hitl_stop_and_returns_last_checkpoint(
+def test_child_does_not_reclassify_non_budget_native_stop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class FakeManager:
@@ -274,30 +306,20 @@ def test_child_time_limit_uses_hitl_stop_and_returns_last_checkpoint(
             pass
 
         def run_research(self, **kwargs: Any) -> dict[str, Any]:
-            from core.hitl_run_control import raise_if_hitl_run_stop_requested
-
-            while True:
-                raise_if_hitl_run_stop_requested()
-                threading.Event().wait(0.005)
+            raise runner_module.HitlRunStopRequested(
+                "HITL run stopped: provider_unavailable."
+            )
 
     monkeypatch.setattr(runner_module, "IdeaManager", FakeManager)
     monkeypatch.setattr(runner_module, "ResearchRunner", FakeRunner)
-    monkeypatch.setattr(
-        "core.hitl_autoresearch.recover_interrupted_hitl_autoresearch_attempt",
-        lambda _workspace: None,
-    )
 
-    result = execute_autoresearch(
-        instruction="Run until the benchmark budget expires.",
-        workspace=tmp_path,
-        ideas_dir=tmp_path / "ideas",
-        time_limit_seconds=0.02,
-    )
-
-    assert result["stopped"] is True
-    assert result["time_limit_reached"] is True
-    control_dir = tmp_path / ".neurico" / "hitl" / "control"
-    assert not list(control_dir.glob("stop.harbor-*.json"))
+    with pytest.raises(runner_module.HitlRunStopRequested, match="provider_unavailable"):
+        execute_autoresearch(
+            instruction="Run this benchmark.",
+            workspace=tmp_path,
+            ideas_dir=tmp_path / "ideas",
+            time_limit_seconds=20,
+        )
 
 
 def test_acp_prompt_launches_autoresearch_not_direct_inference(
