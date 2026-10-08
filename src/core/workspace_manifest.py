@@ -36,6 +36,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+from core.research_environment import RESEARCH_ENV_METADATA_RELATIVE_PATHS
+
 
 MANIFEST_VERSION = "1"
 
@@ -175,6 +177,10 @@ _RAW_ROLE_RULES: list[tuple[str, str]] = [
     ("Dockerfile", "scaffolding"),
     (".gitignore", "scaffolding"),
     ("LICENSE", "scaffolding"),
+
+    # Dependency metadata remains part of the experiment surface even though
+    # its canonical location is inside NeuriCo's runtime namespace.
+    *((path.as_posix(), "scaffolding") for path in RESEARCH_ENV_METADATA_RELATIVE_PATHS),
 
     # NeuriCo internals — not part of experiment surface.
     (".neurico/**", "pipeline_state"),

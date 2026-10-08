@@ -1,0 +1,171 @@
+"""Regression tests for the relocated research dependency environment."""
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from core.autoresearch import CHECKPOINT_EXCLUDE_PATTERNS, CheckpointManager  # noqa: E402
+from core.hitl_scoring_workspace import isolated_scoring_workspace  # noqa: E402
+from core.hitl_workspace_inspection import HitlWorkspaceInspector  # noqa: E402
+from core.hitl_workspace_guard import HitlWorkspaceWriteGuard  # noqa: E402
+from core.scorer import _resolve_python_executable  # noqa: E402
+from core.scoring_seal import seal_scoring_files  # noqa: E402
+from core.workspace_manifest import build_manifest  # noqa: E402
+
+
+def _research_env(work_dir: Path) -> Path:
+    return work_dir / ".neurico" / "research-env"
+
+
+def test_scorer_rejects_ambiguous_task_or_legacy_root_venv(tmp_path):
+    root_python = tmp_path / ".venv" / "bin" / "python"
+    root_python.parent.mkdir(parents=True)
+    root_python.write_text("")
+
+    with pytest.raises(RuntimeError, match="will not use that ambiguous environment"):
+        _resolve_python_executable(tmp_path)
+
+
+def test_scorer_uses_relocated_environment_instead_of_task_root_venv(tmp_path):
+    root_python = tmp_path / ".venv" / "bin" / "python"
+    root_python.parent.mkdir(parents=True)
+    root_python.write_text("")
+
+    research_python = _research_env(tmp_path) / ".venv" / "bin" / "python"
+    research_python.parent.mkdir(parents=True)
+    research_python.write_text("")
+
+    assert _resolve_python_executable(tmp_path) == str(research_python)
+
+
+def test_scorer_without_any_workspace_environment_uses_runtime_python(tmp_path):
+    assert _resolve_python_executable(tmp_path) == sys.executable
+
+
+def test_isolated_scorer_links_only_the_relocated_environment(tmp_path):
+    work_dir = tmp_path / "workspace"
+    work_dir.mkdir()
+    (work_dir / ".gitignore").write_text(".venv/\n")
+    (work_dir / "candidate.py").write_text("VALUE = 1\n")
+
+    root_python = work_dir / ".venv" / "bin" / "python"
+    root_python.parent.mkdir(parents=True)
+    root_python.write_text("")
+    research_python = _research_env(work_dir) / ".venv" / "bin" / "python"
+    research_python.parent.mkdir(parents=True)
+    research_python.write_text("")
+    (_research_env(work_dir) / "pyproject.toml").write_text(
+        '[project]\nname = "research-workspace"\n'
+    )
+
+    scoring = work_dir / "scoring"
+    scoring.mkdir()
+    (scoring / "eval.py").write_text("print('score')\n")
+    (scoring / "targets.json").write_text("{}\n")
+    (scoring / "interface.md").write_text("Candidate contract\n")
+    source_sha = CheckpointManager(work_dir).create_checkpoint("candidate").sha
+    sealed_dir = seal_scoring_files(work_dir)
+
+    with isolated_scoring_workspace(
+        work_dir=work_dir,
+        source_sha=source_sha,
+        sealed_dir=sealed_dir,
+    ) as (scorer_dir, _manifest_sha):
+        scorer_venv = _research_env(scorer_dir) / ".venv"
+        assert scorer_venv.is_symlink()
+        assert scorer_venv.resolve() == (_research_env(work_dir) / ".venv").resolve()
+        assert _resolve_python_executable(scorer_dir) == str(scorer_venv / "bin" / "python")
+        assert not (scorer_dir / ".venv").exists()
+
+
+def test_checkpoint_tracks_metadata_but_does_not_walk_virtualenv(tmp_path, monkeypatch):
+    env_dir = _research_env(tmp_path)
+    venv_dir = env_dir / ".venv"
+    venv_dir.mkdir(parents=True)
+    (tmp_path / ".gitignore").write_text(".venv/\n")
+    (env_dir / "pyproject.toml").write_text('[project]\nname = "research-workspace"\n')
+    (env_dir / "uv.lock").write_text("version = 1\n")
+    (venv_dir / "pyvenv.cfg").write_text("home = /python\n")
+    (tmp_path / "README.md").write_text("research workspace\n")
+
+    manager = CheckpointManager(tmp_path)
+    manager.create_checkpoint("initial research workspace")
+    tracked = set(manager.repo.git.ls_files().splitlines())
+
+    assert ".neurico/research-env/pyproject.toml" in tracked
+    assert ".neurico/research-env/uv.lock" in tracked
+    assert not any(path.startswith(".neurico/research-env/.venv/") for path in tracked)
+    assert ".neurico/research-env/.venv/" not in CHECKPOINT_EXCLUDE_PATTERNS
+
+    original_rglob = Path.rglob
+
+    def reject_venv_walk(path, pattern):
+        assert path != venv_dir
+        return original_rglob(path, pattern)
+
+    monkeypatch.setattr(Path, "rglob", reject_venv_walk)
+    (tmp_path / "README.md").write_text("updated research workspace\n")
+    manager.create_checkpoint("updated research workspace")
+
+
+def test_public_guard_observes_metadata_but_not_virtualenv_contents(tmp_path):
+    env_dir = _research_env(tmp_path)
+    venv_dir = env_dir / ".venv"
+    venv_dir.mkdir(parents=True)
+    project = env_dir / "pyproject.toml"
+    project.write_text('[project]\nname = "research-workspace"\n')
+    (venv_dir / "pyvenv.cfg").write_text("home = /python\n")
+
+    guard = HitlWorkspaceWriteGuard.capture_public(tmp_path)
+    (venv_dir / "installed-package.txt").write_text("private environment state\n")
+    assert guard.require_unchanged()["valid"]
+
+    project.write_text('[project]\nname = "research-workspace"\ndependencies = ["numpy"]\n')
+    result = guard.require_unchanged()
+    assert not result["valid"]
+    assert ".neurico/research-env/pyproject.toml" in result["issues"][0]
+
+
+def test_manifest_reindexes_relocated_dependency_metadata(tmp_path):
+    env_dir = _research_env(tmp_path)
+    venv_dir = env_dir / ".venv"
+    venv_dir.mkdir(parents=True)
+    (env_dir / "pyproject.toml").write_text('[project]\nname = "research-workspace"\n')
+    (env_dir / "uv.lock").write_text("version = 1\n")
+    (venv_dir / "pyvenv.cfg").write_text("home = /python\n")
+
+    files = {entry["path"]: entry for entry in build_manifest(tmp_path)["files"]}
+
+    assert files[".neurico/research-env/pyproject.toml"]["role"] == "scaffolding"
+    assert files[".neurico/research-env/uv.lock"]["role"] == "scaffolding"
+    assert not any("/.venv/" in path for path in files)
+
+
+def test_manager_inspection_exposes_only_research_dependency_metadata(tmp_path):
+    env_dir = _research_env(tmp_path)
+    venv_dir = env_dir / ".venv"
+    venv_dir.mkdir(parents=True)
+    (env_dir / "pyproject.toml").write_text('[project]\nname = "research-workspace"\n')
+    private_state = tmp_path / ".neurico" / "hitl" / "runtime.json"
+    private_state.parent.mkdir(parents=True)
+    private_state.write_text('{"secret": true}\n')
+    (venv_dir / "installed-package.txt").write_text("private environment state\n")
+    inspector = HitlWorkspaceInspector(tmp_path)
+
+    root_entries = json.loads(inspector.list_workspace())["entries"]
+    neurico_entries = json.loads(inspector.list_workspace(".neurico"))["entries"]
+    env_entries = json.loads(inspector.list_workspace(".neurico/research-env"))["entries"]
+    search = json.loads(inspector.search_workspace("research-workspace"))
+    private_search = json.loads(inspector.search_workspace("secret"))
+
+    assert {entry["name"] for entry in root_entries} == {".neurico/"}
+    assert {entry["name"] for entry in neurico_entries} == {"research-env/"}
+    assert {entry["name"] for entry in env_entries} == {"pyproject.toml"}
+    assert search["matches"][0]["path"] == ".neurico/research-env/pyproject.toml"
+    assert private_search["matches"] == []

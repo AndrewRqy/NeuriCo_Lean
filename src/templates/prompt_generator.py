@@ -18,6 +18,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.config_loader import ConfigLoader, normalize_domain
 from core.compute_backend import get_runtime_compute_backend
 from core.agent_cli import provider_skill_root
+from core.research_environment import (
+    RESEARCH_ENV_RELATIVE_ROOT,
+    RESEARCH_PYTHON_RELATIVE_PATH,
+    RESEARCH_PROJECT_RELATIVE_PATH,
+    RESEARCH_REQUIREMENTS_RELATIVE_PATH,
+    RESEARCH_VENV_RELATIVE_ROOT,
+)
 
 # The scoring-only obligation for a required_for_evaluation function, stated
 # once. It binds eval.py in the scoring pipeline, so it must never appear in
@@ -76,6 +83,13 @@ class PromptGenerator:
         self.env.filters['upper'] = str.upper
         self.env.filters['lower'] = str.lower
         self.env.filters['title'] = str.title
+        self.env.globals.update(
+            research_env_dir=RESEARCH_ENV_RELATIVE_ROOT.as_posix(),
+            research_python_path=RESEARCH_PYTHON_RELATIVE_PATH.as_posix(),
+            research_project_path=RESEARCH_PROJECT_RELATIVE_PATH.as_posix(),
+            research_requirements_path=RESEARCH_REQUIREMENTS_RELATIVE_PATH.as_posix(),
+            research_venv_dir=RESEARCH_VENV_RELATIVE_ROOT.as_posix(),
+        )
 
     def _load_template_with_domain_override(self, template_path: str, domain: str) -> str:
         """

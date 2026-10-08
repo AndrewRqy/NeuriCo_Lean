@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from core.hitl_util import sha256_file
+from core.research_environment import RESEARCH_ENV_METADATA_RELATIVE_PATHS
 
 _BUILTIN_RUNTIME_PRIVATE_ROOTS = {
     ".claude",
@@ -28,6 +29,9 @@ _EXCLUDED_PUBLIC_FILES = {
     # so snapshotting it turns the runtime's own write into a worker violation.
     "STATE.md",
 }
+_BUILTIN_PUBLIC_FILES_WITHIN_PRIVATE_ROOTS = tuple(
+    path.as_posix() for path in RESEARCH_ENV_METADATA_RELATIVE_PATHS
+)
 
 
 @dataclass(frozen=True)
@@ -332,6 +336,21 @@ class HitlWorkspaceWriteGuard:
             if state.sha256 != immutable_digests[relative]:
                 raise RuntimeError("Immutable resource changed after registration: " + relative)
             states[relative] = state
+
+        # Dependency declarations retain the same public-boundary semantics
+        # they had at the workspace root. Only these files are observed; the
+        # virtual environment and all other .neurico state remain private.
+        for relative in _BUILTIN_PUBLIC_FILES_WITHIN_PRIVATE_ROOTS:
+            path = root / relative
+            try:
+                stats = path.lstat()
+            except FileNotFoundError:
+                continue
+            states[relative] = HitlWorkspaceWriteGuard._file_state(
+                path,
+                stats,
+                hash_content=False,
+            )
 
         pending_directories = [root]
         while pending_directories:

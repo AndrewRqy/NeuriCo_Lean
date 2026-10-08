@@ -20,7 +20,7 @@ Systematic paper discovery and prioritization for research projects.
 Run the helper script from your workspace:
 
 ```bash
-python .claude/skills/paper-finder/scripts/find_papers.py "your research topic"
+.neurico/research-env/.venv/bin/python .claude/skills/paper-finder/scripts/find_papers.py "your research topic"
 ```
 
 Options:
@@ -30,7 +30,7 @@ Options:
 
 Example:
 ```bash
-python .claude/skills/paper-finder/scripts/find_papers.py "hypothesis generation with large language models" --mode fast
+.neurico/research-env/.venv/bin/python .claude/skills/paper-finder/scripts/find_papers.py "hypothesis generation with large language models" --mode fast
 ```
 
 ## Search Strategy
@@ -126,16 +126,13 @@ This preserves all formatting perfectly (unlike text extraction which loses form
 **Dependencies:**
 ```bash
 # Using uv (recommended):
-uv add pypdf
-
-# Or with pip:
-pip install pypdf
+uv add --project .neurico/research-env pypdf
 ```
 
 **How to run:**
 
 ```bash
-python .claude/skills/paper-finder/scripts/pdf_chunker.py <pdf_path>
+.neurico/research-env/.venv/bin/python .claude/skills/paper-finder/scripts/pdf_chunker.py <pdf_path>
 ```
 
 Options:

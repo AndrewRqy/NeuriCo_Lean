@@ -53,6 +53,7 @@ from core.compute_backend import (
 )
 from core.hitl_mode import HitlMode, normalize_hitl_mode
 from core.hitl_run_control import HitlRunStopRequested, raise_if_hitl_run_stop_requested
+from core.research_environment import reject_ambiguous_root_venv
 from templates.prompt_generator import PromptGenerator
 from templates.research_agent_instructions import generate_instructions
 
@@ -834,6 +835,15 @@ class ResearchRunner:
 
                 print(f"📁 Working directory: {work_dir}\n")
 
+        if (
+            (continue_autoresearch and autoresearch_iterations != 0)
+            or bootstrap_mode
+            or bootstrap_autoresearch_baseline
+            or hitl_bootstrap_autoresearch_baseline
+            or bool(hitl_construct_baseline)
+        ):
+            reject_ambiguous_root_venv(work_dir)
+
         if hitl and not hitl_research:
             # Metadata above is persisted from the original idea. Downstream
             # workers receive research constraints without YAML run policy.
@@ -1609,6 +1619,7 @@ https://github.com/ChicagoHAI/neurico
 
         print(f"   Work dir: {work_dir}")
         print()
+        reject_ambiguous_root_venv(work_dir)
         self._copy_workspace_resources(work_dir, compute_backend=compute_backend)
         stage_local_resources(work_dir, idea)
 

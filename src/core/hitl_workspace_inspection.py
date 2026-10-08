@@ -14,6 +14,10 @@ import subprocess
 from typing import Any, Iterable
 
 from core.hitl_util import sha256_file
+from core.research_environment import (
+    RESEARCH_ENV_METADATA_RELATIVE_PATHS,
+    RESEARCH_ENV_RELATIVE_ROOT,
+)
 from core.scoring_seal import SEALED_PATHS
 
 _HIDDEN_PATH_PARTS = {
@@ -25,6 +29,13 @@ _HIDDEN_PATH_PARTS = {
     ".venv",
     "__pycache__",
 }
+_PUBLIC_PATHS_WITHIN_HIDDEN_ROOTS = frozenset(
+    {
+        ".neurico",
+        RESEARCH_ENV_RELATIVE_ROOT.as_posix(),
+        *(path.as_posix() for path in RESEARCH_ENV_METADATA_RELATIVE_PATHS),
+    }
+)
 _PROTECTED_RELATIVE_PATHS = frozenset(
     path.rstrip("/") for path in SEALED_PATHS if not path.endswith("/")
 )
@@ -180,7 +191,19 @@ class HitlWorkspaceInspector:
             command.append("-i")
         if normalized_glob:
             command.extend(["--glob", normalized_glob])
-        command.extend(["-e", normalized_pattern, str(target)])
+        search_targets = [target]
+        if target.is_dir():
+            # Keep broad .neurico traversal blocked while restoring the same
+            # search visibility dependency metadata had at the workspace root.
+            for relative in RESEARCH_ENV_METADATA_RELATIVE_PATHS:
+                candidate = (self.work_dir / Path(relative)).resolve()
+                try:
+                    candidate.relative_to(target)
+                except ValueError:
+                    continue
+                if candidate.is_file() and not self._is_protected(candidate):
+                    search_targets.append(candidate)
+        command.extend(["-e", normalized_pattern, *(str(path) for path in search_targets)])
         try:
             completed = subprocess.run(
                 command,
@@ -313,10 +336,15 @@ class HitlWorkspaceInspector:
 
     def _is_hidden(self, path: Path) -> bool:
         try:
-            relative_parts = path.resolve().relative_to(self.work_dir).parts
+            relative = path.resolve().relative_to(self.work_dir)
         except ValueError:
             return True
-        return any(part in _HIDDEN_PATH_PARTS for part in relative_parts)
+        normalized = relative.as_posix()
+        if normalized == ".neurico":
+            return not (self.work_dir / Path(RESEARCH_ENV_RELATIVE_ROOT)).is_dir()
+        if normalized in _PUBLIC_PATHS_WITHIN_HIDDEN_ROOTS:
+            return False
+        return any(part in _HIDDEN_PATH_PARTS for part in relative.parts)
 
     def _is_protected(self, path: Path) -> bool:
         try:
