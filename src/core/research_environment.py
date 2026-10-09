@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 
 
-RESEARCH_ENV_RELATIVE_ROOT = PurePosixPath(".neurico/research-env")
+RESEARCH_ENV_RELATIVE_ROOT = PurePosixPath("neurico-research-env")
 RESEARCH_PROJECT_RELATIVE_PATH = RESEARCH_ENV_RELATIVE_ROOT / "pyproject.toml"
 RESEARCH_LOCK_RELATIVE_PATH = RESEARCH_ENV_RELATIVE_ROOT / "uv.lock"
 RESEARCH_REQUIREMENTS_RELATIVE_PATH = RESEARCH_ENV_RELATIVE_ROOT / "requirements.txt"
@@ -56,5 +56,5 @@ def reject_ambiguous_root_venv(work_dir: Path) -> None:
             "The NeuriCo research environment is missing, but a root .venv exists. "
             "NeuriCo will not use that ambiguous environment because it may belong "
             "to the task or verifier. For a confirmed legacy NeuriCo workspace, "
-            "rebuild its dependencies under .neurico/research-env before continuing."
+            "rebuild its dependencies under neurico-research-env before continuing."
         )

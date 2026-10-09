@@ -176,13 +176,13 @@ This preserves all formatting perfectly (unlike text extraction which loses form
 **Dependencies:**
 ```bash
 # Using uv (recommended):
-uv add --project .neurico/research-env pypdf
+uv add --project neurico-research-env pypdf
 ```
 
 **How to run:**
 
 ```bash
-.neurico/research-env/.venv/bin/python .claude/skills/literature-review/scripts/pdf_chunker.py <pdf_path>
+neurico-research-env/.venv/bin/python .claude/skills/literature-review/scripts/pdf_chunker.py <pdf_path>
 ```
 
 Options:

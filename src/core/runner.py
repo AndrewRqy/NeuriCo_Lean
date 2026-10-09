@@ -1619,7 +1619,6 @@ https://github.com/ChicagoHAI/neurico
 
         print(f"   Work dir: {work_dir}")
         print()
-        reject_ambiguous_root_venv(work_dir)
         self._copy_workspace_resources(work_dir, compute_backend=compute_backend)
         stage_local_resources(work_dir, idea)
 

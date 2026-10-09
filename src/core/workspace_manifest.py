@@ -178,8 +178,7 @@ _RAW_ROLE_RULES: list[tuple[str, str]] = [
     (".gitignore", "scaffolding"),
     ("LICENSE", "scaffolding"),
 
-    # Dependency metadata remains part of the experiment surface even though
-    # its canonical location is inside NeuriCo's runtime namespace.
+    # NeuriCo's dependency declarations are public experiment scaffolding.
     *((path.as_posix(), "scaffolding") for path in RESEARCH_ENV_METADATA_RELATIVE_PATHS),
 
     # NeuriCo internals — not part of experiment surface.

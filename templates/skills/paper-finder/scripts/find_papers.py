@@ -6,9 +6,9 @@ Calls the paper-finder API if available, otherwise returns graceful fallback.
 This script lives in .claude/skills/paper-finder/scripts/ when copied to workspaces.
 
 Usage:
-    .neurico/research-env/.venv/bin/python \
+    neurico-research-env/.venv/bin/python \
         .claude/skills/paper-finder/scripts/find_papers.py "query about papers"
-    .neurico/research-env/.venv/bin/python \
+    neurico-research-env/.venv/bin/python \
         .claude/skills/paper-finder/scripts/find_papers.py "query" --mode diligent
 """
 
@@ -28,7 +28,7 @@ def find_papers(query: str, mode: str = "fast", url: str = "http://localhost:800
         return {
             "error": (
                 "httpx not installed. Install with: "
-                "uv add --project .neurico/research-env httpx"
+                "uv add --project neurico-research-env httpx"
             ),
             "fallback": True,
         }

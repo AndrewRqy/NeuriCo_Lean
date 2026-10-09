@@ -62,7 +62,7 @@ def test_bundled_research_skills_do_not_recommend_direct_pip(skill_path: Path):
     skill = skill_path.read_text(encoding="utf-8")
 
     assert "pip install" not in skill
-    assert "uv add --project .neurico/research-env" in skill
+    assert "uv add --project neurico-research-env" in skill
 
 
 @pytest.mark.parametrize("domain", ["general", *DOMAINS])
@@ -80,7 +80,7 @@ def test_generated_prompts_use_the_canonical_research_environment(domain: str):
 
     prompts = (resource_prompt, session_prompt)
     for prompt in prompts:
-        assert ".neurico/research-env/.venv" in prompt
-        assert "uv add --project .neurico/research-env" in prompt
+        assert "neurico-research-env/.venv" in prompt
+        assert "uv add --project neurico-research-env" in prompt
         assert "{{ research_" not in prompt
-    assert ".neurico/research-env/.venv/bin/python" in "\n".join(prompts)
+    assert "neurico-research-env/.venv/bin/python" in "\n".join(prompts)
