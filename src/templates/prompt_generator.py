@@ -19,11 +19,9 @@ from core.config_loader import ConfigLoader, normalize_domain
 from core.compute_backend import get_runtime_compute_backend
 from core.agent_cli import provider_skill_root
 from core.research_environment import (
-    RESEARCH_ENV_RELATIVE_ROOT,
-    RESEARCH_PYTHON_RELATIVE_PATH,
-    RESEARCH_PROJECT_RELATIVE_PATH,
-    RESEARCH_REQUIREMENTS_RELATIVE_PATH,
-    RESEARCH_VENV_RELATIVE_ROOT,
+    WorkspaceMode,
+    normalize_workspace_mode,
+    research_environment_template_variables,
 )
 
 # The scoring-only obligation for a required_for_evaluation function, stated
@@ -56,13 +54,19 @@ class PromptGenerator:
     structured prompt templates.
     """
 
-    def __init__(self, template_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        template_dir: Optional[Path] = None,
+        *,
+        workspace_mode: WorkspaceMode | str = WorkspaceMode.NATIVE,
+    ):
         """
         Initialize prompt generator.
 
         Args:
             template_dir: Root directory containing template files.
                          Defaults to project_root/templates/
+            workspace_mode: Dependency layout rendered into agent instructions.
         """
         if template_dir is None:
             # Assume we're in src/templates/, go up to project root
@@ -70,6 +74,7 @@ class PromptGenerator:
             template_dir = project_root / "templates"
 
         self.template_dir = Path(template_dir)
+        self.workspace_mode = normalize_workspace_mode(workspace_mode)
 
         # Set up Jinja2 environment
         self.env = Environment(
@@ -84,11 +89,7 @@ class PromptGenerator:
         self.env.filters['lower'] = str.lower
         self.env.filters['title'] = str.title
         self.env.globals.update(
-            research_env_dir=RESEARCH_ENV_RELATIVE_ROOT.as_posix(),
-            research_python_path=RESEARCH_PYTHON_RELATIVE_PATH.as_posix(),
-            research_project_path=RESEARCH_PROJECT_RELATIVE_PATH.as_posix(),
-            research_requirements_path=RESEARCH_REQUIREMENTS_RELATIVE_PATH.as_posix(),
-            research_venv_dir=RESEARCH_VENV_RELATIVE_ROOT.as_posix(),
+            **research_environment_template_variables(self.workspace_mode)
         )
 
     def _load_template_with_domain_override(self, template_path: str, domain: str) -> str:

@@ -33,13 +33,12 @@ def _resolve_python_executable(work_dir: Path) -> str:
     """
     Pick the Python interpreter to invoke eval.py with.
 
-    The experiment_runner creates the workspace's NeuriCo-managed research
-    environment during setup and installs all task-specific dependencies
-    there. eval.py typically imports those same dependencies (numpy, torch,
-    sklearn, etc.), so it must run under the research interpreter rather than
-    the orchestrator's. Falls back to sys.executable only if the workspace has
-    neither a research environment nor an ambiguous root venv (e.g., during a
-    scorer-only smoke test).
+    The experiment_runner creates the workspace mode's research environment
+    during setup and installs task-specific dependencies there. eval.py
+    typically imports those same dependencies (numpy, torch, sklearn, etc.),
+    so it must run under the selected research interpreter rather than the
+    orchestrator's. In embedded mode a root .venv is never used because it may
+    belong to the task or verifier.
     """
     posix, windows = research_python_candidates(work_dir)
     if posix.exists() and posix.is_file():
@@ -65,9 +64,9 @@ def run_scorer(
                   runner's outputs.
         timeout: Max execution time for eval.py in seconds.
         python_executable: Python binary to use. Defaults to the workspace's
-                  NeuriCo-managed research interpreter (where the runner
-                  installed deps), falling back to sys.executable only when no
-                  root venv could be mistaken for task or verifier state.
+                  workspace mode's research interpreter (where the runner
+                  installed dependencies), falling back to sys.executable when
+                  that mode has no environment yet.
         idea: The trusted submitted idea (held by the orchestrator, outside
                   the worker-visible workspace). Required so the staged-
                   function integrity check always fails closed against it.

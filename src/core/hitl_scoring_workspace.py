@@ -20,7 +20,7 @@ import tempfile
 from core.hitl_git import run_git
 from core.scoring_seal import SEALED_PATHS, verify_sealed_scoring_manifest
 from core.hitl_util import atomic_write_bytes, sha256_file
-from core.research_environment import research_venv_dir
+from core.research_environment import copy_workspace_mode_state, research_venv_dir
 
 
 def _safe_tarfile_module(stdlib_module: Any = tarfile) -> Any:
@@ -412,6 +412,7 @@ def isolated_scoring_workspace(
         )
 
         _prepare_scoring_directory(scorer_dir)
+        copy_workspace_mode_state(work_dir, scorer_dir)
         copied = 0
         for relative in SEALED_PATHS:
             source = sealed_root / relative.rstrip("/")
