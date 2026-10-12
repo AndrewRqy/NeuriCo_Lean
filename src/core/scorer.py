@@ -162,6 +162,12 @@ def run_scorer(
     else:
         try:
             parsed_results = json.loads(results_path.read_text(encoding='utf-8'))
+        except UnicodeDecodeError as e:
+            read_err = f"results.json is not valid UTF-8: {e}"
+            error = f"{error}; {read_err}" if error else read_err
+        except OSError as e:
+            read_err = f"results.json could not be read: {e}"
+            error = f"{error}; {read_err}" if error else read_err
         except json.JSONDecodeError as e:
             json_err = f"results.json is not valid JSON: {e}"
             error = f"{error}; {json_err}" if error else json_err
@@ -210,6 +216,6 @@ def load_scoring_results(work_dir: Path) -> Optional[Dict[str, Any]]:
         return None
     try:
         results = json.loads(results_path.read_text(encoding='utf-8'))
-    except json.JSONDecodeError:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return results if isinstance(results, dict) else None
