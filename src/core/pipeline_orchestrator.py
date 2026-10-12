@@ -603,14 +603,16 @@ class ResearchPipelineOrchestrator:
                 # A deliberately reopened stage must not inherit its old final
                 # response through the shared command's idempotent retry path.
                 state.clear_completed_worker_command(str(previous["request_key"]))
-        rollback = (
-            HitlStageRollback.capture(
-                self.work_dir,
-                message,
-                include_rule_maker_repair_state=repair,
-            )
-            if repair
-            else HitlStageRollback.capture(self.work_dir, message)
+        capture_artifacts = (
+            self.hitl_autoresearch
+            and stage == "experiment_runner"
+            and hitl_artifact_contract_path(self.work_dir).is_file()
+        )
+        rollback = HitlStageRollback.capture(
+            self.work_dir,
+            message,
+            include_rule_maker_repair_state=repair,
+            capture_artifacts=capture_artifacts,
         )
         if self.managed_initial_run:
             self.state.set_runtime_recovery(
