@@ -185,14 +185,18 @@ class HitlStageRollback:
     checkpoint_sha: str
     state_store: HitlGitStateStore
     hitl_snapshot: HitlGitSnapshot
+    artifact_snapshot_id: str | None = None
 
     def descriptor(self) -> Dict[str, Any]:
-        return {
+        descriptor = {
             "checkpoint_sha": self.checkpoint_sha,
             "hitl_snapshot_ref": self.hitl_snapshot.ref,
             "hitl_snapshot_commit": self.hitl_snapshot.commit_sha,
             "hitl_snapshot_paths": list(self.hitl_snapshot.paths),
         }
+        if self.artifact_snapshot_id:
+            descriptor["artifact_snapshot_id"] = self.artifact_snapshot_id
+        return descriptor
 
     @classmethod
     def from_descriptor(cls, work_dir: Path, record: Dict[str, Any]) -> "HitlStageRollback":
@@ -220,7 +224,22 @@ class HitlStageRollback:
         actual = run_git(root, "rev-parse", "--verify", ref).stdout.strip()
         if actual != commit:
             raise RuntimeError("Initial stage private rollback snapshot changed.")
-        return cls(root, checkpoint, store, HitlGitSnapshot(ref, commit, paths))
+        artifact_snapshot_id = str(record.get("artifact_snapshot_id", "")).strip() or None
+        if artifact_snapshot_id:
+            from core.hitl_artifact_snapshots import validate_hitl_artifact_snapshot
+
+            validate_hitl_artifact_snapshot(
+                root,
+                artifact_snapshot_id,
+                source_checkpoint_sha=checkpoint,
+            )
+        return cls(
+            root,
+            checkpoint,
+            store,
+            HitlGitSnapshot(ref, commit, paths),
+            artifact_snapshot_id,
+        )
 
     @classmethod
     def capture(
@@ -229,6 +248,7 @@ class HitlStageRollback:
         checkpoint_message: str,
         *,
         include_rule_maker_repair_state: bool = False,
+        capture_artifacts: bool = False,
     ) -> "HitlStageRollback":
         from core.autoresearch import CheckpointManager
 
@@ -240,21 +260,41 @@ class HitlStageRollback:
             if include_rule_maker_repair_state
             else state_store.create_rollback_snapshot()
         )
-        return cls(
-            work_dir=root,
-            checkpoint_sha=checkpoint.sha,
-            state_store=state_store,
-            hitl_snapshot=hitl_snapshot,
-        )
+        artifact_snapshot_id: str | None = None
+        try:
+            if capture_artifacts:
+                from core.hitl_artifact_snapshots import capture_hitl_artifact_snapshot
+
+                artifact_snapshot_id = f"rollback-{hitl_snapshot.ref.rsplit('/', 1)[-1]}"
+                capture_hitl_artifact_snapshot(
+                    root,
+                    snapshot_id=artifact_snapshot_id,
+                    source_checkpoint_sha=checkpoint.sha,
+                )
+            return cls(
+                work_dir=root,
+                checkpoint_sha=checkpoint.sha,
+                state_store=state_store,
+                hitl_snapshot=hitl_snapshot,
+                artifact_snapshot_id=artifact_snapshot_id,
+            )
+        except Exception:
+            try:
+                state_store.discard(hitl_snapshot)
+            except Exception:
+                pass
+            raise
 
     def restore(self, runtime: Any, reason: str, *, cleanup_label: str) -> None:
         """Restore the boundary in the established public-then-private order."""
-        from core.autoresearch import CheckpointManager
+        from core.hitl_artifact_snapshots import restore_hitl_checkpoint_with_artifacts
 
         runtime.abandon_pending_worker_request_for_rollback(reason)
-        CheckpointManager(self.work_dir).restore_checkpoint(
-            self.checkpoint_sha,
-            clean_untracked_public=True,
+        runtime.clear_idea_tool_context()
+        restore_hitl_checkpoint_with_artifacts(
+            self.work_dir,
+            checkpoint_sha=self.checkpoint_sha,
+            artifact_snapshot_id=self.artifact_snapshot_id,
         )
         self.state_store.restore(self.hitl_snapshot)
         runtime.reload_manager_after_state_restore()
@@ -266,3 +306,16 @@ class HitlStageRollback:
             self.state_store.discard(self.hitl_snapshot)
         except Exception as cleanup_error:
             print(f"⚠️  Could not clean {cleanup_label} HITL rollback snapshot: {cleanup_error}")
+        if self.artifact_snapshot_id:
+            try:
+                from core.hitl_artifact_snapshots import discard_hitl_artifact_snapshot
+
+                discard_hitl_artifact_snapshot(
+                    self.work_dir,
+                    self.artifact_snapshot_id,
+                )
+            except Exception as cleanup_error:
+                print(
+                    f"⚠️  Could not clean {cleanup_label} HITL artifact snapshot: "
+                    f"{cleanup_error}"
+                )

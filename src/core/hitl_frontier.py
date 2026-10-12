@@ -196,6 +196,7 @@ class HitlFrontierStore:
         plan_text: str,
         objective_score: Dict[str, Any],
         reason_for_acceptance: str,
+        artifact_snapshot_id: str | None = None,
     ) -> None:
         node_sha = self._require_sha(node_sha, "root node SHA")
         if self.exists():
@@ -213,6 +214,7 @@ class HitlFrontierStore:
                 plan_text=plan_text,
                 objective_score=objective_score,
                 reason_for_acceptance=reason_for_acceptance,
+                artifact_snapshot_id=artifact_snapshot_id,
             )
             self._retain_git_object("frontier", node_sha)
             return
@@ -222,6 +224,7 @@ class HitlFrontierStore:
             plan_text=plan_text,
             objective_score=objective_score,
             reason_for_acceptance=reason_for_acceptance,
+            artifact_snapshot_id=artifact_snapshot_id,
         )
         self._write_state(
             selected=node_sha,
@@ -263,6 +266,7 @@ class HitlFrontierStore:
         plan_text: str,
         objective_score: Dict[str, Any],
         reason_for_acceptance: str,
+        artifact_snapshot_id: str | None = None,
     ) -> None:
         node_sha = self._require_sha(node_sha, "node SHA")
         if parent_node_sha is not None:
@@ -275,15 +279,16 @@ class HitlFrontierStore:
             raise HitlFrontierError("Accepted frontier node requires non-empty experiment plan")
         if not str(reason_for_acceptance).strip():
             raise HitlFrontierError("Accepted frontier node requires reason_for_acceptance")
-        self._write_json(
-            self.paths.node_json(node_sha),
-            {
-                "parent_node_sha": parent_node_sha,
-                "node_sha": node_sha,
-                "objective_score": objective_score,
-                "reason_for_acceptance": str(reason_for_acceptance).strip(),
-            },
-        )
+        payload = {
+            "parent_node_sha": parent_node_sha,
+            "node_sha": node_sha,
+            "objective_score": objective_score,
+            "reason_for_acceptance": str(reason_for_acceptance).strip(),
+        }
+        normalized_snapshot_id = str(artifact_snapshot_id or "").strip()
+        if normalized_snapshot_id:
+            payload["artifact_snapshot_id"] = normalized_snapshot_id
+        self._write_json(self.paths.node_json(node_sha), payload)
         plan_path = self.paths.node_plan(node_sha)
         self._write_text(plan_path, str(plan_text))
 
@@ -299,6 +304,7 @@ class HitlFrontierStore:
         accepted: bool,
         reason: str,
         plan_text: str,
+        artifact_snapshot_id: str | None = None,
     ) -> Dict[str, Any]:
         parent = self._require_sha(parent_node_sha, "parent node SHA")
         candidate = self._require_sha(candidate_node_sha, "candidate node SHA")
@@ -329,6 +335,7 @@ class HitlFrontierStore:
                         plan_text=plan_text,
                         objective_score=objective_score,
                         reason_for_acceptance=str(existing.get("reason_for_acceptance", reason)),
+                        artifact_snapshot_id=artifact_snapshot_id,
                     )
                     active = list(current["active_frontier_node_shas"])
                     if proposal_type == "exploitation":
@@ -363,6 +370,7 @@ class HitlFrontierStore:
                 plan_text=plan_text,
                 objective_score=objective_score,
                 reason_for_acceptance=reason,
+                artifact_snapshot_id=artifact_snapshot_id,
             )
             active = list(current["active_frontier_node_shas"])
             if proposal_type == "exploitation":
@@ -442,6 +450,14 @@ class HitlFrontierStore:
             "reason_for_acceptance": record.get("reason_for_acceptance"),
             "attempt_history": self._direction_attempt_history(node),
         }
+
+    def artifact_snapshot_id(self, node_sha: str) -> str | None:
+        """Return runtime-only artifact state associated with one frontier node."""
+        node = self._require_sha(node_sha, "frontier node SHA")
+        value = str(
+            self._read_json(self.paths.node_json(node)).get("artifact_snapshot_id", "")
+        ).strip()
+        return value or None
 
     def _direction_attempt_history(
         self,

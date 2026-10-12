@@ -18,6 +18,11 @@ import tarfile
 import tempfile
 
 from core.hitl_git import run_git
+from core.hitl_artifact_snapshots import (
+    capture_hitl_artifact_snapshot,
+    materialize_hitl_artifact_snapshot,
+)
+from core.hitl_paths import hitl_artifact_contract_path
 from core.scoring_seal import SEALED_PATHS, verify_sealed_scoring_manifest
 from core.hitl_util import atomic_write_bytes, sha256_file
 
@@ -38,12 +43,55 @@ class HitlScoringWorkspaceError(RuntimeError):
     """Raised when runtime cannot prepare an isolated HITL scorer workspace."""
 
 
+def prepare_isolated_scoring_artifacts(
+    *,
+    work_dir: Path,
+    runtime_state: Any,
+    request_key: str,
+    source_checkpoint_sha: str,
+    source_workspace_fingerprint: str,
+    source_workspace_fingerprint_scope: Dict[str, Any],
+    cached_score: Optional[Dict[str, Any]],
+) -> tuple[Optional[str], Dict[str, Any]]:
+    """Durably capture ignored evaluator artifacts for one scoring handoff."""
+    snapshot_id = str(
+        (cached_score or {}).get("artifact_snapshot_id", "")
+    ).strip()
+    if not snapshot_id and hitl_artifact_contract_path(work_dir).is_file():
+        snapshot_id = str(request_key).strip()
+    record: Dict[str, Any] = {
+        "status": "prepared",
+        "source_checkpoint_sha": str(source_checkpoint_sha).strip(),
+        "source_workspace_fingerprint": str(source_workspace_fingerprint).strip(),
+        "source_workspace_fingerprint_scope": dict(source_workspace_fingerprint_scope),
+    }
+    if snapshot_id:
+        record["artifact_snapshot_id"] = snapshot_id
+        runtime_state.update_pending_worker_command(
+            request_key,
+            isolated_scoring={**record, "status": "capturing"},
+        )
+        capture_hitl_artifact_snapshot(
+            work_dir,
+            snapshot_id=snapshot_id,
+            source_checkpoint_sha=source_checkpoint_sha,
+        )
+    runtime_state.update_pending_worker_command(
+        request_key,
+        isolated_scoring=record,
+    )
+    return snapshot_id or None, record
+
+
 def scoring_source_workspace_fingerprint(
     pending: Dict[str, Any],
     cached_score: Optional[Dict[str, Any]],
 ) -> str:
     """Return the reviewed fingerprint for a fresh or resumed scoring handoff."""
-    if isinstance(cached_score, dict) and cached_score.get("status") == "prepared":
+    if isinstance(cached_score, dict) and cached_score.get("status") in {
+        "capturing",
+        "prepared",
+    }:
         source_fingerprint = str(
             cached_score.get("source_workspace_fingerprint", "")
         ).strip()
@@ -59,7 +107,10 @@ def scoring_source_workspace_scope(
     """Return the frozen scope paired with the reviewed scoring fingerprint."""
     from core.hitl_workspace_guard import WorkspaceGuardScope
 
-    if isinstance(cached_score, dict) and cached_score.get("status") == "prepared":
+    if isinstance(cached_score, dict) and cached_score.get("status") in {
+        "capturing",
+        "prepared",
+    }:
         cached_scope = cached_score.get("source_workspace_fingerprint_scope")
         if cached_scope is not None:
             return WorkspaceGuardScope.from_value(cached_scope).to_dict()
@@ -353,6 +404,7 @@ def isolated_scoring_workspace(
     work_dir: Path,
     source_sha: str,
     sealed_dir: Optional[Path],
+    artifact_snapshot_id: Optional[str] = None,
 ) -> Iterator[Tuple[Path, str]]:
     """Yield a temporary evaluator-complete worktree owned by runtime.
 
@@ -410,6 +462,22 @@ def isolated_scoring_workspace(
             source_sha=normalized_sha,
         )
 
+        # Prepared datasets are public research inputs. They can be ignored by
+        # Git, so the detached candidate tree may not contain them even though
+        # the worker used them to produce the candidate being scored.
+        public_datasets = work_dir / "datasets"
+        if public_datasets.is_dir():
+            _copy_path(public_datasets, scorer_dir / "datasets")
+
+        if str(artifact_snapshot_id or "").strip():
+            materialize_hitl_artifact_snapshot(
+                work_dir,
+                snapshot_id=str(artifact_snapshot_id),
+                destination=scorer_dir,
+            )
+
+        # Evaluator-owned files are restored last. Even a malformed artifact
+        # contract cannot replace the sealed scorer implementation.
         _prepare_scoring_directory(scorer_dir)
         copied = 0
         for relative in SEALED_PATHS:
@@ -422,13 +490,6 @@ def isolated_scoring_workspace(
             raise HitlScoringWorkspaceError(
                 "The sealed evaluator payload contains none of the required scoring inputs."
             )
-
-        # Prepared datasets are public research inputs. They can be ignored by
-        # Git, so the detached candidate tree may not contain them even though
-        # the worker used them to produce the candidate being scored.
-        public_datasets = work_dir / "datasets"
-        if public_datasets.is_dir():
-            _copy_path(public_datasets, scorer_dir / "datasets")
 
         # The experiment's configured environment is untracked, but ordinary
         # scoring uses it for task dependencies. Make it available only inside
@@ -459,6 +520,7 @@ def run_isolated_scorer(
     sealed_dir: Optional[Path],
     scorer: Callable[[Path], Dict[str, Any]],
     temporary_ref: Optional[str] = None,
+    artifact_snapshot_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run a scorer privately and commit its result from the immutable source tree.
 
@@ -471,6 +533,7 @@ def run_isolated_scorer(
         work_dir=public_work_dir,
         source_sha=source_sha,
         sealed_dir=sealed_dir,
+        artifact_snapshot_id=artifact_snapshot_id,
     ) as (scorer_work_dir, evaluator_manifest_sha256):
         raw_result = scorer(scorer_work_dir)
         if not isinstance(raw_result, dict):

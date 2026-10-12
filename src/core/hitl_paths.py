@@ -54,5 +54,10 @@ def hitl_artifact_contract_path(work_dir: Path) -> Path:
     return hitl_state_dir(work_dir) / "artifact_contract.json"
 
 
+def hitl_artifact_snapshots_dir(work_dir: Path) -> Path:
+    """Private ignored-artifact snapshots retained outside Git-backed HITL state."""
+    return Path(work_dir) / ".neurico" / "hitl-artifacts"
+
+
 def hitl_research_state_path(work_dir: Path) -> Path:
     return Path(work_dir) / ".neurico" / "research_state.json"

@@ -57,9 +57,14 @@ from core.agent_cli import (
 )
 from core.scorer import run_scorer
 from core.hitl_scoring_workspace import (
+    prepare_isolated_scoring_artifacts,
     run_isolated_scorer,
     scoring_source_workspace_fingerprint,
     scoring_source_workspace_scope,
+)
+from core.hitl_artifact_snapshots import (
+    discard_hitl_artifact_snapshot,
+    restore_hitl_checkpoint_with_artifacts,
 )
 from core.hitl_runtime_state import HitlRuntimeState, worker_command_requires_resume
 from core.scoring_seal import (
@@ -93,6 +98,7 @@ from core.hitl_run_control import (
     HitlRunStopRequested,
 )
 from core.hitl_mode import HitlMode, normalize_hitl_mode
+from core.hitl_paths import hitl_artifact_contract_path
 from core.hitl_stage_runtime import (
     HitlStageRollback,
     run_plan_centered_hitl_stage,
@@ -534,6 +540,9 @@ class ResearchPipelineOrchestrator:
         if not ref.startswith("refs/neurico/hitl-rollback/"):
             raise RuntimeError("Invalid initial-stage snapshot reference.")
         HitlGitStateStore(self.work_dir).discard(ref)
+        artifact_snapshot_id = str(boundary.get("artifact_snapshot_id", "")).strip()
+        if artifact_snapshot_id:
+            discard_hitl_artifact_snapshot(self.work_dir, artifact_snapshot_id)
         self.state.clear_runtime_recovery("initial_stage")
 
     def restore_stopped_initial_run(self) -> Optional[Dict[str, str]]:
@@ -623,6 +632,8 @@ class ResearchPipelineOrchestrator:
         if self.hitl_autoresearch:
             experiment = self.state.get_runtime_recovery("experiment_runner") or {}
             if experiment.get("hitl_snapshot_ref") == rollback.hitl_snapshot.ref:
+                runtime.abandon_pending_worker_request_for_rollback(reason)
+                runtime.clear_idea_tool_context()
                 self._recover_experiment_runner_from_runtime_checkpoint()
                 runtime.reload_manager_after_state_restore()
                 runtime.clear_idea_tool_context()
@@ -722,13 +733,35 @@ class ResearchPipelineOrchestrator:
                 raise RuntimeError(
                     "Completed initial experiment has no durable scored checkpoint/result."
                 )
-            from core.autoresearch import CheckpointManager
-
-            CheckpointManager(self.work_dir).restore_checkpoint(
-                scorer["scored_checkpoint_sha"], clean_untracked_public=True
+            restore_hitl_checkpoint_with_artifacts(
+                self.work_dir,
+                checkpoint_sha=scorer["scored_checkpoint_sha"],
+                artifact_snapshot_id=self._pending_artifact_snapshot_id(required=True),
             )
             result["scorer"] = scorer
         return result
+
+    def _pending_artifact_snapshot_id(
+        self,
+        *,
+        required: bool = False,
+    ) -> Optional[str]:
+        pending = HitlRuntimeState(self.work_dir).pending_worker_command() or {}
+        isolated = pending.get("isolated_scoring")
+        snapshot_id = (
+            str(isolated.get("artifact_snapshot_id", "")).strip() or None
+            if isinstance(isolated, dict)
+            else None
+        )
+        if (
+            required
+            and snapshot_id is None
+            and hitl_artifact_contract_path(self.work_dir).is_file()
+        ):
+            raise RuntimeError(
+                "Persisted initial scoring handoff has no artifact snapshot."
+            )
+        return snapshot_id
 
     def _run_hitl_stage_until_complete(
         self,
@@ -1106,20 +1139,21 @@ class ResearchPipelineOrchestrator:
         return results
 
     def _arm_experiment_runner_recovery_checkpoint(self) -> Dict[str, Any]:
-        from core.autoresearch import CheckpointManager
-
-        checkpoint = CheckpointManager(self.work_dir).create_checkpoint(
-            "HITL pre-experiment recovery checkpoint"
+        rollback = HitlStageRollback.capture(
+            self.work_dir,
+            "HITL pre-experiment recovery checkpoint",
+            capture_artifacts=hitl_artifact_contract_path(self.work_dir).is_file(),
         )
-        hitl_snapshot = HitlGitStateStore(self.work_dir).create_rollback_snapshot()
         payload = {
             "kind": "pre_experiment_checkpoint",
-            "checkpoint_sha": checkpoint.sha,
-            "hitl_snapshot_ref": hitl_snapshot.ref,
-            "hitl_snapshot_commit": hitl_snapshot.commit_sha,
+            **rollback.descriptor(),
             "armed_at": utc_now(),
         }
-        self.state.set_runtime_recovery("experiment_runner", payload)
+        try:
+            self.state.set_runtime_recovery("experiment_runner", payload)
+        except Exception:
+            rollback.discard(cleanup_label="unarmed")
+            raise
         return dict(payload)
 
     def _initial_rule_maker_repair_recovery(self) -> Optional[Dict[str, Any]]:
@@ -1245,6 +1279,9 @@ class ResearchPipelineOrchestrator:
         snapshot_ref = str(recovery.get("hitl_snapshot_ref", "")).strip()
         if snapshot_ref:
             HitlGitStateStore(self.work_dir).discard(snapshot_ref)
+        artifact_snapshot_id = str(recovery.get("artifact_snapshot_id", "")).strip()
+        if artifact_snapshot_id:
+            discard_hitl_artifact_snapshot(self.work_dir, artifact_snapshot_id)
 
     def _recover_experiment_runner_from_runtime_checkpoint(self) -> None:
         recovery = self.state.get_runtime_recovery("experiment_runner")
@@ -1262,15 +1299,12 @@ class ResearchPipelineOrchestrator:
             canceller(
                 "The scored HITL experiment did not complete and runtime is restoring the pre-experiment state."
             )
-        checkpoint_sha = rollback.checkpoint_sha
-
-        from core.autoresearch import CheckpointManager
-
         print()
         print("↩️  Recovering workspace to pre-experiment HITL checkpoint...")
-        CheckpointManager(self.work_dir).restore_checkpoint(
-            checkpoint_sha,
-            clean_untracked_public=True,
+        restore_hitl_checkpoint_with_artifacts(
+            self.work_dir,
+            checkpoint_sha=rollback.checkpoint_sha,
+            artifact_snapshot_id=rollback.artifact_snapshot_id,
         )
         snapshot_ref = rollback.hitl_snapshot.ref
         state_store = rollback.state_store
@@ -1294,6 +1328,17 @@ class ResearchPipelineOrchestrator:
             state_store.discard(snapshot_ref)
         except Exception as cleanup_error:
             print(f"⚠️  Could not clean restored HITL recovery snapshot: {cleanup_error}")
+        if rollback.artifact_snapshot_id:
+            try:
+                discard_hitl_artifact_snapshot(
+                    self.work_dir,
+                    rollback.artifact_snapshot_id,
+                )
+            except Exception as cleanup_error:
+                print(
+                    "⚠️  Could not clean restored HITL artifact snapshot: "
+                    f"{cleanup_error}"
+                )
 
     def _retire_initial_scoring_refs_before_rollback(self) -> None:
         """Retire refs named by live initial-scoring state before restoring it."""
@@ -1314,6 +1359,9 @@ class ResearchPipelineOrchestrator:
             refs.add(f"refs/neurico/hitl/scoring/{request_key}")
         for scoring_ref in refs:
             delete_git_ref(self.work_dir, scoring_ref, strict=True)
+        artifact_snapshot_id = str(isolated.get("artifact_snapshot_id", "")).strip()
+        if artifact_snapshot_id:
+            discard_hitl_artifact_snapshot(self.work_dir, artifact_snapshot_id)
 
     # Provider → top-level skills directory inside the workspace. runner.py
     # copies templates/skills/* to every provider's directory so skills work
@@ -2009,9 +2057,14 @@ class ResearchPipelineOrchestrator:
             if self.hitl_autoresearch and not scored_checkpoint_sha:
                 scored_checkpoint_sha = str((finish_result.get("scorer_result") or {}).get("scored_checkpoint_sha", "")) or None
             if scored_checkpoint_sha:
-                CheckpointManager(self.work_dir).restore_checkpoint(
-                    scored_checkpoint_sha,
-                    clean_untracked_public=True,
+                restore_hitl_checkpoint_with_artifacts(
+                    self.work_dir,
+                    checkpoint_sha=scored_checkpoint_sha,
+                    artifact_snapshot_id=(
+                        self._pending_artifact_snapshot_id(required=True)
+                        if self.hitl_autoresearch
+                        else None
+                    ),
                 )
             self.state.complete_stage("experiment_runner", True, worker_result)
             if self.hitl_autoresearch and isinstance(finish_result.get("scorer_result"), dict):
@@ -2042,10 +2095,22 @@ class ResearchPipelineOrchestrator:
                 scoring_ref = str(result.get("scoring_ref", "")).strip()
                 if scoring_ref:
                     delete_git_ref(self.work_dir, scoring_ref, strict=False)
+                current = runtime_state.pending_worker_command() or {}
+                current_isolated = current.get("isolated_scoring")
+                artifact_snapshot_id = (
+                    str(current_isolated.get("artifact_snapshot_id", "")).strip()
+                    if isinstance(current_isolated, dict)
+                    else ""
+                )
                 runtime_state.update_pending_worker_command(
                     request_key,
                     isolated_scoring=None,
                 )
+                if artifact_snapshot_id:
+                    discard_hitl_artifact_snapshot(
+                        self.work_dir,
+                        artifact_snapshot_id,
+                    )
             isolated = pending.get("isolated_scoring")
             cached_score = isolated if isinstance(isolated, dict) else None
             if cached_score and cached_score.get("status") == "scored":
@@ -2077,6 +2142,7 @@ class ResearchPipelineOrchestrator:
                         "boundary. Runtime will not score an unreviewed initial experiment."
                     )
                 source_sha = str((cached_score or {}).get("source_checkpoint_sha", "")).strip()
+                source_fingerprint = reviewed_fingerprint
                 if source_sha:
                     if not checkpoints.checkpoint_exists(source_sha):
                         raise RuntimeError(
@@ -2087,7 +2153,7 @@ class ResearchPipelineOrchestrator:
                     # immutable source tree.
                     stale_results = self.work_dir / "scoring" / "results.json"
                     stale_results.unlink(missing_ok=True)
-                    source_workspace_fingerprint = (
+                    source_fingerprint = (
                         HitlWorkspaceWriteGuard.public_fingerprint(
                             self.work_dir,
                             scope=reviewed_scope,
@@ -2096,15 +2162,23 @@ class ResearchPipelineOrchestrator:
                     source_sha = checkpoints.create_checkpoint(
                         "HITL initial experiment before isolated scoring"
                     ).sha
-                    runtime_state.update_pending_worker_command(
-                        request_key,
-                        isolated_scoring={
-                            "status": "prepared",
-                            "source_checkpoint_sha": source_sha,
-                            "source_workspace_fingerprint": source_workspace_fingerprint,
-                            "source_workspace_fingerprint_scope": reviewed_scope,
-                        },
-                    )
+                artifact_snapshot_id, _ = prepare_isolated_scoring_artifacts(
+                    work_dir=self.work_dir,
+                    runtime_state=runtime_state,
+                    request_key=request_key,
+                    source_checkpoint_sha=source_sha,
+                    source_workspace_fingerprint=(
+                        str(
+                            (cached_score or {}).get(
+                                "source_workspace_fingerprint",
+                                source_fingerprint,
+                            )
+                        ).strip()
+                        or source_fingerprint
+                    ),
+                    source_workspace_fingerprint_scope=reviewed_scope,
+                    cached_score=cached_score,
+                )
                 try:
                     self.state.start_stage(SCORER_STAGE)
                     scorer_result = run_isolated_scorer(
@@ -2117,6 +2191,7 @@ class ResearchPipelineOrchestrator:
                             idea=idea,
                         ),
                         temporary_ref=f"refs/neurico/hitl/scoring/{request_key}",
+                        artifact_snapshot_id=artifact_snapshot_id,
                     )
                     score_evidence_available = isinstance(scorer_result.get("results"), dict) and bool(
                         scorer_result.get("scored_checkpoint_sha")
@@ -2139,6 +2214,11 @@ class ResearchPipelineOrchestrator:
                         "source_checkpoint_sha": source_sha,
                         "scored_checkpoint_sha": scored_checkpoint_sha,
                         "scorer_result": scorer_result,
+                        **(
+                            {"artifact_snapshot_id": artifact_snapshot_id}
+                            if artifact_snapshot_id
+                            else {}
+                        ),
                     },
                 )
 
@@ -2919,49 +2999,97 @@ class ResearchPipelineOrchestrator:
             request_key = str(pending.get("request_key", "")).strip()
             if not request_key:
                 raise RuntimeError("Baseline scoring has no held rule-maker request.")
-
-            reviewed = scoring_source_workspace_fingerprint(pending, None)
-            if HitlWorkspaceWriteGuard.public_fingerprint(self.work_dir) != reviewed:
-                raise RuntimeError(
-                    "The baseline workspace changed after rule-maker review; refusing to score it."
-                )
-
-            evaluator_dir = seal_scoring_files(self.work_dir)
-            if evaluator_dir is None:
-                raise RuntimeError("Baseline scoring has no evaluator payload.")
-            self._unseal_bootstrap_inputs(sealed_outputs)
-            sealed_outputs = None
+            isolated = pending.get("isolated_scoring")
+            cached_score = isolated if isinstance(isolated, dict) else None
+            evaluator_dir = sealed_dir_for(self.work_dir)
             stale_results = self.work_dir / "scoring" / "results.json"
-            stale_results.unlink(missing_ok=True)
-            from core.autoresearch import CheckpointManager
+            if cached_score and cached_score.get("status") == "scored":
+                scoring_result = dict(cached_score.get("scorer_result") or {})
+                if not scoring_result:
+                    raise RuntimeError("Persisted baseline scoring handoff is incomplete.")
+            else:
+                reviewed = scoring_source_workspace_fingerprint(pending, cached_score)
+                reviewed_scope = scoring_source_workspace_scope(pending, cached_score)
+                if (
+                    HitlWorkspaceWriteGuard.public_fingerprint(
+                        self.work_dir,
+                        scope=reviewed_scope,
+                    )
+                    != reviewed
+                ):
+                    raise RuntimeError(
+                        "The baseline workspace changed after rule-maker review; refusing to score it."
+                    )
 
-            source_sha = CheckpointManager(self.work_dir).create_checkpoint(
-                "Managed baseline before isolated scoring"
-            ).sha
-            self.state.start_stage(SCORER_STAGE)
-            try:
-                scoring_result = run_isolated_scorer(
+                evaluator_dir = seal_scoring_files(self.work_dir)
+                if evaluator_dir is None:
+                    raise RuntimeError("Baseline scoring has no evaluator payload.")
+                self._unseal_bootstrap_inputs(sealed_outputs)
+                sealed_outputs = None
+                stale_results.unlink(missing_ok=True)
+                reviewed = HitlWorkspaceWriteGuard.public_fingerprint(
+                    self.work_dir,
+                    scope=reviewed_scope,
+                )
+                from core.autoresearch import CheckpointManager
+
+                source_sha = str(
+                    (cached_score or {}).get("source_checkpoint_sha", "")
+                ).strip()
+                if not source_sha:
+                    source_sha = CheckpointManager(self.work_dir).create_checkpoint(
+                        "Managed baseline before isolated scoring"
+                    ).sha
+                artifact_snapshot_id, _ = prepare_isolated_scoring_artifacts(
                     work_dir=self.work_dir,
-                    source_sha=source_sha,
-                    sealed_dir=evaluator_dir,
-                    scorer=lambda scorer_work_dir: run_scorer(
-                        work_dir=scorer_work_dir,
-                        timeout=scorer_timeout,
-                        idea=idea,
-                    ),
-                    temporary_ref=f"refs/neurico/hitl/scoring/{request_key}",
+                    runtime_state=runtime_state,
+                    request_key=request_key,
+                    source_checkpoint_sha=source_sha,
+                    source_workspace_fingerprint=reviewed,
+                    source_workspace_fingerprint_scope=reviewed_scope,
+                    cached_score=cached_score,
                 )
-                self.state.complete_stage(
-                    SCORER_STAGE,
-                    isinstance(scoring_result.get("results"), dict),
-                    scoring_result,
+                self.state.start_stage(SCORER_STAGE)
+                try:
+                    scoring_result = run_isolated_scorer(
+                        work_dir=self.work_dir,
+                        source_sha=source_sha,
+                        sealed_dir=evaluator_dir,
+                        scorer=lambda scorer_work_dir: run_scorer(
+                            work_dir=scorer_work_dir,
+                            timeout=scorer_timeout,
+                            idea=idea,
+                        ),
+                        temporary_ref=f"refs/neurico/hitl/scoring/{request_key}",
+                        artifact_snapshot_id=artifact_snapshot_id,
+                    )
+                    self.state.complete_stage(
+                        SCORER_STAGE,
+                        isinstance(scoring_result.get("results"), dict),
+                        scoring_result,
+                    )
+                except Exception as exc:
+                    scoring_result = {
+                        "success": False,
+                        "error": f"Runtime isolated scorer failed: {exc}",
+                    }
+                    self.state.complete_stage(SCORER_STAGE, False, scoring_result)
+                runtime_state.update_pending_worker_command(
+                    request_key,
+                    isolated_scoring={
+                        "status": "scored",
+                        "source_checkpoint_sha": source_sha,
+                        "scored_checkpoint_sha": str(
+                            scoring_result.get("scored_checkpoint_sha", "")
+                        ).strip(),
+                        "scorer_result": scoring_result,
+                        **(
+                            {"artifact_snapshot_id": artifact_snapshot_id}
+                            if artifact_snapshot_id
+                            else {}
+                        ),
+                    },
                 )
-            except Exception as exc:
-                scoring_result = {
-                    "success": False,
-                    "error": f"Runtime isolated scorer failed: {exc}",
-                }
-                self.state.complete_stage(SCORER_STAGE, False, scoring_result)
 
             def finalize_review(review: Dict[str, Any]) -> Dict[str, Any]:
                 nonlocal sealed_outputs
@@ -2985,6 +3113,22 @@ class ResearchPipelineOrchestrator:
                 scoring_ref = str(scoring_result.get("scoring_ref", "")).strip()
                 if scoring_ref:
                     delete_git_ref(self.work_dir, scoring_ref, strict=False)
+                current = runtime_state.pending_worker_command() or {}
+                current_isolated = current.get("isolated_scoring")
+                artifact_snapshot_id = (
+                    str(current_isolated.get("artifact_snapshot_id", "")).strip()
+                    if isinstance(current_isolated, dict)
+                    else ""
+                )
+                runtime_state.update_pending_worker_command(
+                    request_key,
+                    isolated_scoring=None,
+                )
+                if artifact_snapshot_id:
+                    discard_hitl_artifact_snapshot(
+                        self.work_dir,
+                        artifact_snapshot_id,
+                    )
                 stale_results.unlink(missing_ok=True)
                 sealed_outputs = self._seal_bootstrap_inputs()
                 unseal_scoring_files(self.work_dir, evaluator_dir)
