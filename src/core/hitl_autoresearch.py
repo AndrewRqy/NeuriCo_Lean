@@ -1119,7 +1119,7 @@ def _retire_runtime_scoring_refs(
     *,
     strict: bool,
 ) -> None:
-    """Retire every scorer ref still named by live runtime state before rollback."""
+    """Retire transient scorer state without deleting frontier-owned artifacts."""
     records: list[Dict[str, Any]] = []
     artifact_snapshot_ids: set[str] = set()
     pending = runtime_state.pending_worker_command()
@@ -1143,7 +1143,8 @@ def _retire_runtime_scoring_refs(
             continue
         seen.add(scoring_ref)
         _retire_temporary_scoring_ref(work_dir, scorer_result, strict=strict)
-    for snapshot_id in artifact_snapshot_ids:
+    retained_snapshot_ids = HitlFrontierStore(work_dir).retained_artifact_snapshot_ids()
+    for snapshot_id in artifact_snapshot_ids - retained_snapshot_ids:
         discard_hitl_artifact_snapshot(work_dir, snapshot_id)
 
 

@@ -459,6 +459,28 @@ class HitlFrontierStore:
         ).strip()
         return value or None
 
+    def retained_artifact_snapshot_ids(self) -> set[str]:
+        """Return artifact snapshots owned by every retained accepted node."""
+        if not self.exists():
+            return set()
+        if not self.paths.nodes.is_dir():
+            raise HitlFrontierError("HITL frontier is missing its retained node records")
+
+        retained: set[str] = set()
+        for node_dir in sorted(self.paths.nodes.iterdir(), key=lambda path: path.name):
+            if not node_dir.is_dir():
+                continue
+            node_sha = self._require_sha(node_dir.name, "frontier node SHA")
+            snapshot_id = str(
+                self._read_json(self.paths.node_json(node_sha)).get(
+                    "artifact_snapshot_id",
+                    "",
+                )
+            ).strip()
+            if snapshot_id:
+                retained.add(snapshot_id)
+        return retained
+
     def _direction_attempt_history(
         self,
         node_sha: str,
