@@ -1569,6 +1569,7 @@ https://github.com/ChicagoHAI/neurico
         timeout: int = 1800,
         full_permissions: bool = True,
         compute_backend: str = "local",
+        workspace_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run comment mode: make targeted improvements based on user comments.
@@ -1581,6 +1582,9 @@ https://github.com/ChicagoHAI/neurico
             provider: AI provider (claude, codex, gemini)
             timeout: Maximum execution time in seconds (default: 30 min)
             full_permissions: Allow full permissions to CLI agents
+            workspace_mode: Optional dependency-layout selection for a workspace
+                that has not recorded one yet. Existing workspaces retain their
+                recorded mode.
 
         Returns:
             Dictionary with work_dir, github_url, and success status
@@ -1633,7 +1637,9 @@ https://github.com/ChicagoHAI/neurico
                 "and the workspace exists or can be cloned."
             )
 
+        active_workspace_mode = configure_workspace_mode(work_dir, workspace_mode)
         print(f"   Work dir: {work_dir}")
+        print(f"   Workspace mode: {active_workspace_mode.value}")
         print()
         self._copy_workspace_resources(work_dir, compute_backend=compute_backend)
         stage_local_resources(work_dir, idea)
@@ -2250,6 +2256,7 @@ def main():
                 timeout=args.timeout,
                 full_permissions=args.full_permissions,
                 compute_backend=args.compute_backend,
+                workspace_mode=args.workspace_mode,
             )
 
             print()

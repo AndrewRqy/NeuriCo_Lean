@@ -84,6 +84,90 @@ def test_disagreeing_private_mode_records_fail_closed(tmp_path):
         read_workspace_mode(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("requested_mode", "expected_mode"),
+    [
+        (None, WorkspaceMode.NATIVE),
+        ("embedded", WorkspaceMode.EMBEDDED),
+    ],
+)
+def test_comment_mode_configures_selected_workspace_before_launch(
+    tmp_path,
+    monkeypatch,
+    requested_mode,
+    expected_mode,
+):
+    import agents.comment_handler as comment_handler
+    import core.runner as runner_module
+
+    work_dir = tmp_path / "workspace"
+    work_dir.mkdir()
+
+    class FakeIdeaManager:
+        @staticmethod
+        def get_idea(_idea_id):
+            return {"idea": {"title": "Comment test", "comments": "Update it."}}
+
+    runner = object.__new__(runner_module.ResearchRunner)
+    runner.idea_manager = FakeIdeaManager()
+    runner.use_github = False
+    runner.runs_dir = tmp_path
+    runner.project_root = PROJECT_ROOT
+    copied_modes = []
+    runner._copy_workspace_resources = lambda _path, **_kwargs: copied_modes.append(
+        read_workspace_mode(work_dir)
+    )
+
+    monkeypatch.setattr(comment_handler, "resolve_workspace", lambda **_kwargs: work_dir)
+    monkeypatch.setattr(
+        comment_handler,
+        "run_comment_handler",
+        lambda **_kwargs: {"success": True},
+    )
+    monkeypatch.setattr(runner_module, "stage_local_resources", lambda *_args: None)
+
+    result = runner.run_comment_mode(
+        "comment-test",
+        workspace_mode=requested_mode,
+    )
+
+    assert result["success"]
+    assert read_workspace_mode(work_dir) is expected_mode
+    assert copied_modes == [expected_mode]
+
+
+def test_cli_forwards_workspace_mode_to_comment_mode(monkeypatch, tmp_path):
+    import core.runner as runner_module
+
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_comment_mode(self, **kwargs):
+            captured.update(kwargs)
+            return {"success": True, "work_dir": tmp_path, "github_url": None}
+
+    monkeypatch.setattr(runner_module, "ResearchRunner", FakeRunner)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "python -m core.runner",
+            "comment-test",
+            "--comment-mode",
+            "--workspace-mode",
+            "embedded",
+            "--no-github",
+        ],
+    )
+
+    runner_module.main()
+
+    assert captured["workspace_mode"] == "embedded"
+
+
 def test_scorer_uses_native_root_environment_by_default(tmp_path):
     root_python = tmp_path / ".venv" / "bin" / "python"
     root_python.parent.mkdir(parents=True)
