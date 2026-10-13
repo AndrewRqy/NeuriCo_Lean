@@ -66,6 +66,7 @@ from core.hitl_scoring_workspace import (
 from core.hitl_artifact_snapshots import (
     discard_hitl_artifact_snapshot,
     restore_hitl_checkpoint_with_artifacts,
+    validate_hitl_artifact_snapshot,
 )
 from core.hitl_runtime_state import HitlRuntimeState, worker_command_requires_resume
 from core.scoring_seal import (
@@ -2114,15 +2115,15 @@ class ResearchPipelineOrchestrator:
                     if isinstance(current_isolated, dict)
                     else ""
                 )
-                runtime_state.update_pending_worker_command(
-                    request_key,
-                    isolated_scoring=None,
-                )
                 if artifact_snapshot_id:
                     discard_hitl_artifact_snapshot(
                         self.work_dir,
                         artifact_snapshot_id,
                     )
+                runtime_state.update_pending_worker_command(
+                    request_key,
+                    isolated_scoring=None,
+                )
             isolated = pending.get("isolated_scoring")
             cached_score = isolated if isinstance(isolated, dict) else None
             if cached_score and cached_score.get("status") == "scored":
@@ -2130,6 +2131,17 @@ class ResearchPipelineOrchestrator:
                 scored_checkpoint_sha = str(cached_score.get("scored_checkpoint_sha", "")).strip() or None
                 if not scorer_result:
                     raise RuntimeError("Persisted isolated initial scoring handoff is incomplete.")
+                artifact_snapshot_id = str(
+                    cached_score.get("artifact_snapshot_id") or ""
+                ).strip()
+                if artifact_snapshot_id:
+                    validate_hitl_artifact_snapshot(
+                        self.work_dir,
+                        artifact_snapshot_id,
+                        source_checkpoint_sha=str(
+                            cached_score.get("source_checkpoint_sha") or ""
+                        ).strip(),
+                    )
             else:
                 checkpoints = CheckpointManager(self.work_dir)
                 reviewed_fingerprint = scoring_source_workspace_fingerprint(
@@ -3019,6 +3031,17 @@ class ResearchPipelineOrchestrator:
                 scoring_result = dict(cached_score.get("scorer_result") or {})
                 if not scoring_result:
                     raise RuntimeError("Persisted baseline scoring handoff is incomplete.")
+                artifact_snapshot_id = str(
+                    cached_score.get("artifact_snapshot_id") or ""
+                ).strip()
+                if artifact_snapshot_id:
+                    validate_hitl_artifact_snapshot(
+                        self.work_dir,
+                        artifact_snapshot_id,
+                        source_checkpoint_sha=str(
+                            cached_score.get("source_checkpoint_sha") or ""
+                        ).strip(),
+                    )
             else:
                 reviewed = scoring_source_workspace_fingerprint(pending, cached_score)
                 reviewed_scope = scoring_source_workspace_scope(pending, cached_score)
@@ -3132,15 +3155,15 @@ class ResearchPipelineOrchestrator:
                     if isinstance(current_isolated, dict)
                     else ""
                 )
-                runtime_state.update_pending_worker_command(
-                    request_key,
-                    isolated_scoring=None,
-                )
                 if artifact_snapshot_id:
                     discard_hitl_artifact_snapshot(
                         self.work_dir,
                         artifact_snapshot_id,
                     )
+                runtime_state.update_pending_worker_command(
+                    request_key,
+                    isolated_scoring=None,
+                )
                 stale_results.unlink(missing_ok=True)
                 sealed_outputs = self._seal_bootstrap_inputs()
                 unseal_scoring_files(self.work_dir, evaluator_dir)

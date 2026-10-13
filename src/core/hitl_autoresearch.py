@@ -54,6 +54,7 @@ from core.hitl_artifact_snapshots import (
     discard_hitl_artifact_snapshot,
     restore_hitl_checkpoint_with_artifacts,
     restore_hitl_frontier_node,
+    validate_hitl_artifact_snapshot,
 )
 from core.hitl_git import delete_git_ref
 from core.hitl_git_state import HitlGitStateStore
@@ -2809,12 +2810,12 @@ class HitlAutoResearchController:
                 if isinstance(isolated, dict)
                 else ""
             )
+            if snapshot_id:
+                discard_hitl_artifact_snapshot(self.work_dir, snapshot_id)
             state.update_pending_worker_command(
                 request_key,
                 isolated_scoring=None,
             )
-            if snapshot_id:
-                discard_hitl_artifact_snapshot(self.work_dir, snapshot_id)
 
         def score_in_background(approval: Dict[str, Any]) -> None:
             """Score and decide the candidate while its finish command is held."""
@@ -2843,6 +2844,12 @@ class HitlAutoResearchController:
                     raise RuntimeError(
                         "Persisted isolated scoring handoff predates ignored-artifact "
                         "snapshots and cannot safely retain this candidate."
+                    )
+                if artifact_snapshot_id:
+                    validate_hitl_artifact_snapshot(
+                        self.work_dir,
+                        artifact_snapshot_id,
+                        source_checkpoint_sha=source_sha,
                     )
             else:
                 reviewed_fingerprint = scoring_source_workspace_fingerprint(
