@@ -111,9 +111,22 @@ def run_scorer(
                      + "; ".join(mismatches),
         }
 
-    # Clear stale results so we never read leftover values from a prior run
-    if results_path.exists():
-        results_path.unlink()
+    # Clear stale results so we never read leftover values from a prior run.
+    # Malformed paths (for example, a directory left by a failed evaluator)
+    # are scorer failures rather than uncaught pipeline exceptions.
+    try:
+        results_path.unlink(missing_ok=True)
+    except OSError as e:
+        return {
+            'success': False,
+            'return_code': None,
+            'results': None,
+            'results_path': str(results_path),
+            'log_path': str(log_path),
+            'elapsed_time': 0.0,
+            'error': f"could not clear stale results.json: {e}",
+            'stopped': False,
+        }
 
     python_executable = python_executable or _resolve_python_executable(work_dir)
     cmd = [python_executable, str(eval_script)]

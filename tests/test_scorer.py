@@ -13,7 +13,7 @@ from core.scorer import load_scoring_results, run_scorer  # noqa: E402
 
 def _run_scorer_with_output(tmp_path, monkeypatch, write_output):
     scoring_dir = tmp_path / "scoring"
-    scoring_dir.mkdir()
+    scoring_dir.mkdir(exist_ok=True)
     (scoring_dir / "eval.py").write_text("# mocked by the test\n", encoding="utf-8")
     results_path = scoring_dir / "results.json"
 
@@ -43,6 +43,30 @@ def test_run_scorer_returns_structured_failure_for_results_directory(
     assert result["return_code"] == 0
     assert result["results"] is None
     assert "results.json could not be read" in result["error"]
+
+
+def test_run_scorer_returns_structured_failure_when_stale_directory_remains(
+    tmp_path,
+    monkeypatch,
+):
+    first_result = _run_scorer_with_output(
+        tmp_path,
+        monkeypatch,
+        lambda results_path: results_path.mkdir(),
+    )
+
+    second_result = _run_scorer_with_output(
+        tmp_path,
+        monkeypatch,
+        lambda results_path: results_path.mkdir(),
+    )
+
+    assert first_result["success"] is False
+    assert "results.json could not be read" in first_result["error"]
+    assert second_result["success"] is False
+    assert second_result["return_code"] is None
+    assert second_result["results"] is None
+    assert "could not clear stale results.json" in second_result["error"]
 
 
 def test_run_scorer_returns_structured_failure_for_invalid_utf8(
