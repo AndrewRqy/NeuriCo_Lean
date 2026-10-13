@@ -37,6 +37,10 @@ _MANIFEST_NAME = "manifest.json"
 _FILES_DIR = "files"
 _GITLINKS_DIR = "gitlinks"
 _OBJECT_ID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_STAGING_NAME = re.compile(
+    r"^\.(?P<snapshot_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})\."
+    r"[0-9]+\.[0-9a-f]{32}\.tmp$"
+)
 
 
 class HitlArtifactSnapshotError(RuntimeError):
@@ -77,6 +81,27 @@ def _artifact_roots(work_dir: Path) -> list[str]:
 
 def _snapshot_dir(work_dir: Path, snapshot_id: str) -> Path:
     return hitl_artifact_snapshots_dir(work_dir) / _safe_snapshot_id(snapshot_id)
+
+
+def _discard_incomplete_snapshot_generations(
+    store: Path,
+    *,
+    snapshot_id: str | None = None,
+) -> None:
+    """Remove non-authoritative capture generations left by process loss."""
+    normalized = _safe_snapshot_id(snapshot_id) if snapshot_id is not None else None
+    if not store.is_dir():
+        return
+    for entry in store.iterdir():
+        match = _STAGING_NAME.fullmatch(entry.name)
+        if match is None or (
+            normalized is not None and match.group("snapshot_id") != normalized
+        ):
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            entry.unlink()
+        else:
+            shutil.rmtree(entry)
 
 
 def _path_without_symlink_ancestors(root: Path, relative: Path, *, label: str) -> Path:
@@ -377,6 +402,7 @@ def capture_hitl_artifact_snapshot(
 
     store = hitl_artifact_snapshots_dir(workspace)
     store.mkdir(parents=True, exist_ok=True)
+    _discard_incomplete_snapshot_generations(store)
     final = store / normalized
     if final.exists():
         manifest = validate_hitl_artifact_snapshot(workspace, normalized)
@@ -593,7 +619,11 @@ def resolve_hitl_snapshot_gitlink_bundles(
 
 def discard_hitl_artifact_snapshot(work_dir: Path, snapshot_id: str) -> None:
     """Delete one runtime-owned transient snapshot."""
-    target = _snapshot_dir(Path(work_dir).resolve(), snapshot_id)
+    workspace = Path(work_dir).resolve()
+    normalized = _safe_snapshot_id(snapshot_id)
+    store = hitl_artifact_snapshots_dir(workspace)
+    _discard_incomplete_snapshot_generations(store, snapshot_id=normalized)
+    target = store / normalized
     if target.is_symlink() or (target.exists() and not target.is_dir()):
         target.unlink()
     elif target.is_dir():
