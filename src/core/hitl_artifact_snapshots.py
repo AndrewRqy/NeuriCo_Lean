@@ -571,6 +571,46 @@ def discard_hitl_artifact_snapshot(work_dir: Path, snapshot_id: str) -> None:
         shutil.rmtree(target)
 
 
+def _finalize_restored_gitlink(
+    repository: Path,
+    gitlink: CheckpointGitlink,
+    *,
+    artifact_roots: list[str],
+) -> None:
+    """Clean and verify one restored nested repository."""
+    relative_text = gitlink.relative_path.as_posix()
+    cleaned_public = run_git(repository, "clean", "-ffd", check=False)
+    if cleaned_public.returncode != 0:
+        raise HitlArtifactSnapshotError(
+            "Runtime could not clear untracked files from checkpointed nested "
+            f"repository `{relative_text}`: {git_failure_detail(cleaned_public)}"
+        )
+
+    scopes = _artifact_scopes_in_gitlink(artifact_roots, gitlink)
+    if scopes:
+        cleaned_ignored = run_git(
+            repository,
+            "clean",
+            "-ffdX",
+            "--",
+            *[scope.as_posix() for scope in scopes],
+            check=False,
+        )
+        if cleaned_ignored.returncode != 0:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not clear stale ignored evaluator artifacts from "
+                f"checkpointed nested repository `{relative_text}`: "
+                f"{git_failure_detail(cleaned_ignored)}"
+            )
+
+    head = run_git(repository, "rev-parse", "HEAD", check=False)
+    if head.returncode != 0 or str(head.stdout).strip() != gitlink.commit_sha:
+        raise HitlArtifactSnapshotError(
+            "Runtime could not verify restored checkpointed nested repository "
+            f"`{relative_text}`."
+        )
+
+
 def _restore_checkpoint_gitlinks(
     resolved_gitlinks: list[tuple[CheckpointGitlink, Path]],
     *,
@@ -591,37 +631,11 @@ def _restore_checkpoint_gitlinks(
                 "Runtime could not restore checkpointed nested repository "
                 f"`{relative_text}`: {git_failure_detail(reset)}"
             )
-
-        cleaned_public = run_git(repository, "clean", "-fd", check=False)
-        if cleaned_public.returncode != 0:
-            raise HitlArtifactSnapshotError(
-                "Runtime could not clear untracked files from checkpointed nested "
-                f"repository `{relative_text}`: {git_failure_detail(cleaned_public)}"
-            )
-
-        scopes = _artifact_scopes_in_gitlink(artifact_roots, gitlink)
-        if scopes:
-            cleaned_ignored = run_git(
-                repository,
-                "clean",
-                "-fdX",
-                "--",
-                *[scope.as_posix() for scope in scopes],
-                check=False,
-            )
-            if cleaned_ignored.returncode != 0:
-                raise HitlArtifactSnapshotError(
-                    "Runtime could not clear stale ignored evaluator artifacts from "
-                    f"checkpointed nested repository `{relative_text}`: "
-                    f"{git_failure_detail(cleaned_ignored)}"
-                )
-
-        head = run_git(repository, "rev-parse", "HEAD", check=False)
-        if head.returncode != 0 or str(head.stdout).strip() != gitlink.commit_sha:
-            raise HitlArtifactSnapshotError(
-                "Runtime could not verify restored checkpointed nested repository "
-                f"`{relative_text}`."
-            )
+        _finalize_restored_gitlink(
+            repository,
+            gitlink,
+            artifact_roots=artifact_roots,
+        )
 
 
 def _restore_bundled_checkpoint_gitlinks(
@@ -681,36 +695,11 @@ def _restore_bundled_checkpoint_gitlinks(
                 f"`{gitlink.relative_path.as_posix()}`: "
                 f"{git_failure_detail(checked_out)}"
             )
-        cleaned_public = run_git(repository, "clean", "-fd", check=False)
-        if cleaned_public.returncode != 0:
-            raise HitlArtifactSnapshotError(
-                "Runtime could not clear untracked files from checkpointed nested "
-                f"repository `{gitlink.relative_path.as_posix()}`: "
-                f"{git_failure_detail(cleaned_public)}"
-            )
-        scopes = _artifact_scopes_in_gitlink(artifact_roots, gitlink)
-        if scopes:
-            cleaned_ignored = run_git(
-                repository,
-                "clean",
-                "-fdX",
-                "--",
-                *[scope.as_posix() for scope in scopes],
-                check=False,
-            )
-            if cleaned_ignored.returncode != 0:
-                raise HitlArtifactSnapshotError(
-                    "Runtime could not clear stale ignored evaluator artifacts from "
-                    f"checkpointed nested repository "
-                    f"`{gitlink.relative_path.as_posix()}`: "
-                    f"{git_failure_detail(cleaned_ignored)}"
-                )
-        head = run_git(repository, "rev-parse", "HEAD", check=False)
-        if head.returncode != 0 or str(head.stdout).strip() != gitlink.commit_sha:
-            raise HitlArtifactSnapshotError(
-                "Runtime could not verify restored checkpointed nested repository "
-                f"`{gitlink.relative_path.as_posix()}`."
-            )
+        _finalize_restored_gitlink(
+            repository,
+            gitlink,
+            artifact_roots=artifact_roots,
+        )
 
 
 def restore_hitl_checkpoint_with_artifacts(
