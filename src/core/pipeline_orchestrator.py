@@ -57,6 +57,7 @@ from core.agent_cli import (
 )
 from core.scorer import run_scorer
 from core.hitl_scoring_workspace import (
+    discard_isolated_scoring_workspace,
     prepare_isolated_scoring_artifacts,
     run_isolated_scorer,
     scoring_source_workspace_fingerprint,
@@ -1352,6 +1353,7 @@ class ResearchPipelineOrchestrator:
 
     def _retire_initial_scoring_refs_before_rollback(self) -> None:
         """Retire refs named by live initial-scoring state before restoring it."""
+        discard_isolated_scoring_workspace(self.work_dir)
         pending = HitlRuntimeState(self.work_dir).pending_worker_command()
         if not isinstance(pending, dict):
             return

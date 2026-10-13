@@ -72,6 +72,7 @@ from core.hitl_runtime_state import (
     worker_command_requires_resume,
 )
 from core.hitl_scoring_workspace import (
+    discard_isolated_scoring_workspace,
     prepare_isolated_scoring_artifacts,
     run_isolated_scorer,
     scoring_source_workspace_fingerprint,
@@ -1120,6 +1121,7 @@ def _retire_runtime_scoring_refs(
     strict: bool,
 ) -> None:
     """Retire transient scorer state without deleting frontier-owned artifacts."""
+    discard_isolated_scoring_workspace(work_dir)
     records: list[Dict[str, Any]] = []
     artifact_snapshot_ids: set[str] = set()
     pending = runtime_state.pending_worker_command()

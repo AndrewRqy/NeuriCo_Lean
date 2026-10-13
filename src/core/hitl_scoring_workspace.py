@@ -14,8 +14,8 @@ import json
 import hashlib
 import os
 import shutil
+import sys
 import tarfile
-import tempfile
 
 from core.hitl_git import (
     HitlGitlinkError,
@@ -49,6 +49,43 @@ safe_tarfile = _safe_tarfile_module()
 
 class HitlScoringWorkspaceError(RuntimeError):
     """Raised when runtime cannot prepare an isolated HITL scorer workspace."""
+
+
+def _isolated_scoring_parent(work_dir: Path) -> Path:
+    """Return the single runtime-owned scorer slot for one public workspace."""
+    workspace = Path(work_dir).resolve()
+    workspace_id = hashlib.sha256(os.fsencode(workspace)).hexdigest()[:16]
+    return workspace.parent / f".neurico-hitl-scorer-{workspace_id}"
+
+
+def discard_isolated_scoring_workspace(work_dir: Path) -> None:
+    """Reclaim this workspace's runtime-owned scorer slot after completion or loss."""
+    workspace = Path(work_dir).resolve()
+    temporary_parent = _isolated_scoring_parent(workspace)
+    scorer_dir = temporary_parent / "workspace"
+    run_git(
+        workspace,
+        "worktree",
+        "remove",
+        "--force",
+        str(scorer_dir),
+        check=False,
+        quiet=True,
+    )
+
+    if temporary_parent.is_symlink() or (
+        temporary_parent.exists() and not temporary_parent.is_dir()
+    ):
+        temporary_parent.unlink()
+    elif temporary_parent.is_dir():
+        shutil.rmtree(temporary_parent)
+
+    pruned = run_git(workspace, "worktree", "prune", check=False, quiet=True)
+    if pruned.returncode != 0:
+        raise HitlScoringWorkspaceError(
+            "Runtime could not prune isolated scorer worktree metadata: "
+            f"{git_failure_detail(pruned)}"
+        )
 
 
 def prepare_isolated_scoring_artifacts(
@@ -375,15 +412,11 @@ def isolated_scoring_workspace(
             f"Runtime rejected the sealed evaluator payload: {exc}"
         ) from exc
 
-    temporary_parent = Path(
-        tempfile.mkdtemp(
-            prefix=".neurico-hitl-scorer-",
-            dir=work_dir.parent,
-        )
-    )
+    discard_isolated_scoring_workspace(work_dir)
+    temporary_parent = _isolated_scoring_parent(work_dir)
+    temporary_parent.mkdir(mode=0o700)
     os.chmod(temporary_parent, 0o700)
     scorer_dir = temporary_parent / "workspace"
-    created = False
     try:
         completed = run_git(
             work_dir,
@@ -399,8 +432,6 @@ def isolated_scoring_workspace(
             raise HitlScoringWorkspaceError(
                 f"Runtime could not create the isolated scorer worktree: {detail}"
             )
-        created = True
-
         _materialize_checkpoint_gitlinks(
             work_dir=work_dir,
             scorer_dir=scorer_dir,
@@ -445,18 +476,16 @@ def isolated_scoring_workspace(
             (scorer_dir / ".venv").symlink_to(candidate_venv, target_is_directory=True)
         yield scorer_dir, evaluator_manifest_sha256
     finally:
-        if created:
-            run_git(
-                work_dir,
-                "worktree",
-                "remove",
-                "--force",
-                str(scorer_dir),
-                check=False,
-                quiet=True,
+        active_error = sys.exc_info()[0] is not None
+        try:
+            discard_isolated_scoring_workspace(work_dir)
+        except Exception as cleanup_error:
+            if not active_error:
+                raise
+            print(
+                "⚠️  Could not clean isolated scorer workspace after scoring failure: "
+                f"{cleanup_error}"
             )
-            run_git(work_dir, "worktree", "prune", check=False, quiet=True)
-        shutil.rmtree(temporary_parent, ignore_errors=True)
 
 
 def run_isolated_scorer(
