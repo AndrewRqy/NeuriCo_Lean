@@ -7,6 +7,7 @@ import os
 from pathlib import Path, PurePosixPath
 import subprocess
 from typing import Mapping
+import uuid
 
 
 @dataclass(frozen=True)
@@ -245,3 +246,105 @@ def resolve_gitlink_repositories(
             )
         resolved.append((gitlink, repository))
     return resolved
+
+
+def verify_git_commit_bundle(
+    work_dir: Path,
+    bundle_path: Path,
+    commit_sha: str,
+) -> None:
+    """Require one readable, self-contained bundle advertising ``commit_sha``."""
+    bundle = Path(bundle_path)
+    if bundle.is_symlink() or not bundle.is_file():
+        raise HitlGitlinkError(f"Checkpointed nested-repository bundle is missing: {bundle}")
+    bundle = bundle.resolve()
+
+    verified = run_git(work_dir, "bundle", "verify", str(bundle), check=False)
+    if verified.returncode != 0:
+        raise HitlGitlinkError(
+            "Checkpointed nested-repository bundle is invalid: " f"{git_failure_detail(verified)}"
+        )
+    listed = run_git(work_dir, "bundle", "list-heads", str(bundle), check=False)
+    if listed.returncode != 0:
+        raise HitlGitlinkError(
+            "Runtime could not inspect checkpointed nested-repository bundle: "
+            f"{git_failure_detail(listed)}"
+        )
+    advertised = {
+        line.split(maxsplit=1)[0] for line in str(listed.stdout or "").splitlines() if line.strip()
+    }
+    if str(commit_sha).strip() not in advertised:
+        raise HitlGitlinkError(
+            "Checkpointed nested-repository bundle does not advertise its recorded commit."
+        )
+
+
+def create_git_commit_bundle(
+    repository: Path,
+    *,
+    commit_sha: str,
+    destination: Path,
+) -> None:
+    """Create and verify a self-contained bundle for one nested commit."""
+    repo = Path(repository).resolve()
+    bundle = Path(destination).resolve()
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+    temporary_ref = f"refs/neurico/hitl/bundles/{uuid.uuid4().hex}"
+    retained = run_git(repo, "update-ref", temporary_ref, commit_sha, check=False)
+    if retained.returncode != 0:
+        raise HitlGitlinkError(
+            "Runtime could not retain a nested commit for bundling: "
+            f"{git_failure_detail(retained)}"
+        )
+    try:
+        created = run_git(
+            repo,
+            "bundle",
+            "create",
+            str(bundle),
+            temporary_ref,
+            check=False,
+        )
+        if created.returncode != 0:
+            raise HitlGitlinkError(
+                "Runtime could not bundle a checkpointed nested repository: "
+                f"{git_failure_detail(created)}"
+            )
+        verify_git_commit_bundle(repo, bundle, commit_sha)
+    finally:
+        run_git(repo, "update-ref", "-d", temporary_ref, check=False, quiet=True)
+
+
+def fetch_git_commit_bundle(
+    repository: Path,
+    *,
+    bundle_path: Path,
+    commit_sha: str,
+) -> None:
+    """Fetch one bundled commit into an existing repository and verify it."""
+    repo = Path(repository).resolve()
+    bundle = Path(bundle_path).resolve()
+    verify_git_commit_bundle(repo, bundle, commit_sha)
+    fetched = run_git(
+        repo,
+        "fetch",
+        "--no-tags",
+        str(bundle),
+        commit_sha,
+        check=False,
+    )
+    if fetched.returncode != 0:
+        raise HitlGitlinkError(
+            "Runtime could not fetch a checkpointed nested-repository bundle: "
+            f"{git_failure_detail(fetched)}"
+        )
+    exists = run_git(
+        repo,
+        "cat-file",
+        "-e",
+        f"{commit_sha}^{{commit}}",
+        check=False,
+        quiet=True,
+    )
+    if exists.returncode != 0:
+        raise HitlGitlinkError("Fetched nested-repository bundle is missing its recorded commit.")

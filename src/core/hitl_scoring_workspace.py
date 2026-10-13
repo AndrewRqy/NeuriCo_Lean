@@ -19,14 +19,15 @@ import tempfile
 
 from core.hitl_git import (
     HitlGitlinkError,
-    checkpoint_gitlinks,
     git_failure_detail,
     resolve_checkpoint_gitlinks,
     run_git,
 )
 from core.hitl_artifact_snapshots import (
+    HitlArtifactSnapshotError,
     capture_hitl_artifact_snapshot,
     materialize_hitl_artifact_snapshot,
+    materialize_hitl_snapshot_gitlinks,
 )
 from core.hitl_paths import hitl_artifact_contract_path
 from core.scoring_seal import SEALED_PATHS, verify_sealed_scoring_manifest
@@ -143,17 +144,6 @@ def _prepare_scoring_directory(work_dir: Path) -> None:
     scoring_dir.mkdir(parents=True)
 
 
-def _checkpoint_gitlinks(work_dir: Path, source_sha: str) -> list[tuple[Path, str]]:
-    """Compatibility wrapper around shared checkpoint Gitlink inspection."""
-    try:
-        return [
-            (gitlink.relative_path, gitlink.commit_sha)
-            for gitlink in checkpoint_gitlinks(work_dir, source_sha)
-        ]
-    except HitlGitlinkError as exc:
-        raise HitlScoringWorkspaceError(str(exc)) from exc
-
-
 def _contained_path(root: Path, relative: Path, *, description: str) -> Path:
     root = root.resolve()
     candidate = (root / relative).resolve()
@@ -243,8 +233,20 @@ def _materialize_checkpoint_gitlinks(
     work_dir: Path,
     scorer_dir: Path,
     source_sha: str,
+    artifact_snapshot_id: Optional[str] = None,
 ) -> None:
     """Restore exact nested-repository contents omitted by ``git worktree``."""
+    if str(artifact_snapshot_id or "").strip():
+        try:
+            if materialize_hitl_snapshot_gitlinks(
+                work_dir,
+                snapshot_id=str(artifact_snapshot_id),
+                checkpoint_sha=source_sha,
+                destination=scorer_dir,
+            ):
+                return
+        except HitlArtifactSnapshotError as exc:
+            raise HitlScoringWorkspaceError(str(exc)) from exc
     try:
         resolved_gitlinks = resolve_checkpoint_gitlinks(work_dir, source_sha)
     except HitlGitlinkError as exc:
@@ -361,6 +363,7 @@ def isolated_scoring_workspace(
             work_dir=work_dir,
             scorer_dir=scorer_dir,
             source_sha=normalized_sha,
+            artifact_snapshot_id=artifact_snapshot_id,
         )
 
         # Prepared datasets are public research inputs. They can be ignored by

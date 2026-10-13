@@ -21,10 +21,12 @@ from core.hitl_git import (
     CheckpointGitlink,
     HitlGitlinkError,
     checkpoint_gitlinks,
+    create_git_commit_bundle,
+    fetch_git_commit_bundle,
     git_failure_detail,
-    resolve_gitlink_repositories,
     resolve_checkpoint_gitlinks,
     run_git,
+    verify_git_commit_bundle,
 )
 from core.hitl_paths import hitl_artifact_snapshots_dir
 from core.hitl_util import atomic_write_json, fsync_directory
@@ -33,6 +35,8 @@ from core.hitl_util import atomic_write_json, fsync_directory
 _SNAPSHOT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MANIFEST_NAME = "manifest.json"
 _FILES_DIR = "files"
+_GITLINKS_DIR = "gitlinks"
+_OBJECT_ID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
 class HitlArtifactSnapshotError(RuntimeError):
@@ -132,22 +136,11 @@ def _artifact_scopes_in_gitlink(
 
 
 def _validate_gitlink_artifact_ownership(
-    work_dir: Path,
+    resolved_gitlinks: list[tuple[CheckpointGitlink, Path]],
     *,
-    source_checkpoint_sha: str,
     artifact_roots: list[str],
-) -> list[tuple[CheckpointGitlink, Path]]:
+) -> None:
     """Require nested artifact state to be fully owned by its Git checkpoint."""
-    try:
-        relevant_gitlinks = [
-            gitlink
-            for gitlink in checkpoint_gitlinks(work_dir, source_checkpoint_sha)
-            if _artifact_scopes_in_gitlink(artifact_roots, gitlink)
-        ]
-        resolved_gitlinks = resolve_gitlink_repositories(work_dir, relevant_gitlinks)
-    except HitlGitlinkError as exc:
-        raise HitlArtifactSnapshotError(str(exc)) from exc
-
     for gitlink, repository in resolved_gitlinks:
         scopes = _artifact_scopes_in_gitlink(artifact_roots, gitlink)
         if not scopes:
@@ -187,7 +180,6 @@ def _validate_gitlink_artifact_ownership(
                 "Evaluator-declared artifacts in checkpointed nested repository "
                 f"`{relative_text}` must be clean committed content or absent."
             )
-    return resolved_gitlinks
 
 
 def _path_is_owned_by_gitlink(
@@ -198,6 +190,52 @@ def _path_is_owned_by_gitlink(
         relative == gitlink.relative_path or gitlink.relative_path in relative.parents
         for gitlink, _repository in resolved_gitlinks
     )
+
+
+def _manifest_gitlinks(manifest: dict[str, Any]) -> list[tuple[CheckpointGitlink, str]]:
+    """Return validated Gitlink identities and bundle paths from one manifest."""
+    if manifest.get("version") == 1:
+        return []
+    entries = manifest.get("gitlinks")
+    if not isinstance(entries, list):
+        raise HitlArtifactSnapshotError("HITL artifact snapshot has no Gitlink list.")
+
+    parsed: list[tuple[CheckpointGitlink, str]] = []
+    seen_paths: set[str] = set()
+    seen_bundles: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise HitlArtifactSnapshotError("HITL artifact snapshot has an invalid Gitlink entry.")
+        relative = _safe_relative_path(
+            str(entry.get("path", "")),
+            label="Gitlink path",
+        )
+        commit_sha = str(entry.get("commit_sha", "")).strip()
+        if not _OBJECT_ID.fullmatch(commit_sha):
+            raise HitlArtifactSnapshotError(
+                f"HITL artifact snapshot has an invalid Gitlink commit: {commit_sha!r}"
+            )
+        bundle = _safe_relative_path(
+            str(entry.get("bundle", "")),
+            label="Gitlink bundle path",
+        ).as_posix()
+        if not bundle.startswith(f"{_GITLINKS_DIR}/") or not bundle.endswith(".bundle"):
+            raise HitlArtifactSnapshotError(
+                f"HITL artifact snapshot has an invalid Gitlink bundle path: {bundle}"
+            )
+        path_key = relative.as_posix()
+        if path_key in seen_paths or bundle in seen_bundles:
+            raise HitlArtifactSnapshotError(
+                "HITL artifact snapshot contains duplicate Gitlink state."
+            )
+        seen_paths.add(path_key)
+        seen_bundles.add(bundle)
+        parsed.append((CheckpointGitlink(relative, commit_sha), bundle))
+    return parsed
+
+
+def _gitlink_identity_map(gitlinks: list[CheckpointGitlink]) -> dict[str, str]:
+    return {gitlink.relative_path.as_posix(): gitlink.commit_sha for gitlink in gitlinks}
 
 
 def _read_manifest(work_dir: Path, snapshot_id: str) -> dict[str, Any]:
@@ -211,7 +249,7 @@ def _read_manifest(work_dir: Path, snapshot_id: str) -> dict[str, Any]:
         ) from exc
     if (
         not isinstance(payload, dict)
-        or payload.get("version") != 1
+        or payload.get("version") not in {1, 2}
         or payload.get("artifact_snapshot_id") != normalized
         or not isinstance(payload.get("source_checkpoint_sha"), str)
         or not isinstance(payload.get("artifact_roots"), list)
@@ -230,6 +268,7 @@ def _read_manifest(work_dir: Path, snapshot_id: str) -> dict[str, Any]:
             raise HitlArtifactSnapshotError(
                 f"HITL artifact snapshot {normalized} contains an undeclared path."
             )
+    _manifest_gitlinks(payload)
     return payload
 
 
@@ -269,6 +308,20 @@ def validate_hitl_artifact_snapshot(
                 f"HITL artifact snapshot {snapshot_id} has an invalid stored file: "
                 f"{relative_text}."
             )
+    snapshot_root = _snapshot_dir(workspace, snapshot_id)
+    for gitlink, bundle_text in _manifest_gitlinks(manifest):
+        bundle = _path_without_symlink_ancestors(
+            snapshot_root,
+            _safe_relative_path(bundle_text, label="Gitlink bundle path"),
+            label="Stored Gitlink bundle",
+        )
+        try:
+            verify_git_commit_bundle(workspace, bundle, gitlink.commit_sha)
+        except HitlGitlinkError as exc:
+            raise HitlArtifactSnapshotError(
+                f"HITL artifact snapshot {snapshot_id} has an invalid bundle for "
+                f"`{gitlink.relative_path.as_posix()}`: {exc}"
+            ) from exc
     return manifest
 
 
@@ -287,20 +340,30 @@ def capture_hitl_artifact_snapshot(
     roots = _artifact_roots(workspace)
     if not roots:
         raise HitlArtifactSnapshotError("Artifact snapshot requires a non-empty frozen contract.")
-    resolved_gitlinks = _validate_gitlink_artifact_ownership(
-        workspace,
-        source_checkpoint_sha=source_sha,
+    try:
+        resolved_gitlinks = resolve_checkpoint_gitlinks(workspace, source_sha)
+    except HitlGitlinkError as exc:
+        raise HitlArtifactSnapshotError(str(exc)) from exc
+    _validate_gitlink_artifact_ownership(
+        resolved_gitlinks,
         artifact_roots=roots,
     )
+    gitlinks = [gitlink for gitlink, _repository in resolved_gitlinks]
 
     store = hitl_artifact_snapshots_dir(workspace)
     store.mkdir(parents=True, exist_ok=True)
     final = store / normalized
     if final.exists():
         manifest = validate_hitl_artifact_snapshot(workspace, normalized)
+        stored_gitlinks = [gitlink for gitlink, _bundle in _manifest_gitlinks(manifest)]
         if (
             manifest["source_checkpoint_sha"] != source_sha
             or manifest["artifact_roots"] != roots
+            or (manifest["version"] == 1 and bool(gitlinks))
+            or (
+                manifest["version"] == 2
+                and _gitlink_identity_map(stored_gitlinks) != _gitlink_identity_map(gitlinks)
+            )
         ):
             raise HitlArtifactSnapshotError(
                 f"HITL artifact snapshot id {normalized} already names a different boundary."
@@ -358,14 +421,36 @@ def capture_hitl_artifact_snapshot(
                     f"Ignored evaluator artifact disappeared during capture: {relative_text}"
                 )
             _copy_entry(source, files_root / relative)
+        bundled_gitlinks: list[dict[str, str]] = []
+        for index, (gitlink, repository) in enumerate(resolved_gitlinks):
+            bundle_relative = f"{_GITLINKS_DIR}/{index:04d}.bundle"
+            try:
+                create_git_commit_bundle(
+                    repository,
+                    commit_sha=gitlink.commit_sha,
+                    destination=staging / bundle_relative,
+                )
+            except HitlGitlinkError as exc:
+                raise HitlArtifactSnapshotError(
+                    "Runtime could not preserve checkpointed nested repository "
+                    f"`{gitlink.relative_path.as_posix()}`: {exc}"
+                ) from exc
+            bundled_gitlinks.append(
+                {
+                    "path": gitlink.relative_path.as_posix(),
+                    "commit_sha": gitlink.commit_sha,
+                    "bundle": bundle_relative,
+                }
+            )
         atomic_write_json(
             staging / _MANIFEST_NAME,
             {
-                "version": 1,
+                "version": 2,
                 "artifact_snapshot_id": normalized,
                 "source_checkpoint_sha": source_sha,
                 "artifact_roots": roots,
                 "captured_paths": captured,
+                "gitlinks": bundled_gitlinks,
             },
             fsync_parent=False,
         )
@@ -409,6 +494,100 @@ def materialize_hitl_artifact_snapshot(
         elif target.is_dir():
             shutil.rmtree(target)
         _copy_entry(source, target)
+
+
+def _remove_workspace_entry(path: Path) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _snapshot_bundle_path(
+    work_dir: Path,
+    snapshot_id: str,
+    bundle_text: str,
+) -> Path:
+    return _path_without_symlink_ancestors(
+        _snapshot_dir(work_dir, snapshot_id),
+        _safe_relative_path(bundle_text, label="Gitlink bundle path"),
+        label="Stored Gitlink bundle",
+    )
+
+
+def _require_manifest_gitlinks_match_checkpoint(
+    manifest: dict[str, Any],
+    checkpoint_links: list[CheckpointGitlink],
+) -> list[tuple[CheckpointGitlink, str]]:
+    entries = _manifest_gitlinks(manifest)
+    if manifest["version"] == 2 and _gitlink_identity_map(
+        [gitlink for gitlink, _bundle in entries]
+    ) != _gitlink_identity_map(checkpoint_links):
+        raise HitlArtifactSnapshotError(
+            "HITL artifact snapshot Gitlinks do not match the workspace checkpoint."
+        )
+    return entries
+
+
+def materialize_hitl_snapshot_gitlinks(
+    work_dir: Path,
+    *,
+    snapshot_id: str,
+    checkpoint_sha: str,
+    destination: Path,
+) -> bool:
+    """Materialize bundled Gitlink trees as plain files for isolated scoring."""
+    workspace = Path(work_dir).resolve()
+    manifest = validate_hitl_artifact_snapshot(
+        workspace,
+        snapshot_id,
+        source_checkpoint_sha=checkpoint_sha,
+    )
+    if manifest["version"] == 1:
+        return False
+    try:
+        checkpoint_links = checkpoint_gitlinks(workspace, checkpoint_sha)
+    except HitlGitlinkError as exc:
+        raise HitlArtifactSnapshotError(str(exc)) from exc
+    entries = _require_manifest_gitlinks_match_checkpoint(manifest, checkpoint_links)
+    target_root = Path(destination).resolve()
+    for gitlink, bundle_text in entries:
+        target = _path_without_symlink_ancestors(
+            target_root,
+            gitlink.relative_path,
+            label="Materialized Gitlink",
+        )
+        _remove_workspace_entry(target)
+        target.mkdir(parents=True)
+        initialized = run_git(target, "init", "--quiet", check=False)
+        if initialized.returncode != 0:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not initialize isolated nested repository "
+                f"`{gitlink.relative_path.as_posix()}`: {git_failure_detail(initialized)}"
+            )
+        try:
+            fetch_git_commit_bundle(
+                target,
+                bundle_path=_snapshot_bundle_path(workspace, snapshot_id, bundle_text),
+                commit_sha=gitlink.commit_sha,
+            )
+        except HitlGitlinkError as exc:
+            raise HitlArtifactSnapshotError(str(exc)) from exc
+        checked_out = run_git(
+            target,
+            "checkout",
+            "--detach",
+            "--force",
+            gitlink.commit_sha,
+            check=False,
+        )
+        if checked_out.returncode != 0:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not materialize isolated nested repository "
+                f"`{gitlink.relative_path.as_posix()}`: {git_failure_detail(checked_out)}"
+            )
+        _remove_workspace_entry(target / ".git")
+    return True
 
 
 def discard_hitl_artifact_snapshot(work_dir: Path, snapshot_id: str) -> None:
@@ -473,6 +652,95 @@ def _restore_checkpoint_gitlinks(
             )
 
 
+def _restore_bundled_checkpoint_gitlinks(
+    work_dir: Path,
+    *,
+    snapshot_id: str,
+    manifest: dict[str, Any],
+    checkpoint_links: list[CheckpointGitlink],
+    artifact_roots: list[str],
+) -> None:
+    entries = _require_manifest_gitlinks_match_checkpoint(manifest, checkpoint_links)
+    workspace = Path(work_dir).resolve()
+    for gitlink, bundle_text in entries:
+        repository = _path_without_symlink_ancestors(
+            workspace,
+            gitlink.relative_path,
+            label="Restored Gitlink",
+        )
+        repository_root = (
+            run_git(repository, "rev-parse", "--show-toplevel", check=False)
+            if repository.is_dir()
+            else None
+        )
+        if (
+            repository_root is None
+            or repository_root.returncode != 0
+            or Path(str(repository_root.stdout).strip()).resolve() != repository
+        ):
+            _remove_workspace_entry(repository)
+            repository.mkdir(parents=True)
+            initialized = run_git(repository, "init", "--quiet", check=False)
+            if initialized.returncode != 0:
+                raise HitlArtifactSnapshotError(
+                    "Runtime could not reconstruct checkpointed nested repository "
+                    f"`{gitlink.relative_path.as_posix()}`: "
+                    f"{git_failure_detail(initialized)}"
+                )
+        try:
+            fetch_git_commit_bundle(
+                repository,
+                bundle_path=_snapshot_bundle_path(workspace, snapshot_id, bundle_text),
+                commit_sha=gitlink.commit_sha,
+            )
+        except HitlGitlinkError as exc:
+            raise HitlArtifactSnapshotError(str(exc)) from exc
+        checked_out = run_git(
+            repository,
+            "checkout",
+            "--detach",
+            "--force",
+            gitlink.commit_sha,
+            check=False,
+        )
+        if checked_out.returncode != 0:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not restore checkpointed nested repository "
+                f"`{gitlink.relative_path.as_posix()}`: "
+                f"{git_failure_detail(checked_out)}"
+            )
+        cleaned_public = run_git(repository, "clean", "-fd", check=False)
+        if cleaned_public.returncode != 0:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not clear untracked files from checkpointed nested "
+                f"repository `{gitlink.relative_path.as_posix()}`: "
+                f"{git_failure_detail(cleaned_public)}"
+            )
+        scopes = _artifact_scopes_in_gitlink(artifact_roots, gitlink)
+        if scopes:
+            cleaned_ignored = run_git(
+                repository,
+                "clean",
+                "-fdX",
+                "--",
+                *[scope.as_posix() for scope in scopes],
+                check=False,
+            )
+            if cleaned_ignored.returncode != 0:
+                raise HitlArtifactSnapshotError(
+                    "Runtime could not clear stale ignored evaluator artifacts from "
+                    f"checkpointed nested repository "
+                    f"`{gitlink.relative_path.as_posix()}`: "
+                    f"{git_failure_detail(cleaned_ignored)}"
+                )
+        head = run_git(repository, "rev-parse", "HEAD", check=False)
+        if head.returncode != 0 or str(head.stdout).strip() != gitlink.commit_sha:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not verify restored checkpointed nested repository "
+                f"`{gitlink.relative_path.as_posix()}`."
+            )
+
+
 def restore_hitl_checkpoint_with_artifacts(
     work_dir: Path,
     *,
@@ -493,11 +761,67 @@ def restore_hitl_checkpoint_with_artifacts(
         if snapshot_id
         else None
     )
+    artifact_roots = list(manifest["artifact_roots"]) if manifest is not None else []
+    try:
+        target_gitlinks = checkpoint_gitlinks(workspace, sha)
+        current_sha = checkpoints.current_sha()
+        current_gitlinks = checkpoint_gitlinks(workspace, current_sha) if current_sha else []
+    except HitlGitlinkError as exc:
+        raise HitlArtifactSnapshotError(str(exc)) from exc
+
+    if manifest is not None and manifest["version"] == 2:
+        _require_manifest_gitlinks_match_checkpoint(manifest, target_gitlinks)
+        current_paths = {
+            gitlink.relative_path.as_posix(): gitlink.relative_path for gitlink in current_gitlinks
+        }
+        target_paths = {gitlink.relative_path.as_posix() for gitlink in target_gitlinks}
+        for relative_text, relative in current_paths.items():
+            if relative_text in target_paths:
+                continue
+            obsolete = _path_without_symlink_ancestors(
+                workspace,
+                relative,
+                label="Obsolete Gitlink",
+            )
+            _remove_workspace_entry(obsolete)
+
+        checkpoints.restore_checkpoint(sha, clean_untracked_public=True)
+        if artifact_roots:
+            cleaned = run_git(
+                workspace,
+                "clean",
+                "-ffdx",
+                "--",
+                *artifact_roots,
+                check=False,
+            )
+            if cleaned.returncode != 0:
+                detail = str(cleaned.stderr or cleaned.stdout or "unknown Git error").strip()
+                raise HitlArtifactSnapshotError(
+                    f"Runtime could not clear stale evaluator artifacts: {detail}"
+                )
+        _restore_bundled_checkpoint_gitlinks(
+            workspace,
+            snapshot_id=snapshot_id,
+            manifest=manifest,
+            checkpoint_links=target_gitlinks,
+            artifact_roots=artifact_roots,
+        )
+        materialize_hitl_artifact_snapshot(
+            workspace,
+            snapshot_id=snapshot_id,
+            destination=workspace,
+        )
+        if checkpoints.current_sha() != sha:
+            raise HitlArtifactSnapshotError("Runtime could not restore the HITL node checkpoint.")
+        return sha
+
+    # Version-1 snapshots and legacy nodes depend on their existing live
+    # nested checkouts. Resolve every target before changing the workspace.
     try:
         resolved_gitlinks = resolve_checkpoint_gitlinks(workspace, sha)
     except HitlGitlinkError as exc:
         raise HitlArtifactSnapshotError(str(exc)) from exc
-    artifact_roots = list(manifest["artifact_roots"]) if manifest is not None else []
 
     checkpoints.restore_checkpoint(sha, clean_untracked_public=True)
     _restore_checkpoint_gitlinks(
