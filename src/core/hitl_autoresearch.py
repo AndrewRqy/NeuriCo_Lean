@@ -2797,14 +2797,25 @@ class HitlAutoResearchController:
             "proposal_idea_id": proposal_idea_id,
         }
 
-        def clear_repairable_scoring_handoff(
-            *, request_key: str, scorer_result: Dict[str, Any]
-        ) -> None:
+        def clear_repairable_scoring_handoff() -> None:
             """Discard an obsolete score before the worker revises the workspace."""
-            self._retire_temporary_scoring_ref(scorer_result, strict=True)
             state = HitlRuntimeState(self.work_dir)
             pending = state.pending_worker_command() or {}
+            request_key = str(pending.get("request_key", "")).strip()
+            if not request_key:
+                raise RuntimeError("HITL candidate repair has no held runtime request.")
             isolated = pending.get("isolated_scoring")
+            scorer_result = (
+                dict(isolated.get("scorer_result") or {})
+                if isinstance(isolated, dict)
+                else {}
+            )
+            self._retire_temporary_scoring_ref(scorer_result, strict=True)
+            delete_git_ref(
+                self.work_dir,
+                f"refs/neurico/hitl/scoring/{request_key}",
+                strict=True,
+            )
             snapshot_id = (
                 str(isolated.get("artifact_snapshot_id", "")).strip()
                 if isinstance(isolated, dict)
@@ -2947,10 +2958,7 @@ class HitlAutoResearchController:
                         manager_feedback=decision["reason"],
                         provenance=attempt_provenance,
                     )
-                    clear_repairable_scoring_handoff(
-                        request_key=request_key,
-                        scorer_result=scorer_result,
-                    )
+                    clear_repairable_scoring_handoff()
                     return runtime.scoring_repair_response(
                         context="Manager requested a revision after reviewing runtime score evidence.",
                         manager_feedback=decision["reason"],
@@ -3034,6 +3042,7 @@ class HitlAutoResearchController:
             allow_scoring_approval=True,
             phase_finish_validator=lambda: validate_required_artifact_contract(self.work_dir),
             scoring_handler=score_in_background,
+            scoring_repair_cleanup=clear_repairable_scoring_handoff,
         )
         try:
             prompt = (

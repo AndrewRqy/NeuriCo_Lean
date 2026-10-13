@@ -1205,6 +1205,7 @@ class HitlRuntime:
         plan_finish_validator: Optional[Callable[[], Dict[str, Any]]] = None,
         phase_finish_validator: Optional[Callable[[], Dict[str, Any]]] = None,
         scoring_handler: Optional[Callable[[Dict[str, Any]], None]] = None,
+        scoring_repair_cleanup: Optional[Callable[[], None]] = None,
         worker_prompt_contexts: Optional[Dict[str, str]] = None,
         baseline_construction: bool = False,
         baseline_candidate_manifest: Optional[Dict[str, Any]] = None,
@@ -1266,6 +1267,7 @@ class HitlRuntime:
             "supplied_plan_finish_validator": plan_finish_validator,
             "supplied_phase_finish_validator": phase_finish_validator,
             "scoring_handler": scoring_handler,
+            "scoring_repair_cleanup": scoring_repair_cleanup,
             "worker_prompt_contexts": dict(worker_prompt_contexts or {}),
             "baseline_construction": bool(baseline_construction),
             "baseline_candidate_manifest": dict(baseline_candidate_manifest or {}),
@@ -2835,13 +2837,19 @@ class HitlRuntime:
             if isinstance(pending, dict) and pending.get("status") == "cancelled":
                 return
             try:
+                def finalize_repair(review: Dict[str, Any]) -> Dict[str, Any]:
+                    cleanup = self._tool_context.get("scoring_repair_cleanup")
+                    if callable(cleanup):
+                        cleanup()
+                    return finalize_failure(review)
+
                 self.manager.resume_worker_request(
                     prompt=_load_hitl_template(
                         "manager_runtime_scoring_failure.txt",
                         error=str(exc),
                     ),
                     validate=self._validate_runtime_scoring_failure,
-                    finalize=finalize_failure,
+                    finalize=finalize_repair,
                     manager_review_kind="scoring_failure",
                 )
             except Exception:

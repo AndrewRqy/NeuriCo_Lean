@@ -76,6 +76,7 @@ def run_plan_centered_hitl_stage(
     plan_finish_validator: Callable[[], Dict[str, Any]] | None = None,
     allow_scoring_approval: bool = False,
     scoring_handler: Callable[[Dict[str, Any]], None] | None = None,
+    scoring_repair_cleanup: Callable[[], None] | None = None,
     baseline_construction: bool = False,
     baseline_candidate_manifest: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
@@ -113,6 +114,7 @@ def run_plan_centered_hitl_stage(
             worker_prompt_contexts=worker_prompt_contexts,
             allow_scoring_approval=allow_scoring_approval,
             scoring_handler=scoring_handler,
+            scoring_repair_cleanup=scoring_repair_cleanup,
             baseline_construction=baseline_construction,
             baseline_candidate_manifest=baseline_candidate_manifest,
         )
@@ -135,6 +137,7 @@ def run_plan_centered_hitl_stage(
             worker_prompt_contexts=worker_prompt_contexts,
             allow_scoring_approval=allow_scoring_approval,
             scoring_handler=scoring_handler,
+            scoring_repair_cleanup=scoring_repair_cleanup,
             baseline_construction=baseline_construction,
             baseline_candidate_manifest=baseline_candidate_manifest,
         )
@@ -153,6 +156,7 @@ def run_plan_centered_hitl_stage(
             worker_prompt_contexts=worker_prompt_contexts,
             allow_scoring_approval=allow_scoring_approval,
             scoring_handler=scoring_handler,
+            scoring_repair_cleanup=scoring_repair_cleanup,
             baseline_construction=baseline_construction,
             baseline_candidate_manifest=baseline_candidate_manifest,
         )

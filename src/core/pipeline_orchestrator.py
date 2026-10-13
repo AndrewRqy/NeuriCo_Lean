@@ -662,6 +662,7 @@ class ResearchPipelineOrchestrator:
         validator: Any,
         *,
         scoring_handler: Any = None,
+        scoring_repair_cleanup: Optional[Callable[[], None]] = None,
         baseline_construction: bool = False,
         baseline_candidate_manifest: Optional[Dict[str, Any]] = None,
         plan_finish_validator: Any = None,
@@ -719,6 +720,7 @@ class ResearchPipelineOrchestrator:
             worker_prompt_contexts=worker_prompt_contexts,
             allow_scoring_approval=scoring_handler is not None,
             scoring_handler=scoring_handler,
+            scoring_repair_cleanup=scoring_repair_cleanup,
             baseline_construction=baseline_construction,
             baseline_candidate_manifest=baseline_candidate_manifest,
         )
@@ -2093,6 +2095,41 @@ class ResearchPipelineOrchestrator:
                 completed["scorer"] = dict(finish_result["scorer_result"])
             return completed
 
+        def discard_repairable_scoring_handoff() -> None:
+            """Ensure a repair scores revised work rather than a cached failure."""
+            runtime_state = HitlRuntimeState(self.work_dir)
+            pending = runtime_state.pending_worker_command() or {}
+            request_key = str(pending.get("request_key", "")).strip()
+            if not request_key:
+                raise RuntimeError("HITL initial scoring repair has no held runtime request.")
+            isolated = pending.get("isolated_scoring")
+            scorer_result = (
+                dict(isolated.get("scorer_result") or {})
+                if isinstance(isolated, dict)
+                else {}
+            )
+            refs = {
+                f"refs/neurico/hitl/scoring/{request_key}",
+                str(scorer_result.get("scoring_ref", "")).strip(),
+            }
+            for scoring_ref in refs:
+                if scoring_ref:
+                    delete_git_ref(self.work_dir, scoring_ref, strict=False)
+            artifact_snapshot_id = (
+                str(isolated.get("artifact_snapshot_id", "")).strip()
+                if isinstance(isolated, dict)
+                else ""
+            )
+            if artifact_snapshot_id:
+                discard_hitl_artifact_snapshot(
+                    self.work_dir,
+                    artifact_snapshot_id,
+                )
+            runtime_state.update_pending_worker_command(
+                request_key,
+                isolated_scoring=None,
+            )
+
         def score_in_background(approval: Dict[str, Any]) -> None:
             """Run scoring while the finishing worker remains held in its command."""
             nonlocal scored_checkpoint_sha
@@ -2102,28 +2139,6 @@ class ResearchPipelineOrchestrator:
             request_key = str(pending.get("request_key", "")).strip()
             if not request_key:
                 raise RuntimeError("HITL initial scoring has no held runtime request.")
-
-            def discard_repairable_scoring_handoff(result: Dict[str, Any]) -> None:
-                """Ensure a repair scores revised work rather than a cached failure."""
-                scoring_ref = str(result.get("scoring_ref", "")).strip()
-                if scoring_ref:
-                    delete_git_ref(self.work_dir, scoring_ref, strict=False)
-                current = runtime_state.pending_worker_command() or {}
-                current_isolated = current.get("isolated_scoring")
-                artifact_snapshot_id = (
-                    str(current_isolated.get("artifact_snapshot_id", "")).strip()
-                    if isinstance(current_isolated, dict)
-                    else ""
-                )
-                if artifact_snapshot_id:
-                    discard_hitl_artifact_snapshot(
-                        self.work_dir,
-                        artifact_snapshot_id,
-                    )
-                runtime_state.update_pending_worker_command(
-                    request_key,
-                    isolated_scoring=None,
-                )
             isolated = pending.get("isolated_scoring")
             cached_score = isolated if isinstance(isolated, dict) else None
             if cached_score and cached_score.get("status") == "scored":
@@ -2261,7 +2276,7 @@ class ResearchPipelineOrchestrator:
                         "final": True,
                         "scorer_result": dict(scorer_result),
                     }
-                discard_repairable_scoring_handoff(scorer_result)
+                discard_repairable_scoring_handoff()
                 response_factory = (
                     runtime.initial_rule_maker_repair_response
                     if review["repair_target"] == "rule_maker"
@@ -2282,6 +2297,9 @@ class ResearchPipelineOrchestrator:
             resumed = self._resume_initial_worker(
                 runtime, launch_worker, worker_prompt_contexts, artifact_validator,
                 scoring_handler=score_in_background if scoring_enabled else None,
+                scoring_repair_cleanup=(
+                    discard_repairable_scoring_handoff if scoring_enabled else None
+                ),
             )
             if resumed is not None:
                 result, finish = resumed
@@ -2296,6 +2314,9 @@ class ResearchPipelineOrchestrator:
                     allow_scoring_approval=scoring_enabled,
                     phase_finish_validator=artifact_validator,
                     scoring_handler=score_in_background if scoring_enabled else None,
+                    scoring_repair_cleanup=(
+                        discard_repairable_scoring_handoff if scoring_enabled else None
+                    ),
                     worker_prompt_contexts=worker_prompt_contexts,
                 )
                 result, finish = run_worker_with_replacements(
@@ -2320,6 +2341,9 @@ class ResearchPipelineOrchestrator:
                 allow_scoring_approval=scoring_enabled,
                 phase_finish_validator=artifact_validator,
                 scoring_handler=score_in_background if scoring_enabled else None,
+                scoring_repair_cleanup=(
+                    discard_repairable_scoring_handoff if scoring_enabled else None
+                ),
                 worker_prompt_contexts=worker_prompt_contexts,
             )
             result, finish = run_worker_with_replacements(
@@ -2552,6 +2576,7 @@ class ResearchPipelineOrchestrator:
         artifact_validator: Optional[Callable[[], Dict[str, Any]]] = None,
         plan_finish_validator: Optional[Callable[[], Dict[str, Any]]] = None,
         scoring_handler: Optional[Callable[[Dict[str, Any]], None]] = None,
+        scoring_repair_cleanup: Optional[Callable[[], None]] = None,
         baseline_construction: bool = False,
         baseline_candidate_manifest: Optional[Dict[str, Any]] = None,
         runtime_override: Optional[HitlRuntime] = None,
@@ -2712,6 +2737,7 @@ class ResearchPipelineOrchestrator:
                 worker_prompt_contexts,
                 rule_maker_artifact_validator,
                 scoring_handler=scoring_handler,
+                scoring_repair_cleanup=scoring_repair_cleanup,
                 baseline_construction=baseline_construction,
                 baseline_candidate_manifest=baseline_candidate_manifest,
                 plan_finish_validator=plan_finish_validator,
@@ -2728,6 +2754,7 @@ class ResearchPipelineOrchestrator:
                     worker_prompt_contexts=worker_prompt_contexts,
                     allow_scoring_approval=bool(scoring_handler),
                     scoring_handler=scoring_handler,
+                    scoring_repair_cleanup=scoring_repair_cleanup,
                     baseline_construction=baseline_construction,
                     baseline_candidate_manifest=baseline_candidate_manifest,
                 )
@@ -2760,6 +2787,7 @@ class ResearchPipelineOrchestrator:
                 plan_finish_validator=plan_finish_validator,
                 allow_scoring_approval=bool(scoring_handler),
                 scoring_handler=scoring_handler,
+                scoring_repair_cleanup=scoring_repair_cleanup,
                 baseline_construction=baseline_construction,
                 baseline_candidate_manifest=baseline_candidate_manifest,
             )
@@ -3015,6 +3043,46 @@ class ResearchPipelineOrchestrator:
                 }
             return managed_runtime._validate_living_plan_file()
 
+        def discard_repairable_baseline_handoff() -> None:
+            """Return a failed baseline score to its existing repair boundary."""
+            nonlocal sealed_outputs
+            runtime_state = HitlRuntimeState(self.work_dir)
+            pending = runtime_state.pending_worker_command() or {}
+            request_key = str(pending.get("request_key", "")).strip()
+            if not request_key:
+                raise RuntimeError("Baseline scoring repair has no held rule-maker request.")
+            isolated = pending.get("isolated_scoring")
+            scorer_result = (
+                dict(isolated.get("scorer_result") or {})
+                if isinstance(isolated, dict)
+                else {}
+            )
+            refs = {
+                f"refs/neurico/hitl/scoring/{request_key}",
+                str(scorer_result.get("scoring_ref", "")).strip(),
+            }
+            for scoring_ref in refs:
+                if scoring_ref:
+                    delete_git_ref(self.work_dir, scoring_ref, strict=False)
+            artifact_snapshot_id = (
+                str(isolated.get("artifact_snapshot_id", "")).strip()
+                if isinstance(isolated, dict)
+                else ""
+            )
+            if artifact_snapshot_id:
+                discard_hitl_artifact_snapshot(
+                    self.work_dir,
+                    artifact_snapshot_id,
+                )
+            runtime_state.update_pending_worker_command(
+                request_key,
+                isolated_scoring=None,
+            )
+            (self.work_dir / "scoring" / "results.json").unlink(missing_ok=True)
+            sealed_outputs = self._seal_bootstrap_inputs()
+            evaluator_dir = sealed_dir_for(self.work_dir)
+            unseal_scoring_files(self.work_dir, evaluator_dir)
+
         def score_baseline(approval: Dict[str, Any]) -> None:
             nonlocal sealed_outputs, scoring_result
             runtime = managed_runtime
@@ -3145,28 +3213,7 @@ class ResearchPipelineOrchestrator:
                         "scorer_result": dict(scoring_result),
                     }
 
-                scoring_ref = str(scoring_result.get("scoring_ref", "")).strip()
-                if scoring_ref:
-                    delete_git_ref(self.work_dir, scoring_ref, strict=False)
-                current = runtime_state.pending_worker_command() or {}
-                current_isolated = current.get("isolated_scoring")
-                artifact_snapshot_id = (
-                    str(current_isolated.get("artifact_snapshot_id", "")).strip()
-                    if isinstance(current_isolated, dict)
-                    else ""
-                )
-                if artifact_snapshot_id:
-                    discard_hitl_artifact_snapshot(
-                        self.work_dir,
-                        artifact_snapshot_id,
-                    )
-                runtime_state.update_pending_worker_command(
-                    request_key,
-                    isolated_scoring=None,
-                )
-                stale_results.unlink(missing_ok=True)
-                sealed_outputs = self._seal_bootstrap_inputs()
-                unseal_scoring_files(self.work_dir, evaluator_dir)
+                discard_repairable_baseline_handoff()
                 return runtime.scoring_repair_response(
                     context=str(review["context"]),
                     manager_feedback=str(review["manager_feedback"]),
@@ -3201,6 +3248,7 @@ class ResearchPipelineOrchestrator:
                     artifact_validator=validate_baseline_artifacts,
                     plan_finish_validator=validate_baseline_plan,
                     scoring_handler=score_baseline,
+                    scoring_repair_cleanup=discard_repairable_baseline_handoff,
                     baseline_construction=True,
                     baseline_candidate_manifest=candidate_manifest,
                     runtime_override=managed_runtime,
