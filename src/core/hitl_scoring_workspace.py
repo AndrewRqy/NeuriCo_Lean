@@ -17,7 +17,13 @@ import shutil
 import tarfile
 import tempfile
 
-from core.hitl_git import run_git
+from core.hitl_git import (
+    HitlGitlinkError,
+    checkpoint_gitlinks,
+    git_failure_detail,
+    resolve_checkpoint_gitlinks,
+    run_git,
+)
 from core.hitl_artifact_snapshots import (
     capture_hitl_artifact_snapshot,
     materialize_hitl_artifact_snapshot,
@@ -137,57 +143,15 @@ def _prepare_scoring_directory(work_dir: Path) -> None:
     scoring_dir.mkdir(parents=True)
 
 
-def _git_failure_detail(completed: Any) -> str:
-    value = completed.stderr or completed.stdout or "unknown Git error"
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace").strip()
-    return str(value).strip()
-
-
 def _checkpoint_gitlinks(work_dir: Path, source_sha: str) -> list[tuple[Path, str]]:
-    """Return every Gitlink path and commit recorded by ``source_sha``."""
-    completed = run_git(
-        work_dir,
-        "ls-tree",
-        "-r",
-        "-z",
-        "--full-tree",
-        source_sha,
-        text=False,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise HitlScoringWorkspaceError(
-            "Runtime could not inspect the isolated scorer checkpoint: "
-            f"{_git_failure_detail(completed)}"
-        )
-
-    gitlinks: list[tuple[Path, str]] = []
-    for raw_record in bytes(completed.stdout or b"").split(b"\0"):
-        if not raw_record:
-            continue
-        metadata, separator, raw_path = raw_record.partition(b"\t")
-        fields = metadata.split()
-        if not separator or len(fields) != 3:
-            raise HitlScoringWorkspaceError(
-                "Runtime received an invalid Git tree record while preparing the isolated scorer."
-            )
-        mode, object_type, raw_commit = fields
-        if mode != b"160000":
-            continue
-        if object_type != b"commit" or not raw_path:
-            raise HitlScoringWorkspaceError(
-                "Runtime received an invalid Gitlink while preparing the isolated scorer."
-            )
-
-        relative_text = os.fsdecode(raw_path)
-        posix_path = PurePosixPath(relative_text)
-        if posix_path.is_absolute() or any(part in {"", ".", ".."} for part in posix_path.parts):
-            raise HitlScoringWorkspaceError(
-                f"Runtime rejected unsafe Gitlink path: {relative_text!r}."
-            )
-        gitlinks.append((Path(*posix_path.parts), raw_commit.decode("ascii")))
-    return gitlinks
+    """Compatibility wrapper around shared checkpoint Gitlink inspection."""
+    try:
+        return [
+            (gitlink.relative_path, gitlink.commit_sha)
+            for gitlink in checkpoint_gitlinks(work_dir, source_sha)
+        ]
+    except HitlGitlinkError as exc:
+        raise HitlScoringWorkspaceError(str(exc)) from exc
 
 
 def _contained_path(root: Path, relative: Path, *, description: str) -> Path:
@@ -209,50 +173,20 @@ def validate_checkpoint_gitlinks(
     """Return issues for nested repositories that differ from their Gitlinks."""
     root = Path(work_dir).resolve()
     try:
-        gitlinks = _checkpoint_gitlinks(root, source_sha)
-    except HitlScoringWorkspaceError as exc:
+        resolved_gitlinks = resolve_checkpoint_gitlinks(root, source_sha)
+    except HitlGitlinkError as exc:
         return [str(exc)]
 
     issues: list[str] = []
-    for relative, commit_sha in gitlinks:
-        try:
-            source_repo = _contained_path(
-                root,
-                relative,
-                description="Gitlink source",
-            )
-        except HitlScoringWorkspaceError as exc:
-            issues.append(str(exc))
-            continue
+    for gitlink, source_repo in resolved_gitlinks:
+        relative = gitlink.relative_path
+        commit_sha = gitlink.commit_sha
         relative_text = relative.as_posix()
-        if not source_repo.is_dir():
-            issues.append(
-                "Checkpointed nested repository "
-                f"`{relative_text}` is missing from the workspace."
-            )
-            continue
-
-        repository_root = run_git(
-            source_repo,
-            "rev-parse",
-            "--show-toplevel",
-            check=False,
-        )
-        if (
-            repository_root.returncode != 0
-            or Path(str(repository_root.stdout).strip()).resolve() != source_repo
-        ):
-            issues.append(
-                "Checkpointed nested repository "
-                f"`{relative_text}` is not available at its recorded Git root."
-            )
-            continue
-
         head = run_git(source_repo, "rev-parse", "HEAD", check=False)
         if head.returncode != 0:
             issues.append(
                 "Could not inspect HEAD for checkpointed nested repository "
-                f"`{relative_text}`: {_git_failure_detail(head)}"
+                f"`{relative_text}`: {git_failure_detail(head)}"
             )
         elif str(head.stdout).strip() != commit_sha:
             issues.append(
@@ -272,7 +206,7 @@ def validate_checkpoint_gitlinks(
         if status.returncode != 0:
             issues.append(
                 "Could not inspect working-tree status for checkpointed nested repository "
-                f"`{relative_text}`: {_git_failure_detail(status)}"
+                f"`{relative_text}`: {git_failure_detail(status)}"
             )
         elif bytes(status.stdout or b""):
             issues.append(
@@ -311,51 +245,18 @@ def _materialize_checkpoint_gitlinks(
     source_sha: str,
 ) -> None:
     """Restore exact nested-repository contents omitted by ``git worktree``."""
-    for index, (relative, commit_sha) in enumerate(_checkpoint_gitlinks(work_dir, source_sha)):
-        source_repo = _contained_path(
-            work_dir,
-            relative,
-            description="Gitlink source",
-        )
+    try:
+        resolved_gitlinks = resolve_checkpoint_gitlinks(work_dir, source_sha)
+    except HitlGitlinkError as exc:
+        raise HitlScoringWorkspaceError(str(exc)) from exc
+    for index, (gitlink, source_repo) in enumerate(resolved_gitlinks):
+        relative = gitlink.relative_path
+        commit_sha = gitlink.commit_sha
         destination = _contained_path(
             scorer_dir,
             relative,
             description="Gitlink destination",
         )
-        if not source_repo.is_dir():
-            raise HitlScoringWorkspaceError(
-                "Runtime could not materialize checkpointed nested repository "
-                f"{relative.as_posix()}: the source repository is missing."
-            )
-
-        repository_root = run_git(
-            source_repo,
-            "rev-parse",
-            "--show-toplevel",
-            check=False,
-        )
-        if (
-            repository_root.returncode != 0
-            or Path(str(repository_root.stdout).strip()).resolve() != source_repo
-        ):
-            raise HitlScoringWorkspaceError(
-                "Runtime could not materialize checkpointed nested repository "
-                f"{relative.as_posix()}: the source path is not its Git root."
-            )
-
-        commit_exists = run_git(
-            source_repo,
-            "cat-file",
-            "-e",
-            f"{commit_sha}^{{commit}}",
-            check=False,
-            quiet=True,
-        )
-        if commit_exists.returncode != 0:
-            raise HitlScoringWorkspaceError(
-                "Runtime could not materialize checkpointed nested repository "
-                f"{relative.as_posix()}: commit {commit_sha} is unavailable."
-            )
 
         if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
             destination.unlink()
@@ -375,7 +276,7 @@ def _materialize_checkpoint_gitlinks(
         if archived.returncode != 0:
             raise HitlScoringWorkspaceError(
                 "Runtime could not export checkpointed nested repository "
-                f"{relative.as_posix()}: {_git_failure_detail(archived)}"
+                f"{relative.as_posix()}: {git_failure_detail(archived)}"
             )
         try:
             _extract_git_archive(archive_path, destination)

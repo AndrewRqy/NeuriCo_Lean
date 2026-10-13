@@ -17,7 +17,15 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from core.hitl_git import run_git
+from core.hitl_git import (
+    CheckpointGitlink,
+    HitlGitlinkError,
+    checkpoint_gitlinks,
+    git_failure_detail,
+    resolve_gitlink_repositories,
+    resolve_checkpoint_gitlinks,
+    run_git,
+)
 from core.hitl_paths import hitl_artifact_snapshots_dir
 from core.hitl_util import atomic_write_json, fsync_directory
 
@@ -100,46 +108,96 @@ def _copy_entry(source: Path, destination: Path) -> None:
     )
 
 
-def _reject_gitlink_artifact_roots(
+def _artifact_scopes_in_gitlink(
+    artifact_roots: list[str],
+    gitlink: CheckpointGitlink,
+) -> list[Path]:
+    """Return portions of the artifact contract owned by one Gitlink."""
+    scopes: list[Path] = []
+    seen: set[str] = set()
+    nested_root = gitlink.relative_path
+    for raw_root in artifact_roots:
+        root = _safe_relative_path(raw_root, label="artifact root")
+        if root == nested_root or nested_root in root.parents:
+            scope = root.relative_to(nested_root)
+        elif root in nested_root.parents:
+            scope = Path(".")
+        else:
+            continue
+        key = scope.as_posix()
+        if key not in seen:
+            seen.add(key)
+            scopes.append(scope)
+    return scopes
+
+
+def _validate_gitlink_artifact_ownership(
     work_dir: Path,
     *,
     source_checkpoint_sha: str,
     artifact_roots: list[str],
-) -> None:
-    """Reject contract roots whose state is owned by a nested repository."""
-    listed = run_git(
-        work_dir,
-        "ls-tree",
-        "-r",
-        "-z",
-        "--full-tree",
-        source_checkpoint_sha,
-        text=False,
-        check=False,
-    )
-    if listed.returncode != 0:
-        detail = bytes(listed.stderr or listed.stdout or b"unknown Git error").decode(
-            "utf-8", errors="replace"
-        ).strip()
-        raise HitlArtifactSnapshotError(
-            f"Runtime could not inspect the artifact checkpoint: {detail}"
-        )
-    gitlinks: list[PurePosixPath] = []
-    for raw_record in bytes(listed.stdout or b"").split(b"\0"):
-        if not raw_record:
+) -> list[tuple[CheckpointGitlink, Path]]:
+    """Require nested artifact state to be fully owned by its Git checkpoint."""
+    try:
+        relevant_gitlinks = [
+            gitlink
+            for gitlink in checkpoint_gitlinks(work_dir, source_checkpoint_sha)
+            if _artifact_scopes_in_gitlink(artifact_roots, gitlink)
+        ]
+        resolved_gitlinks = resolve_gitlink_repositories(work_dir, relevant_gitlinks)
+    except HitlGitlinkError as exc:
+        raise HitlArtifactSnapshotError(str(exc)) from exc
+
+    for gitlink, repository in resolved_gitlinks:
+        scopes = _artifact_scopes_in_gitlink(artifact_roots, gitlink)
+        if not scopes:
             continue
-        metadata, separator, raw_path = raw_record.partition(b"\t")
-        fields = metadata.split()
-        if separator and len(fields) == 3 and fields[0] == b"160000":
-            gitlinks.append(PurePosixPath(os.fsdecode(raw_path)))
-    for raw_root in artifact_roots:
-        root = PurePosixPath(raw_root)
-        for gitlink in gitlinks:
-            if root == gitlink or root.is_relative_to(gitlink) or gitlink.is_relative_to(root):
-                raise HitlArtifactSnapshotError(
-                    "Evaluator-declared artifacts cannot cross checkpointed nested "
-                    f"repository {gitlink.as_posix()}: {raw_root}"
-                )
+        relative_text = gitlink.relative_path.as_posix()
+        head = run_git(repository, "rev-parse", "HEAD", check=False)
+        if head.returncode != 0:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not inspect checkpointed nested repository "
+                f"`{relative_text}`: {git_failure_detail(head)}"
+            )
+        if str(head.stdout).strip() != gitlink.commit_sha:
+            raise HitlArtifactSnapshotError(
+                "Evaluator-declared artifacts in checkpointed nested repository "
+                f"`{relative_text}` are not at the recorded commit."
+            )
+
+        status = run_git(
+            repository,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--",
+            *[scope.as_posix() for scope in scopes],
+            text=False,
+            check=False,
+        )
+        if status.returncode != 0:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not inspect evaluator-declared artifacts in checkpointed "
+                f"nested repository `{relative_text}`: {git_failure_detail(status)}"
+            )
+        if bytes(status.stdout or b""):
+            raise HitlArtifactSnapshotError(
+                "Evaluator-declared artifacts in checkpointed nested repository "
+                f"`{relative_text}` must be clean committed content or absent."
+            )
+    return resolved_gitlinks
+
+
+def _path_is_owned_by_gitlink(
+    relative: Path,
+    resolved_gitlinks: list[tuple[CheckpointGitlink, Path]],
+) -> bool:
+    return any(
+        relative == gitlink.relative_path or gitlink.relative_path in relative.parents
+        for gitlink, _repository in resolved_gitlinks
+    )
 
 
 def _read_manifest(work_dir: Path, snapshot_id: str) -> dict[str, Any]:
@@ -229,7 +287,7 @@ def capture_hitl_artifact_snapshot(
     roots = _artifact_roots(workspace)
     if not roots:
         raise HitlArtifactSnapshotError("Artifact snapshot requires a non-empty frozen contract.")
-    _reject_gitlink_artifact_roots(
+    resolved_gitlinks = _validate_gitlink_artifact_ownership(
         workspace,
         source_checkpoint_sha=source_sha,
         artifact_roots=roots,
@@ -276,6 +334,8 @@ def capture_hitl_artifact_snapshot(
             continue
         relative_text = os.fsdecode(raw)
         relative = _safe_relative_path(relative_text, label="ignored artifact path")
+        if _path_is_owned_by_gitlink(relative, resolved_gitlinks):
+            continue
         normalized_relative = relative.as_posix()
         if normalized_relative not in seen:
             seen.add(normalized_relative)
@@ -360,6 +420,59 @@ def discard_hitl_artifact_snapshot(work_dir: Path, snapshot_id: str) -> None:
         shutil.rmtree(target)
 
 
+def _restore_checkpoint_gitlinks(
+    resolved_gitlinks: list[tuple[CheckpointGitlink, Path]],
+    *,
+    artifact_roots: list[str],
+) -> None:
+    """Restore nested checkouts and clean only runtime-owned artifact state."""
+    for gitlink, repository in resolved_gitlinks:
+        relative_text = gitlink.relative_path.as_posix()
+        reset = run_git(
+            repository,
+            "reset",
+            "--hard",
+            gitlink.commit_sha,
+            check=False,
+        )
+        if reset.returncode != 0:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not restore checkpointed nested repository "
+                f"`{relative_text}`: {git_failure_detail(reset)}"
+            )
+
+        cleaned_public = run_git(repository, "clean", "-fd", check=False)
+        if cleaned_public.returncode != 0:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not clear untracked files from checkpointed nested "
+                f"repository `{relative_text}`: {git_failure_detail(cleaned_public)}"
+            )
+
+        scopes = _artifact_scopes_in_gitlink(artifact_roots, gitlink)
+        if scopes:
+            cleaned_ignored = run_git(
+                repository,
+                "clean",
+                "-fdX",
+                "--",
+                *[scope.as_posix() for scope in scopes],
+                check=False,
+            )
+            if cleaned_ignored.returncode != 0:
+                raise HitlArtifactSnapshotError(
+                    "Runtime could not clear stale ignored evaluator artifacts from "
+                    f"checkpointed nested repository `{relative_text}`: "
+                    f"{git_failure_detail(cleaned_ignored)}"
+                )
+
+        head = run_git(repository, "rev-parse", "HEAD", check=False)
+        if head.returncode != 0 or str(head.stdout).strip() != gitlink.commit_sha:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not verify restored checkpointed nested repository "
+                f"`{relative_text}`."
+            )
+
+
 def restore_hitl_checkpoint_with_artifacts(
     work_dir: Path,
     *,
@@ -380,14 +493,24 @@ def restore_hitl_checkpoint_with_artifacts(
         if snapshot_id
         else None
     )
+    try:
+        resolved_gitlinks = resolve_checkpoint_gitlinks(workspace, sha)
+    except HitlGitlinkError as exc:
+        raise HitlArtifactSnapshotError(str(exc)) from exc
+    artifact_roots = list(manifest["artifact_roots"]) if manifest is not None else []
+
     checkpoints.restore_checkpoint(sha, clean_untracked_public=True)
+    _restore_checkpoint_gitlinks(
+        resolved_gitlinks,
+        artifact_roots=artifact_roots,
+    )
     if manifest is not None:
         cleaned = run_git(
             workspace,
             "clean",
             "-fdX",
             "--",
-            *[str(root) for root in manifest["artifact_roots"]],
+            *artifact_roots,
             check=False,
         )
         if cleaned.returncode != 0:

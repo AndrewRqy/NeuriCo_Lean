@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 from typing import Mapping
 
@@ -27,6 +27,18 @@ class HitlGitCommandError(RuntimeError):
         ).strip()
         super().__init__(f"Git command failed ({' '.join(failure.argv)}): {detail}")
         self.failure = failure
+
+
+class HitlGitlinkError(RuntimeError):
+    """Raised when a checkpointed nested repository cannot be used safely."""
+
+
+@dataclass(frozen=True)
+class CheckpointGitlink:
+    """One nested repository recorded by a parent workspace checkpoint."""
+
+    relative_path: Path
+    commit_sha: str
 
 
 def run_git(
@@ -97,3 +109,139 @@ def delete_git_ref(work_dir: Path, ref_name: str, *, strict: bool) -> None:
             stderr=removed.stderr or "",
         )
     )
+
+
+def git_failure_detail(completed: subprocess.CompletedProcess) -> str:
+    """Return the useful diagnostic from a failed Git command."""
+    value = completed.stderr or completed.stdout or "unknown Git error"
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    return str(value).strip()
+
+
+def checkpoint_gitlinks(
+    work_dir: Path,
+    source_sha: str,
+) -> list[CheckpointGitlink]:
+    """Return every safe Gitlink path and commit recorded by a checkpoint."""
+    completed = run_git(
+        work_dir,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        source_sha,
+        text=False,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise HitlGitlinkError(
+            "Runtime could not inspect checkpointed nested repositories: "
+            f"{git_failure_detail(completed)}"
+        )
+
+    gitlinks: list[CheckpointGitlink] = []
+    for raw_record in bytes(completed.stdout or b"").split(b"\0"):
+        if not raw_record:
+            continue
+        metadata, separator, raw_path = raw_record.partition(b"\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3:
+            raise HitlGitlinkError(
+                "Runtime received an invalid Git tree record while inspecting "
+                "checkpointed nested repositories."
+            )
+        mode, object_type, raw_commit = fields
+        if mode != b"160000":
+            continue
+        if object_type != b"commit" or not raw_path:
+            raise HitlGitlinkError(
+                "Runtime received an invalid checkpointed nested repository record."
+            )
+
+        relative_text = os.fsdecode(raw_path)
+        posix_path = PurePosixPath(relative_text)
+        if posix_path.is_absolute() or any(
+            part in {"", ".", ".."} for part in posix_path.parts
+        ):
+            raise HitlGitlinkError(
+                f"Runtime rejected unsafe Gitlink path: {relative_text!r}."
+            )
+        try:
+            commit_sha = raw_commit.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise HitlGitlinkError(
+                "Runtime received an invalid checkpointed nested repository commit."
+            ) from exc
+        gitlinks.append(
+            CheckpointGitlink(
+                relative_path=Path(*posix_path.parts),
+                commit_sha=commit_sha,
+            )
+        )
+    return gitlinks
+
+
+def resolve_checkpoint_gitlinks(
+    work_dir: Path,
+    source_sha: str,
+) -> list[tuple[CheckpointGitlink, Path]]:
+    """Resolve checkpoint Gitlinks to local repositories containing their commits."""
+    return resolve_gitlink_repositories(
+        work_dir,
+        checkpoint_gitlinks(work_dir, source_sha),
+    )
+
+
+def resolve_gitlink_repositories(
+    work_dir: Path,
+    gitlinks: list[CheckpointGitlink],
+) -> list[tuple[CheckpointGitlink, Path]]:
+    """Resolve known Gitlinks to local repositories containing their commits."""
+    workspace = Path(work_dir).resolve()
+    resolved: list[tuple[CheckpointGitlink, Path]] = []
+    for gitlink in gitlinks:
+        repository = (workspace / gitlink.relative_path).resolve()
+        try:
+            repository.relative_to(workspace)
+        except ValueError as exc:
+            raise HitlGitlinkError(
+                "Runtime rejected checkpointed nested repository outside the workspace: "
+                f"{gitlink.relative_path.as_posix()}."
+            ) from exc
+        relative_text = gitlink.relative_path.as_posix()
+        if not repository.is_dir():
+            raise HitlGitlinkError(
+                f"Checkpointed nested repository `{relative_text}` is missing from the workspace."
+            )
+
+        repository_root = run_git(
+            repository,
+            "rev-parse",
+            "--show-toplevel",
+            check=False,
+        )
+        if (
+            repository_root.returncode != 0
+            or Path(str(repository_root.stdout).strip()).resolve() != repository
+        ):
+            raise HitlGitlinkError(
+                "Checkpointed nested repository "
+                f"`{relative_text}` is not available at its recorded Git root."
+            )
+
+        commit_exists = run_git(
+            repository,
+            "cat-file",
+            "-e",
+            f"{gitlink.commit_sha}^{{commit}}",
+            check=False,
+            quiet=True,
+        )
+        if commit_exists.returncode != 0:
+            raise HitlGitlinkError(
+                "Checkpointed nested repository "
+                f"`{relative_text}` does not contain recorded commit {gitlink.commit_sha}."
+            )
+        resolved.append((gitlink, repository))
+    return resolved
