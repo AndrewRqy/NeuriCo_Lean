@@ -559,6 +559,7 @@ class ResearchPipelineOrchestrator:
             self._discard_initial_boundary(boundary)
             return {"stage": stage, "checkpoint_sha": str(boundary.get("checkpoint_sha", ""))}
         rollback = HitlStageRollback.from_descriptor(self.work_dir, boundary)
+        self._retire_initial_scoring_refs_before_rollback()
         runtime = self._create_hitl_runtime(stage)
         try:
             rollback.restore(
