@@ -529,14 +529,17 @@ def _require_manifest_gitlinks_match_checkpoint(
     return entries
 
 
-def materialize_hitl_snapshot_gitlinks(
+def resolve_hitl_snapshot_gitlink_bundles(
     work_dir: Path,
     *,
     snapshot_id: str,
     checkpoint_sha: str,
-    destination: Path,
-) -> bool:
-    """Materialize bundled Gitlink trees as plain files for isolated scoring."""
+) -> list[tuple[CheckpointGitlink, Path]] | None:
+    """Return validated Gitlink bundles for isolated scoring.
+
+    Version-1 snapshots predate bundled Gitlinks and return ``None`` so the
+    scorer can retain its existing live-repository fallback.
+    """
     workspace = Path(work_dir).resolve()
     manifest = validate_hitl_artifact_snapshot(
         workspace,
@@ -544,50 +547,19 @@ def materialize_hitl_snapshot_gitlinks(
         source_checkpoint_sha=checkpoint_sha,
     )
     if manifest["version"] == 1:
-        return False
+        return None
     try:
         checkpoint_links = checkpoint_gitlinks(workspace, checkpoint_sha)
     except HitlGitlinkError as exc:
         raise HitlArtifactSnapshotError(str(exc)) from exc
     entries = _require_manifest_gitlinks_match_checkpoint(manifest, checkpoint_links)
-    target_root = Path(destination).resolve()
-    for gitlink, bundle_text in entries:
-        target = _path_without_symlink_ancestors(
-            target_root,
-            gitlink.relative_path,
-            label="Materialized Gitlink",
+    return [
+        (
+            gitlink,
+            _snapshot_bundle_path(workspace, snapshot_id, bundle_text),
         )
-        _remove_workspace_entry(target)
-        target.mkdir(parents=True)
-        initialized = run_git(target, "init", "--quiet", check=False)
-        if initialized.returncode != 0:
-            raise HitlArtifactSnapshotError(
-                "Runtime could not initialize isolated nested repository "
-                f"`{gitlink.relative_path.as_posix()}`: {git_failure_detail(initialized)}"
-            )
-        try:
-            fetch_git_commit_bundle(
-                target,
-                bundle_path=_snapshot_bundle_path(workspace, snapshot_id, bundle_text),
-                commit_sha=gitlink.commit_sha,
-            )
-        except HitlGitlinkError as exc:
-            raise HitlArtifactSnapshotError(str(exc)) from exc
-        checked_out = run_git(
-            target,
-            "checkout",
-            "--detach",
-            "--force",
-            gitlink.commit_sha,
-            check=False,
-        )
-        if checked_out.returncode != 0:
-            raise HitlArtifactSnapshotError(
-                "Runtime could not materialize isolated nested repository "
-                f"`{gitlink.relative_path.as_posix()}`: {git_failure_detail(checked_out)}"
-            )
-        _remove_workspace_entry(target / ".git")
-    return True
+        for gitlink, bundle_text in entries
+    ]
 
 
 def discard_hitl_artifact_snapshot(work_dir: Path, snapshot_id: str) -> None:

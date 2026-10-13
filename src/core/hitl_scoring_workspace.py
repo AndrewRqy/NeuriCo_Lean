@@ -19,6 +19,7 @@ import tempfile
 
 from core.hitl_git import (
     HitlGitlinkError,
+    fetch_git_commit_bundle,
     git_failure_detail,
     resolve_checkpoint_gitlinks,
     run_git,
@@ -27,7 +28,7 @@ from core.hitl_artifact_snapshots import (
     HitlArtifactSnapshotError,
     capture_hitl_artifact_snapshot,
     materialize_hitl_artifact_snapshot,
-    materialize_hitl_snapshot_gitlinks,
+    resolve_hitl_snapshot_gitlink_bundles,
 )
 from core.hitl_paths import hitl_artifact_contract_path
 from core.scoring_seal import SEALED_PATHS, verify_sealed_scoring_manifest
@@ -236,59 +237,95 @@ def _materialize_checkpoint_gitlinks(
     artifact_snapshot_id: Optional[str] = None,
 ) -> None:
     """Restore exact nested-repository contents omitted by ``git worktree``."""
-    if str(artifact_snapshot_id or "").strip():
-        try:
-            if materialize_hitl_snapshot_gitlinks(
-                work_dir,
-                snapshot_id=str(artifact_snapshot_id),
-                checkpoint_sha=source_sha,
-                destination=scorer_dir,
-            ):
-                return
-        except HitlArtifactSnapshotError as exc:
-            raise HitlScoringWorkspaceError(str(exc)) from exc
+    resolved_gitlinks = None
+    bundle_repositories_root: Path | None = None
     try:
-        resolved_gitlinks = resolve_checkpoint_gitlinks(work_dir, source_sha)
-    except HitlGitlinkError as exc:
-        raise HitlScoringWorkspaceError(str(exc)) from exc
-    for index, (gitlink, source_repo) in enumerate(resolved_gitlinks):
-        relative = gitlink.relative_path
-        commit_sha = gitlink.commit_sha
-        destination = _contained_path(
-            scorer_dir,
-            relative,
-            description="Gitlink destination",
-        )
-
-        if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
-            destination.unlink()
-        elif destination.is_dir():
-            shutil.rmtree(destination)
-        destination.mkdir(parents=True)
-
-        archive_path = scorer_dir.parent / f".gitlink-{index}.tar"
-        archived = run_git(
-            source_repo,
-            "archive",
-            "--format=tar",
-            f"--output={archive_path}",
-            commit_sha,
-            check=False,
-        )
-        if archived.returncode != 0:
-            raise HitlScoringWorkspaceError(
-                "Runtime could not export checkpointed nested repository "
-                f"{relative.as_posix()}: {git_failure_detail(archived)}"
+        if str(artifact_snapshot_id or "").strip():
+            try:
+                bundled_gitlinks = resolve_hitl_snapshot_gitlink_bundles(
+                    work_dir,
+                    snapshot_id=str(artifact_snapshot_id),
+                    checkpoint_sha=source_sha,
+                )
+            except HitlArtifactSnapshotError as exc:
+                raise HitlScoringWorkspaceError(str(exc)) from exc
+            if bundled_gitlinks is not None:
+                bundle_repositories_root = (
+                    scorer_dir.parent / ".gitlink-bundle-repositories"
+                )
+                bundle_repositories_root.mkdir()
+                resolved_gitlinks = []
+                for index, (gitlink, bundle_path) in enumerate(bundled_gitlinks):
+                    repository = bundle_repositories_root / f"{index:04d}.git"
+                    repository.mkdir()
+                    initialized = run_git(
+                        repository,
+                        "init",
+                        "--bare",
+                        "--quiet",
+                        check=False,
+                    )
+                    if initialized.returncode != 0:
+                        raise HitlScoringWorkspaceError(
+                            "Runtime could not initialize bundled nested repository "
+                            f"`{gitlink.relative_path.as_posix()}`: "
+                            f"{git_failure_detail(initialized)}"
+                        )
+                    try:
+                        fetch_git_commit_bundle(
+                            repository,
+                            bundle_path=bundle_path,
+                            commit_sha=gitlink.commit_sha,
+                        )
+                    except HitlGitlinkError as exc:
+                        raise HitlScoringWorkspaceError(str(exc)) from exc
+                    resolved_gitlinks.append((gitlink, repository))
+        if resolved_gitlinks is None:
+            try:
+                resolved_gitlinks = resolve_checkpoint_gitlinks(work_dir, source_sha)
+            except HitlGitlinkError as exc:
+                raise HitlScoringWorkspaceError(str(exc)) from exc
+        for index, (gitlink, source_repo) in enumerate(resolved_gitlinks):
+            relative = gitlink.relative_path
+            commit_sha = gitlink.commit_sha
+            destination = _contained_path(
+                scorer_dir,
+                relative,
+                description="Gitlink destination",
             )
-        try:
-            _extract_git_archive(archive_path, destination)
-        except (OSError, safe_tarfile.TarError) as exc:
-            raise HitlScoringWorkspaceError(
-                "Runtime could not restore checkpointed nested repository "
-                f"{relative.as_posix()}: {exc}"
-            ) from exc
-        finally:
-            archive_path.unlink(missing_ok=True)
+
+            if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+                destination.unlink()
+            elif destination.is_dir():
+                shutil.rmtree(destination)
+            destination.mkdir(parents=True)
+
+            archive_path = scorer_dir.parent / f".gitlink-{index}.tar"
+            archived = run_git(
+                source_repo,
+                "archive",
+                "--format=tar",
+                f"--output={archive_path}",
+                commit_sha,
+                check=False,
+            )
+            if archived.returncode != 0:
+                raise HitlScoringWorkspaceError(
+                    "Runtime could not export checkpointed nested repository "
+                    f"{relative.as_posix()}: {git_failure_detail(archived)}"
+                )
+            try:
+                _extract_git_archive(archive_path, destination)
+            except (OSError, safe_tarfile.TarError) as exc:
+                raise HitlScoringWorkspaceError(
+                    "Runtime could not restore checkpointed nested repository "
+                    f"{relative.as_posix()}: {exc}"
+                ) from exc
+            finally:
+                archive_path.unlink(missing_ok=True)
+    finally:
+        if bundle_repositories_root is not None:
+            shutil.rmtree(bundle_repositories_root, ignore_errors=True)
 
 
 def _write_public_results(path: Path, source: Path) -> str:
