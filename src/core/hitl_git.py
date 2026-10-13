@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 from typing import Mapping
 import uuid
@@ -40,6 +41,9 @@ class CheckpointGitlink:
 
     relative_path: Path
     commit_sha: str
+
+
+_OBJECT_ID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
 def run_git(
@@ -253,7 +257,7 @@ def verify_git_commit_bundle(
     bundle_path: Path,
     commit_sha: str,
 ) -> None:
-    """Require one readable, self-contained bundle advertising ``commit_sha``."""
+    """Require one readable bundle advertising ``commit_sha``."""
     bundle = Path(bundle_path)
     if bundle.is_symlink() or not bundle.is_file():
         raise HitlGitlinkError(f"Checkpointed nested-repository bundle is missing: {bundle}")
@@ -279,16 +283,102 @@ def verify_git_commit_bundle(
         )
 
 
+def _git_shallow_path(repository: Path) -> Path:
+    resolved = run_git(repository, "rev-parse", "--git-path", "shallow", check=False)
+    if resolved.returncode != 0:
+        raise HitlGitlinkError(
+            "Runtime could not locate nested-repository shallow metadata: "
+            f"{git_failure_detail(resolved)}"
+        )
+    value = Path(str(resolved.stdout).strip())
+    return value if value.is_absolute() else Path(repository).resolve() / value
+
+
+def git_commit_shallow_boundaries(
+    repository: Path,
+    commit_sha: str,
+) -> tuple[str, ...]:
+    """Return shallow boundaries reachable from one nested commit."""
+    repo = Path(repository).resolve()
+    shallow = run_git(repo, "rev-parse", "--is-shallow-repository", check=False)
+    if shallow.returncode != 0:
+        raise HitlGitlinkError(
+            "Runtime could not inspect nested-repository shallow state: "
+            f"{git_failure_detail(shallow)}"
+        )
+    if str(shallow.stdout).strip() != "true":
+        return ()
+
+    path = _git_shallow_path(repo)
+    try:
+        candidates = path.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise HitlGitlinkError(
+            "Runtime could not read nested-repository shallow metadata."
+        ) from exc
+
+    boundaries: list[str] = []
+    for raw in candidates:
+        boundary = raw.strip()
+        if not _OBJECT_ID.fullmatch(boundary):
+            raise HitlGitlinkError(
+                "Nested repository contains invalid shallow-boundary metadata."
+            )
+        ancestor = run_git(
+            repo,
+            "merge-base",
+            "--is-ancestor",
+            boundary,
+            commit_sha,
+            check=False,
+            quiet=True,
+        )
+        if ancestor.returncode == 0:
+            boundaries.append(boundary)
+        elif ancestor.returncode != 1:
+            raise HitlGitlinkError(
+                "Runtime could not resolve nested-repository shallow boundaries."
+            )
+    return tuple(sorted(set(boundaries)))
+
+
+def _normalize_shallow_boundaries(values: tuple[str, ...]) -> tuple[str, ...]:
+    boundaries = tuple(str(value).strip() for value in values)
+    if any(not _OBJECT_ID.fullmatch(value) for value in boundaries):
+        raise HitlGitlinkError(
+            "Checkpointed nested repository has invalid shallow-boundary metadata."
+        )
+    if len(set(boundaries)) != len(boundaries):
+        raise HitlGitlinkError(
+            "Checkpointed nested repository has duplicate shallow-boundary metadata."
+        )
+    return tuple(sorted(boundaries))
+
+
+def _write_git_shallow(path: Path, content: bytes | None) -> None:
+    if content is None:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        temporary.write_bytes(content)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def create_git_commit_bundle(
     repository: Path,
     *,
     commit_sha: str,
     destination: Path,
-) -> None:
-    """Create and verify a self-contained bundle for one nested commit."""
+) -> tuple[str, ...]:
+    """Create one bundle and return shallow boundaries needed to import it."""
     repo = Path(repository).resolve()
     bundle = Path(destination).resolve()
     bundle.parent.mkdir(parents=True, exist_ok=True)
+    shallow_boundaries = git_commit_shallow_boundaries(repo, commit_sha)
     temporary_ref = f"refs/neurico/hitl/bundles/{uuid.uuid4().hex}"
     retained = run_git(repo, "update-ref", temporary_ref, commit_sha, check=False)
     if retained.returncode != 0:
@@ -313,6 +403,7 @@ def create_git_commit_bundle(
         verify_git_commit_bundle(repo, bundle, commit_sha)
     finally:
         run_git(repo, "update-ref", "-d", temporary_ref, check=False, quiet=True)
+    return shallow_boundaries
 
 
 def fetch_git_commit_bundle(
@@ -320,10 +411,12 @@ def fetch_git_commit_bundle(
     *,
     bundle_path: Path,
     commit_sha: str,
+    shallow_boundaries: tuple[str, ...] = (),
 ) -> None:
-    """Fetch one bundled commit into an existing repository and verify it."""
+    """Import one bundled commit with any required shallow boundaries."""
     repo = Path(repository).resolve()
     bundle = Path(bundle_path).resolve()
+    boundaries = _normalize_shallow_boundaries(shallow_boundaries)
     verify_git_commit_bundle(repo, bundle, commit_sha)
     fetched = run_git(
         repo,
@@ -333,18 +426,61 @@ def fetch_git_commit_bundle(
         commit_sha,
         check=False,
     )
-    if fetched.returncode != 0:
-        raise HitlGitlinkError(
-            "Runtime could not fetch a checkpointed nested-repository bundle: "
-            f"{git_failure_detail(fetched)}"
+    shallow_path: Path | None = None
+    previous_shallow: bytes | None = None
+    changed_shallow = False
+    if fetched.returncode != 0 and boundaries:
+        shallow_path = _git_shallow_path(repo)
+        try:
+            previous_shallow = shallow_path.read_bytes() if shallow_path.exists() else None
+            existing = set(
+                previous_shallow.decode("ascii").splitlines()
+                if previous_shallow is not None
+                else ()
+            )
+            _write_git_shallow(
+                shallow_path,
+                ("\n".join(sorted(existing | set(boundaries))) + "\n").encode("ascii"),
+            )
+        except (OSError, UnicodeError) as exc:
+            raise HitlGitlinkError(
+                "Runtime could not update destination shallow metadata."
+            ) from exc
+        changed_shallow = True
+        fetched = run_git(
+            repo,
+            "fetch",
+            "--no-tags",
+            str(bundle),
+            commit_sha,
+            check=False,
         )
-    exists = run_git(
-        repo,
-        "cat-file",
-        "-e",
-        f"{commit_sha}^{{commit}}",
-        check=False,
-        quiet=True,
-    )
-    if exists.returncode != 0:
-        raise HitlGitlinkError("Fetched nested-repository bundle is missing its recorded commit.")
+
+    try:
+        if fetched.returncode != 0:
+            raise HitlGitlinkError(
+                "Runtime could not fetch a checkpointed nested-repository bundle: "
+                f"{git_failure_detail(fetched)}"
+            )
+        exists = run_git(
+            repo,
+            "cat-file",
+            "-e",
+            f"{commit_sha}^{{commit}}",
+            check=False,
+            quiet=True,
+        )
+        if exists.returncode != 0:
+            raise HitlGitlinkError(
+                "Fetched nested-repository bundle is missing its recorded commit."
+            )
+    except Exception:
+        if changed_shallow and shallow_path is not None:
+            try:
+                _write_git_shallow(shallow_path, previous_shallow)
+            except OSError as exc:
+                raise HitlGitlinkError(
+                    "Runtime could not restore destination shallow metadata after a "
+                    "failed bundle import."
+                ) from exc
+        raise

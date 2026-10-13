@@ -192,15 +192,17 @@ def _path_is_owned_by_gitlink(
     )
 
 
-def _manifest_gitlinks(manifest: dict[str, Any]) -> list[tuple[CheckpointGitlink, str]]:
-    """Return validated Gitlink identities and bundle paths from one manifest."""
+def _manifest_gitlinks(
+    manifest: dict[str, Any],
+) -> list[tuple[CheckpointGitlink, str, tuple[str, ...]]]:
+    """Return validated Gitlink identities, bundles, and shallow boundaries."""
     if manifest.get("version") == 1:
         return []
     entries = manifest.get("gitlinks")
     if not isinstance(entries, list):
         raise HitlArtifactSnapshotError("HITL artifact snapshot has no Gitlink list.")
 
-    parsed: list[tuple[CheckpointGitlink, str]] = []
+    parsed: list[tuple[CheckpointGitlink, str, tuple[str, ...]]] = []
     seen_paths: set[str] = set()
     seen_bundles: set[str] = set()
     for entry in entries:
@@ -223,6 +225,27 @@ def _manifest_gitlinks(manifest: dict[str, Any]) -> list[tuple[CheckpointGitlink
             raise HitlArtifactSnapshotError(
                 f"HITL artifact snapshot has an invalid Gitlink bundle path: {bundle}"
             )
+        raw_boundaries = entry.get("shallow_boundaries", [])
+        if not isinstance(raw_boundaries, list):
+            raise HitlArtifactSnapshotError(
+                "HITL artifact snapshot has invalid Gitlink shallow boundaries."
+            )
+        boundaries: list[str] = []
+        for raw_boundary in raw_boundaries:
+            if not isinstance(raw_boundary, str):
+                raise HitlArtifactSnapshotError(
+                    "HITL artifact snapshot has an invalid Gitlink shallow boundary."
+                )
+            boundary = raw_boundary.strip()
+            if not _OBJECT_ID.fullmatch(boundary):
+                raise HitlArtifactSnapshotError(
+                    "HITL artifact snapshot has an invalid Gitlink shallow boundary."
+                )
+            boundaries.append(boundary)
+        if len(set(boundaries)) != len(boundaries):
+            raise HitlArtifactSnapshotError(
+                "HITL artifact snapshot has duplicate Gitlink shallow boundaries."
+            )
         path_key = relative.as_posix()
         if path_key in seen_paths or bundle in seen_bundles:
             raise HitlArtifactSnapshotError(
@@ -230,7 +253,9 @@ def _manifest_gitlinks(manifest: dict[str, Any]) -> list[tuple[CheckpointGitlink
             )
         seen_paths.add(path_key)
         seen_bundles.add(bundle)
-        parsed.append((CheckpointGitlink(relative, commit_sha), bundle))
+        parsed.append(
+            (CheckpointGitlink(relative, commit_sha), bundle, tuple(sorted(boundaries)))
+        )
     return parsed
 
 
@@ -309,7 +334,7 @@ def validate_hitl_artifact_snapshot(
                 f"{relative_text}."
             )
     snapshot_root = _snapshot_dir(workspace, snapshot_id)
-    for gitlink, bundle_text in _manifest_gitlinks(manifest):
+    for gitlink, bundle_text, _boundaries in _manifest_gitlinks(manifest):
         bundle = _path_without_symlink_ancestors(
             snapshot_root,
             _safe_relative_path(bundle_text, label="Gitlink bundle path"),
@@ -355,7 +380,9 @@ def capture_hitl_artifact_snapshot(
     final = store / normalized
     if final.exists():
         manifest = validate_hitl_artifact_snapshot(workspace, normalized)
-        stored_gitlinks = [gitlink for gitlink, _bundle in _manifest_gitlinks(manifest)]
+        stored_gitlinks = [
+            gitlink for gitlink, _bundle, _boundaries in _manifest_gitlinks(manifest)
+        ]
         if (
             manifest["source_checkpoint_sha"] != source_sha
             or manifest["artifact_roots"] != roots
@@ -421,11 +448,11 @@ def capture_hitl_artifact_snapshot(
                     f"Ignored evaluator artifact disappeared during capture: {relative_text}"
                 )
             _copy_entry(source, files_root / relative)
-        bundled_gitlinks: list[dict[str, str]] = []
+        bundled_gitlinks: list[dict[str, Any]] = []
         for index, (gitlink, repository) in enumerate(resolved_gitlinks):
             bundle_relative = f"{_GITLINKS_DIR}/{index:04d}.bundle"
             try:
-                create_git_commit_bundle(
+                shallow_boundaries = create_git_commit_bundle(
                     repository,
                     commit_sha=gitlink.commit_sha,
                     destination=staging / bundle_relative,
@@ -440,6 +467,7 @@ def capture_hitl_artifact_snapshot(
                     "path": gitlink.relative_path.as_posix(),
                     "commit_sha": gitlink.commit_sha,
                     "bundle": bundle_relative,
+                    "shallow_boundaries": list(shallow_boundaries),
                 }
             )
         atomic_write_json(
@@ -518,10 +546,10 @@ def _snapshot_bundle_path(
 def _require_manifest_gitlinks_match_checkpoint(
     manifest: dict[str, Any],
     checkpoint_links: list[CheckpointGitlink],
-) -> list[tuple[CheckpointGitlink, str]]:
+) -> list[tuple[CheckpointGitlink, str, tuple[str, ...]]]:
     entries = _manifest_gitlinks(manifest)
     if manifest["version"] == 2 and _gitlink_identity_map(
-        [gitlink for gitlink, _bundle in entries]
+        [gitlink for gitlink, _bundle, _boundaries in entries]
     ) != _gitlink_identity_map(checkpoint_links):
         raise HitlArtifactSnapshotError(
             "HITL artifact snapshot Gitlinks do not match the workspace checkpoint."
@@ -534,7 +562,7 @@ def resolve_hitl_snapshot_gitlink_bundles(
     *,
     snapshot_id: str,
     checkpoint_sha: str,
-) -> list[tuple[CheckpointGitlink, Path]] | None:
+) -> list[tuple[CheckpointGitlink, Path, tuple[str, ...]]] | None:
     """Return validated Gitlink bundles for isolated scoring.
 
     Version-1 snapshots predate bundled Gitlinks and return ``None`` so the
@@ -557,8 +585,9 @@ def resolve_hitl_snapshot_gitlink_bundles(
         (
             gitlink,
             _snapshot_bundle_path(workspace, snapshot_id, bundle_text),
+            shallow_boundaries,
         )
-        for gitlink, bundle_text in entries
+        for gitlink, bundle_text, shallow_boundaries in entries
     ]
 
 
@@ -648,7 +677,7 @@ def _restore_bundled_checkpoint_gitlinks(
 ) -> None:
     entries = _require_manifest_gitlinks_match_checkpoint(manifest, checkpoint_links)
     workspace = Path(work_dir).resolve()
-    for gitlink, bundle_text in entries:
+    for gitlink, bundle_text, shallow_boundaries in entries:
         repository = _path_without_symlink_ancestors(
             workspace,
             gitlink.relative_path,
@@ -678,6 +707,7 @@ def _restore_bundled_checkpoint_gitlinks(
                 repository,
                 bundle_path=_snapshot_bundle_path(workspace, snapshot_id, bundle_text),
                 commit_sha=gitlink.commit_sha,
+                shallow_boundaries=shallow_boundaries,
             )
         except HitlGitlinkError as exc:
             raise HitlArtifactSnapshotError(str(exc)) from exc

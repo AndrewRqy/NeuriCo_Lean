@@ -255,7 +255,11 @@ def _materialize_checkpoint_gitlinks(
                 )
                 bundle_repositories_root.mkdir()
                 resolved_gitlinks = []
-                for index, (gitlink, bundle_path) in enumerate(bundled_gitlinks):
+                for index, (
+                    gitlink,
+                    bundle_path,
+                    shallow_boundaries,
+                ) in enumerate(bundled_gitlinks):
                     repository = bundle_repositories_root / f"{index:04d}.git"
                     repository.mkdir()
                     initialized = run_git(
@@ -276,6 +280,7 @@ def _materialize_checkpoint_gitlinks(
                             repository,
                             bundle_path=bundle_path,
                             commit_sha=gitlink.commit_sha,
+                            shallow_boundaries=shallow_boundaries,
                         )
                     except HitlGitlinkError as exc:
                         raise HitlScoringWorkspaceError(str(exc)) from exc
