@@ -3089,7 +3089,8 @@ class ResearchPipelineOrchestrator:
                 isolated_scoring=None,
             )
             (self.work_dir / "scoring" / "results.json").unlink(missing_ok=True)
-            sealed_outputs = self._seal_bootstrap_inputs()
+            if sealed_outputs is None:
+                sealed_outputs = self._seal_bootstrap_inputs()
             evaluator_dir = sealed_dir_for(self.work_dir)
             unseal_scoring_files(self.work_dir, evaluator_dir)
 
