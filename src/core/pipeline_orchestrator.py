@@ -641,6 +641,13 @@ class ResearchPipelineOrchestrator:
                 runtime.reload_manager_after_state_restore()
                 runtime.clear_idea_tool_context()
                 return
+            # The pending command owns any candidate artifact snapshot and
+            # temporary scoring ref created after this stage boundary. Quiesce
+            # scoring and retire those resources before restoring private HITL
+            # state, which removes their ownership record.
+            runtime.abandon_pending_worker_request_for_rollback(reason)
+            runtime.clear_idea_tool_context()
+            self._retire_initial_scoring_refs_before_rollback()
         rollback.restore(runtime, reason, cleanup_label="restored")
         if self.managed_initial_run:
             self.state = PipelineState(self.work_dir)
