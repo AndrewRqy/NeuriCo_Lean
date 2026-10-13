@@ -185,6 +185,7 @@ def _validate_gitlink_artifact_ownership(
 
         status = run_git(
             repository,
+            "--literal-pathspecs",
             "status",
             "--porcelain=v1",
             "-z",
@@ -425,6 +426,7 @@ def capture_hitl_artifact_snapshot(
 
     listed = run_git(
         workspace,
+        "--literal-pathspecs",
         "ls-files",
         "--others",
         "--ignored",
@@ -649,6 +651,7 @@ def _finalize_restored_gitlink(
     if scopes:
         cleaned_ignored = run_git(
             repository,
+            "--literal-pathspecs",
             "clean",
             "-ffdX",
             "--",
@@ -810,6 +813,7 @@ def restore_hitl_checkpoint_with_artifacts(
         if artifact_roots:
             cleaned = run_git(
                 workspace,
+                "--literal-pathspecs",
                 "clean",
                 "-ffdx",
                 "--",
@@ -852,6 +856,7 @@ def restore_hitl_checkpoint_with_artifacts(
     if manifest is not None:
         cleaned = run_git(
             workspace,
+            "--literal-pathspecs",
             "clean",
             "-fdX",
             "--",
