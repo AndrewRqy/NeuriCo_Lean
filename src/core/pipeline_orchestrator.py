@@ -625,10 +625,20 @@ class ResearchPipelineOrchestrator:
 
     def _discard_stage_rollback(self, rollback: HitlStageRollback, *, cleanup_label: str) -> None:
         if self.managed_initial_run:
-            self.state.clear_runtime_recovery("initial_stage")
+            boundary = self.state.get_runtime_recovery("initial_stage")
             experiment = self.state.get_runtime_recovery("experiment_runner") or {}
             if experiment.get("hitl_snapshot_ref") == rollback.hitl_snapshot.ref:
+                self.state.clear_runtime_recovery("initial_stage")
                 return  # The outer experiment boundary still owns this snapshot.
+            if boundary:
+                try:
+                    self._discard_initial_boundary(boundary)
+                except Exception as cleanup_error:
+                    print(
+                        f"⚠️  Could not clean {cleanup_label} HITL rollback boundary: "
+                        f"{cleanup_error}"
+                    )
+                return
         rollback.discard(cleanup_label=cleanup_label)
 
     def _restore_stage_rollback(
