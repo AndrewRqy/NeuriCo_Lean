@@ -846,9 +846,6 @@ def construct_managed_baseline(
 
     def restore_active_rule_maker_boundary() -> None:
         """Restore the inner managed-stage boundary before the outer workspace."""
-        state = PipelineState(work_dir)
-        if state.get_runtime_recovery("initial_stage") is None:
-            return
         ResearchPipelineOrchestrator(
             work_dir=work_dir,
             templates_dir=templates_dir,

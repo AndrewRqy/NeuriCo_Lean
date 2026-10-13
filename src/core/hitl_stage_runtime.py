@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 
 from core.hitl_git_state import HitlGitSnapshot, HitlGitStateStore
-from core.hitl_run_control import HitlRunStopRequested, hitl_run_stop_requested
+from core.hitl_run_control import (
+    HitlRollbackControl,
+    HitlRunStopRequested,
+    hitl_run_stop_requested,
+)
 from core.hitl_runtime_state import HitlRuntimeState, worker_command_requires_resume
 
 
@@ -291,19 +295,53 @@ class HitlStageRollback:
 
     def restore(self, runtime: Any, reason: str, *, cleanup_label: str) -> None:
         """Restore the boundary in the established public-then-private order."""
-        from core.hitl_artifact_snapshots import restore_hitl_checkpoint_with_artifacts
-
         runtime.abandon_pending_worker_request_for_rollback(reason)
         runtime.clear_idea_tool_context()
-        restore_hitl_checkpoint_with_artifacts(
-            self.work_dir,
-            checkpoint_sha=self.checkpoint_sha,
-            artifact_snapshot_id=self.artifact_snapshot_id,
+
+        def reload_runtime(_record: Dict[str, Any]) -> None:
+            runtime.reload_manager_after_state_restore()
+            runtime.clear_idea_tool_context()
+
+        HitlRollbackControl(self.work_dir).request(
+            {**self.descriptor(), "stage": getattr(runtime, "pipeline_stage", "")},
+            discard_boundaries=[],
         )
-        self.state_store.restore(self.hitl_snapshot)
-        runtime.reload_manager_after_state_restore()
-        runtime.clear_idea_tool_context()
-        self.discard(cleanup_label=cleanup_label)
+        self.restore_pending(self.work_dir, after_restore=reload_runtime)
+
+    @classmethod
+    def restore_pending(
+        cls, work_dir: Path, *, after_restore: Callable[[Dict[str, Any]], None]
+    ) -> Dict[str, Any] | None:
+        """Replay an unfinished restore, or finish disposal without reading its data."""
+        from core.hitl_artifact_snapshots import (
+            discard_hitl_artifact_snapshot,
+            restore_hitl_checkpoint_with_artifacts,
+        )
+
+        control = HitlRollbackControl(work_dir)
+        record = control.record()
+        if record is None:
+            return None
+        if record["status"] == "restoring":
+            rollback = cls.from_descriptor(work_dir, record["boundary"])
+            restore_hitl_checkpoint_with_artifacts(
+                work_dir,
+                checkpoint_sha=rollback.checkpoint_sha,
+                artifact_snapshot_id=rollback.artifact_snapshot_id,
+            )
+            rollback.state_store.restore(rollback.hitl_snapshot)
+            # No snapshot contents may be removed until replay is no longer needed.
+            control.mark_cleanup_pending(record)
+            record["status"] = "cleanup_pending"
+        after_restore(record)
+        store = HitlGitStateStore(work_dir)
+        for boundary in [*record["discard_boundaries"], record["boundary"]]:
+            artifact_id = str(boundary.get("artifact_snapshot_id", "")).strip()
+            if artifact_id:
+                discard_hitl_artifact_snapshot(work_dir, artifact_id)
+            store.discard(boundary["hitl_snapshot_ref"])
+        control.clear()
+        return record
 
     def discard(self, *, cleanup_label: str) -> None:
         try:

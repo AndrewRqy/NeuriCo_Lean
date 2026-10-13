@@ -16,6 +16,7 @@ from core.hitl_lock import active_hitl_workspace_run
 from core.hitl_paths import (
     hitl_initial_scoring_repair_control_path,
     hitl_launch_status_path,
+    hitl_rollback_control_path,
     hitl_run_budget_path,
     hitl_stop_request_path,
 )
@@ -24,6 +25,59 @@ from core.hitl_util import atomic_write_json, utc_now
 
 class HitlRunStopRequested(RuntimeError):
     """Raised at a cooperative boundary after the current run is asked to stop."""
+
+
+class HitlRollbackControl:
+    """Keep rollback ownership outside the public/private state being restored."""
+
+    def __init__(self, work_dir: Path) -> None:
+        self.path = hitl_rollback_control_path(Path(work_dir).resolve())
+
+    def request(
+        self, boundary: Dict[str, Any], *, discard_boundaries: list[Dict[str, Any]]
+    ) -> None:
+        existing = self.record()
+        if existing is not None:
+            if (
+                existing["boundary"] != boundary
+                or existing["discard_boundaries"] != discard_boundaries
+            ):
+                raise RuntimeError("Another HITL rollback handoff is still pending.")
+            return
+        atomic_write_json(self.path, {
+            "version": 1,
+            "status": "restoring",
+            "boundary": boundary,
+            "discard_boundaries": discard_boundaries,
+        })
+
+    def record(self) -> Optional[Dict[str, Any]]:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("HITL rollback handoff is unavailable or invalid.") from exc
+        if (
+            not isinstance(value, dict)
+            or value.get("version") != 1
+            or value.get("status") not in {"restoring", "cleanup_pending"}
+            or not isinstance(value.get("boundary"), dict)
+            or not isinstance(value.get("discard_boundaries"), list)
+        ):
+            raise RuntimeError("HITL rollback handoff is malformed.")
+        for boundary in [value["boundary"], *value["discard_boundaries"]]:
+            if not isinstance(boundary, dict) or not str(
+                boundary.get("hitl_snapshot_ref", "")
+            ).startswith("refs/neurico/hitl-rollback/"):
+                raise RuntimeError("Invalid HITL rollback snapshot reference.")
+        return value
+
+    def mark_cleanup_pending(self, record: Dict[str, Any]) -> None:
+        atomic_write_json(self.path, {**record, "status": "cleanup_pending"})
+
+    def clear(self) -> None:
+        self.path.unlink(missing_ok=True)
 
 
 class HitlInitialScoringRepairControl:

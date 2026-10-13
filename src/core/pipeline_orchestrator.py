@@ -97,6 +97,7 @@ from core.hitl_git_state import HitlGitSnapshot, HitlGitStateStore
 from core.hitl_git import delete_git_ref
 from core.hitl_run_control import (
     HitlInitialScoringRepairControl,
+    HitlRollbackControl,
     HitlRunStopRequested,
 )
 from core.hitl_mode import HitlMode, normalize_hitl_mode
@@ -470,6 +471,7 @@ class ResearchPipelineOrchestrator:
         """Recover before new work; return whether reviewed inputs must be preserved."""
         if not self.managed_initial_run:
             return False
+        self._resume_initial_rollback()
         stages = self._managed_initial_stages()
         if self.hitl_autoresearch:
             repair = self._reconcile_initial_rule_maker_repair_handoff()
@@ -551,6 +553,13 @@ class ResearchPipelineOrchestrator:
         """Restore an explicitly stopped managed run to its active stage boundary."""
         if not self.managed_initial_run:
             return None
+        restored = self._resume_initial_rollback()
+        if restored is not None:
+            boundary = restored["boundary"]
+            return {
+                "stage": str(boundary.get("stage", "")),
+                "checkpoint_sha": str(boundary["checkpoint_sha"]),
+            }
         boundary = self.state.get_runtime_recovery("initial_stage")
         if not boundary:
             return None
@@ -577,6 +586,7 @@ class ResearchPipelineOrchestrator:
     def _stage_rollback(
         self, stage: str, message: str, *, repair: bool = False
     ) -> HitlStageRollback:
+        self._resume_initial_rollback()
         if self.managed_initial_run:
             existing = self.state.get_runtime_recovery("initial_stage")
             if existing:
@@ -1163,6 +1173,7 @@ class ResearchPipelineOrchestrator:
         return results
 
     def _arm_experiment_runner_recovery_checkpoint(self) -> Dict[str, Any]:
+        self._resume_initial_rollback()
         rollback = HitlStageRollback.capture(
             self.work_dir,
             "HITL pre-experiment recovery checkpoint",
@@ -1308,6 +1319,7 @@ class ResearchPipelineOrchestrator:
             discard_hitl_artifact_snapshot(self.work_dir, artifact_snapshot_id)
 
     def _recover_experiment_runner_from_runtime_checkpoint(self) -> None:
+        self._resume_initial_rollback()
         recovery = self.state.get_runtime_recovery("experiment_runner")
         if not recovery:
             return
@@ -1325,44 +1337,30 @@ class ResearchPipelineOrchestrator:
             )
         print()
         print("↩️  Recovering workspace to pre-experiment HITL checkpoint...")
-        restore_hitl_checkpoint_with_artifacts(
-            self.work_dir,
-            checkpoint_sha=rollback.checkpoint_sha,
-            artifact_snapshot_id=rollback.artifact_snapshot_id,
+        HitlRollbackControl(self.work_dir).request(
+            {**recovery, **rollback.descriptor(), "stage": "experiment_runner"},
+            discard_boundaries=[initial_boundary] if initial_boundary else [],
         )
-        snapshot_ref = rollback.hitl_snapshot.ref
-        state_store = rollback.state_store
-        try:
-            state_store.restore(rollback.hitl_snapshot)
-        except Exception as exc:
-            raise RuntimeError(
-                "Could not restore the armed HITL private-state recovery boundary."
-            ) from exc
+        self._resume_initial_rollback()
+
+    def _resume_initial_rollback(self) -> Optional[Dict[str, Any]]:
+        return HitlStageRollback.restore_pending(
+            self.work_dir, after_restore=self._reload_after_initial_rollback
+        )
+
+    def _reload_after_initial_rollback(self, record: Dict[str, Any]) -> None:
+        """Reconcile restored state before the durable handoff releases its snapshots."""
         reloader = getattr(self.hitl_manager, "reload_after_runtime_restore", None)
         if callable(reloader):
             reloader()
-        if self.hitl_autoresearch:
-            self.state = PipelineState(self.work_dir)
-            self._reconcile_initial_rule_maker_repair_handoff()
-            if initial_boundary:
-                self._discard_initial_boundary(initial_boundary)
-        self.state.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state.clear_runtime_recovery("experiment_runner")
-        try:
-            state_store.discard(snapshot_ref)
-        except Exception as cleanup_error:
-            print(f"⚠️  Could not clean restored HITL recovery snapshot: {cleanup_error}")
-        if rollback.artifact_snapshot_id:
-            try:
-                discard_hitl_artifact_snapshot(
-                    self.work_dir,
-                    rollback.artifact_snapshot_id,
-                )
-            except Exception as cleanup_error:
-                print(
-                    "⚠️  Could not clean restored HITL artifact snapshot: "
-                    f"{cleanup_error}"
-                )
+        self.state.state = PipelineState(self.work_dir).state
+        if record["boundary"].get("kind") == "pre_experiment_checkpoint":
+            if self.hitl_autoresearch:
+                self._reconcile_initial_rule_maker_repair_handoff()
+                if record["discard_boundaries"]:
+                    self.state.clear_runtime_recovery("initial_stage")
+            self.state.state_file.parent.mkdir(parents=True, exist_ok=True)
+            self.state.clear_runtime_recovery("experiment_runner")
 
     def _retire_initial_scoring_refs_before_rollback(self) -> None:
         """Retire refs named by live initial-scoring state before restoring it."""

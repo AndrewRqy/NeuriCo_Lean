@@ -46,6 +46,10 @@ def hitl_initial_scoring_repair_control_path(work_dir: Path) -> Path:
     return hitl_run_control_dir(work_dir) / "initial_scoring_repair.json"
 
 
+def hitl_rollback_control_path(work_dir: Path) -> Path:
+    return hitl_run_control_dir(work_dir) / "rollback.json"
+
+
 def hitl_launch_requests_dir(workspace_root: Path) -> Path:
     return Path(workspace_root) / ".neurico" / "hitl-launch-requests"
 
