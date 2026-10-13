@@ -472,6 +472,8 @@ class ResearchPipelineOrchestrator:
         if not self.managed_initial_run:
             return False
         self._resume_initial_rollback()
+        self._complete_rollback_artifact_capture("experiment_runner")
+        self._complete_rollback_artifact_capture("initial_stage")
         stages = self._managed_initial_stages()
         if self.hitl_autoresearch:
             repair = self._reconcile_initial_rule_maker_repair_handoff()
@@ -560,6 +562,8 @@ class ResearchPipelineOrchestrator:
                 "stage": str(boundary.get("stage", "")),
                 "checkpoint_sha": str(boundary["checkpoint_sha"]),
             }
+        self._complete_rollback_artifact_capture("experiment_runner")
+        self._complete_rollback_artifact_capture("initial_stage")
         boundary = self.state.get_runtime_recovery("initial_stage")
         if not boundary:
             return None
@@ -588,7 +592,8 @@ class ResearchPipelineOrchestrator:
     ) -> HitlStageRollback:
         self._resume_initial_rollback()
         if self.managed_initial_run:
-            existing = self.state.get_runtime_recovery("initial_stage")
+            self._complete_rollback_artifact_capture("experiment_runner")
+            existing = self._complete_rollback_artifact_capture("initial_stage")
             if existing:
                 if existing.get("stage") != stage:
                     raise RuntimeError("Another initial stage still owns the rollback boundary.")
@@ -626,12 +631,76 @@ class ResearchPipelineOrchestrator:
             message,
             include_rule_maker_repair_state=repair,
             capture_artifacts=capture_artifacts,
+            defer_artifact_capture=True,
         )
         if self.managed_initial_run:
-            self.state.set_runtime_recovery(
-                "initial_stage", {"stage": stage, **rollback.descriptor()}
+            self._register_rollback_boundary(
+                "initial_stage",
+                rollback,
+                {"stage": stage, **rollback.descriptor()},
             )
         return rollback
+
+    def _register_rollback_boundary(
+        self,
+        owner: str,
+        rollback: HitlStageRollback,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Persist rollback ownership before copying any private artifacts."""
+        if not rollback.artifact_snapshot_id:
+            try:
+                self.state.set_runtime_recovery(owner, payload)
+            except Exception:
+                self.state = PipelineState(self.work_dir)
+                rollback.discard(cleanup_label="unregistered")
+                raise
+            return dict(payload)
+
+        capturing = {**payload, "artifact_capture_status": "capturing"}
+        try:
+            self.state.set_runtime_recovery(owner, capturing)
+        except Exception:
+            self.state = PipelineState(self.work_dir)
+            rollback.discard(cleanup_label="unregistered")
+            raise
+
+        rollback.capture_artifacts()
+        prepared = {**capturing, "artifact_capture_status": "prepared"}
+        try:
+            self.state.set_runtime_recovery(owner, prepared)
+        except Exception:
+            # Preserve the last durable `capturing` record so this object can
+            # retry through the same recovery path without becoming invisible.
+            self.state = PipelineState(self.work_dir)
+            raise
+        return dict(prepared)
+
+    def _complete_rollback_artifact_capture(self, owner: str) -> Optional[Dict[str, Any]]:
+        """Complete a registered rollback capture before using its boundary."""
+        record = self.state.get_runtime_recovery(owner)
+        if record is None:
+            return None
+        status = str(record.get("artifact_capture_status", "")).strip()
+        if not status:
+            # Records written before the capture lifecycle was introduced are
+            # already complete and retain their established interpretation.
+            return dict(record)
+        if status == "prepared":
+            return dict(record)
+        artifact_snapshot_id = str(record.get("artifact_snapshot_id", "")).strip()
+        if status != "capturing" or not artifact_snapshot_id:
+            raise RuntimeError(f"{owner} has an invalid rollback artifact capture state.")
+
+        rollback = HitlStageRollback.from_capture_descriptor(self.work_dir, record)
+        rollback.capture_artifacts()
+        prepared = {**record, "artifact_capture_status": "prepared"}
+        try:
+            self.state.set_runtime_recovery(owner, prepared)
+        except Exception:
+            self.state = PipelineState(self.work_dir)
+            raise
+        return dict(prepared)
 
     def _discard_stage_rollback(self, rollback: HitlStageRollback, *, cleanup_label: str) -> None:
         if self.managed_initial_run:
@@ -1174,22 +1243,23 @@ class ResearchPipelineOrchestrator:
 
     def _arm_experiment_runner_recovery_checkpoint(self) -> Dict[str, Any]:
         self._resume_initial_rollback()
+        existing = self._complete_rollback_artifact_capture("experiment_runner")
+        if existing is not None:
+            return existing
         rollback = HitlStageRollback.capture(
             self.work_dir,
             "HITL pre-experiment recovery checkpoint",
             capture_artifacts=hitl_artifact_contract_path(self.work_dir).is_file(),
+            defer_artifact_capture=True,
         )
         payload = {
             "kind": "pre_experiment_checkpoint",
             **rollback.descriptor(),
             "armed_at": utc_now(),
         }
-        try:
-            self.state.set_runtime_recovery("experiment_runner", payload)
-        except Exception:
-            rollback.discard(cleanup_label="unarmed")
-            raise
-        return dict(payload)
+        return self._register_rollback_boundary(
+            "experiment_runner", rollback, payload
+        )
 
     def _initial_rule_maker_repair_recovery(self) -> Optional[Dict[str, Any]]:
         """Return one validated durable initial-scoring repair handoff."""
@@ -1320,9 +1390,10 @@ class ResearchPipelineOrchestrator:
 
     def _recover_experiment_runner_from_runtime_checkpoint(self) -> None:
         self._resume_initial_rollback()
-        recovery = self.state.get_runtime_recovery("experiment_runner")
+        recovery = self._complete_rollback_artifact_capture("experiment_runner")
         if not recovery:
             return
+        self._complete_rollback_artifact_capture("initial_stage")
         initial_boundary = self.state.get_runtime_recovery("initial_stage") if self.hitl_autoresearch else None
         # Validate both halves before retiring score evidence or changing files.
         rollback = HitlStageRollback.from_descriptor(

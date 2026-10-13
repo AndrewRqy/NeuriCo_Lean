@@ -208,6 +208,22 @@ class HitlStageRollback:
 
     @classmethod
     def from_descriptor(cls, work_dir: Path, record: Dict[str, Any]) -> "HitlStageRollback":
+        rollback = cls.from_capture_descriptor(work_dir, record)
+        if rollback.artifact_snapshot_id:
+            from core.hitl_artifact_snapshots import validate_hitl_artifact_snapshot
+
+            validate_hitl_artifact_snapshot(
+                rollback.work_dir,
+                rollback.artifact_snapshot_id,
+                source_checkpoint_sha=rollback.checkpoint_sha,
+            )
+        return rollback
+
+    @classmethod
+    def from_capture_descriptor(
+        cls, work_dir: Path, record: Dict[str, Any]
+    ) -> "HitlStageRollback":
+        """Load a rollback boundary whose artifact capture may still be pending."""
         from core.autoresearch import CheckpointManager
         from core.scoring_seal import SEALED_PATHS
 
@@ -233,14 +249,6 @@ class HitlStageRollback:
         if actual != commit:
             raise RuntimeError("Initial stage private rollback snapshot changed.")
         artifact_snapshot_id = str(record.get("artifact_snapshot_id", "")).strip() or None
-        if artifact_snapshot_id:
-            from core.hitl_artifact_snapshots import validate_hitl_artifact_snapshot
-
-            validate_hitl_artifact_snapshot(
-                root,
-                artifact_snapshot_id,
-                source_checkpoint_sha=checkpoint,
-            )
         return cls(
             root,
             checkpoint,
@@ -257,7 +265,9 @@ class HitlStageRollback:
         *,
         include_rule_maker_repair_state: bool = False,
         capture_artifacts: bool = False,
+        defer_artifact_capture: bool = False,
     ) -> "HitlStageRollback":
+        """Create a rollback boundary, optionally reserving capture for its owner."""
         from core.autoresearch import CheckpointManager
 
         root = Path(work_dir)
@@ -268,30 +278,38 @@ class HitlStageRollback:
             if include_rule_maker_repair_state
             else state_store.create_rollback_snapshot()
         )
-        artifact_snapshot_id: str | None = None
+        artifact_snapshot_id = (
+            f"rollback-{hitl_snapshot.ref.rsplit('/', 1)[-1]}"
+            if capture_artifacts
+            else None
+        )
+        rollback = cls(
+            work_dir=root,
+            checkpoint_sha=checkpoint.sha,
+            state_store=state_store,
+            hitl_snapshot=hitl_snapshot,
+            artifact_snapshot_id=artifact_snapshot_id,
+        )
+        if defer_artifact_capture:
+            return rollback
         try:
-            if capture_artifacts:
-                from core.hitl_artifact_snapshots import capture_hitl_artifact_snapshot
-
-                artifact_snapshot_id = f"rollback-{hitl_snapshot.ref.rsplit('/', 1)[-1]}"
-                capture_hitl_artifact_snapshot(
-                    root,
-                    snapshot_id=artifact_snapshot_id,
-                    source_checkpoint_sha=checkpoint.sha,
-                )
-            return cls(
-                work_dir=root,
-                checkpoint_sha=checkpoint.sha,
-                state_store=state_store,
-                hitl_snapshot=hitl_snapshot,
-                artifact_snapshot_id=artifact_snapshot_id,
-            )
+            rollback.capture_artifacts()
         except Exception:
-            try:
-                state_store.discard(hitl_snapshot)
-            except Exception:
-                pass
+            rollback.discard(cleanup_label="incomplete")
             raise
+        return rollback
+
+    def capture_artifacts(self) -> None:
+        """Idempotently finish the artifact half of this rollback boundary."""
+        if not self.artifact_snapshot_id:
+            return
+        from core.hitl_artifact_snapshots import capture_hitl_artifact_snapshot
+
+        capture_hitl_artifact_snapshot(
+            self.work_dir,
+            snapshot_id=self.artifact_snapshot_id,
+            source_checkpoint_sha=self.checkpoint_sha,
+        )
 
     def restore(self, runtime: Any, reason: str, *, cleanup_label: str) -> None:
         """Restore the boundary in the established public-then-private order."""
