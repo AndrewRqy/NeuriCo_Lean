@@ -203,6 +203,13 @@ def test_scorer_without_any_workspace_environment_uses_runtime_python(tmp_path):
     assert _resolve_python_executable(tmp_path) == sys.executable
 
 
+def test_scorer_rejects_missing_embedded_environment(tmp_path):
+    configure_workspace_mode(tmp_path, "embedded")
+
+    with pytest.raises(RuntimeError, match="configured embedded.*unavailable"):
+        _resolve_python_executable(tmp_path)
+
+
 def test_isolated_scorer_links_only_the_relocated_environment(tmp_path):
     work_dir = tmp_path / "workspace"
     work_dir.mkdir()
@@ -238,6 +245,29 @@ def test_isolated_scorer_links_only_the_relocated_environment(tmp_path):
         assert scorer_venv.resolve() == (_research_env(work_dir) / ".venv").resolve()
         assert _resolve_python_executable(scorer_dir) == str(scorer_venv / "bin" / "python")
         assert not (scorer_dir / ".venv").exists()
+
+
+def test_isolated_scorer_rejects_missing_embedded_environment(tmp_path):
+    work_dir = tmp_path / "workspace"
+    work_dir.mkdir()
+    configure_workspace_mode(work_dir, "embedded")
+    (work_dir / "candidate.py").write_text("VALUE = 1\n")
+    scoring = work_dir / "scoring"
+    scoring.mkdir()
+    (scoring / "eval.py").write_text("print('score')\n")
+    (scoring / "targets.json").write_text("{}\n")
+    (scoring / "interface.md").write_text("Candidate contract\n")
+    source_sha = CheckpointManager(work_dir).create_checkpoint("candidate").sha
+    sealed_dir = seal_scoring_files(work_dir)
+
+    with isolated_scoring_workspace(
+        work_dir=work_dir,
+        source_sha=source_sha,
+        sealed_dir=sealed_dir,
+    ) as (scorer_dir, _manifest_sha):
+        assert read_workspace_mode(scorer_dir) is WorkspaceMode.EMBEDDED
+        with pytest.raises(RuntimeError, match="configured embedded.*unavailable"):
+            _resolve_python_executable(scorer_dir)
 
 
 def test_isolated_scorer_preserves_native_environment_mode(tmp_path):

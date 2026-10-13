@@ -18,6 +18,8 @@ import sys
 import time
 
 from core.research_environment import (
+    WorkspaceMode,
+    read_workspace_mode,
     reject_ambiguous_root_venv,
     research_python_candidates,
 )
@@ -46,6 +48,12 @@ def _resolve_python_executable(work_dir: Path) -> str:
     if windows.exists() and windows.is_file():
         return str(windows)
     reject_ambiguous_root_venv(work_dir)
+    if read_workspace_mode(work_dir) is WorkspaceMode.EMBEDDED:
+        raise RuntimeError(
+            "The configured embedded NeuriCo research environment is unavailable. "
+            "No Python interpreter exists under neurico-research-env/.venv. "
+            "Rebuild dependencies under neurico-research-env before scoring."
+        )
     return sys.executable
 
 
@@ -65,8 +73,9 @@ def run_scorer(
         timeout: Max execution time for eval.py in seconds.
         python_executable: Python binary to use. Defaults to the workspace's
                   workspace mode's research interpreter (where the runner
-                  installed dependencies), falling back to sys.executable when
-                  that mode has no environment yet.
+                  installed dependencies). Native workspaces fall back to
+                  sys.executable when no environment exists; embedded
+                  workspaces require their configured environment.
         idea: The trusted submitted idea (held by the orchestrator, outside
                   the worker-visible workspace). Required so the staged-
                   function integrity check always fails closed against it.
