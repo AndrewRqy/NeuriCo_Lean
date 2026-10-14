@@ -524,7 +524,9 @@ def capture_hitl_artifact_snapshot(
     _discard_incomplete_materializations(store)
     final = store / normalized
     if final.exists():
-        manifest = validate_hitl_artifact_snapshot(workspace, normalized)
+        # Reopening a published snapshot needs structural and identity checks;
+        # materialization verifies its contents while copying them for use.
+        manifest = inspect_hitl_artifact_snapshot(workspace, normalized)
         stored_gitlinks = [
             gitlink for gitlink, _bundle, _boundaries in _manifest_gitlinks(manifest)
         ]
