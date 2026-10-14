@@ -210,9 +210,9 @@ class HitlStageRollback:
     def from_descriptor(cls, work_dir: Path, record: Dict[str, Any]) -> "HitlStageRollback":
         rollback = cls.from_capture_descriptor(work_dir, record)
         if rollback.artifact_snapshot_id:
-            from core.hitl_artifact_snapshots import validate_hitl_artifact_snapshot
+            from core.hitl_artifact_snapshots import inspect_hitl_artifact_snapshot
 
-            validate_hitl_artifact_snapshot(
+            inspect_hitl_artifact_snapshot(
                 rollback.work_dir,
                 rollback.artifact_snapshot_id,
                 source_checkpoint_sha=rollback.checkpoint_sha,

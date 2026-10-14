@@ -390,7 +390,7 @@ def _read_manifest(work_dir: Path, snapshot_id: str) -> dict[str, Any]:
     return payload
 
 
-def _inspect_hitl_artifact_snapshot(
+def inspect_hitl_artifact_snapshot(
     work_dir: Path,
     snapshot_id: str,
     *,
@@ -458,7 +458,7 @@ def validate_hitl_artifact_snapshot(
 ) -> dict[str, Any]:
     """Validate one stored snapshot, including v3 artifact contents."""
     workspace = Path(work_dir).resolve()
-    manifest = _inspect_hitl_artifact_snapshot(
+    manifest = inspect_hitl_artifact_snapshot(
         workspace,
         snapshot_id,
         source_checkpoint_sha=source_checkpoint_sha,
@@ -781,7 +781,7 @@ def resolve_hitl_snapshot_gitlink_bundles(
     scorer can retain its existing live-repository fallback.
     """
     workspace = Path(work_dir).resolve()
-    manifest = _inspect_hitl_artifact_snapshot(
+    manifest = inspect_hitl_artifact_snapshot(
         workspace,
         snapshot_id,
         source_checkpoint_sha=checkpoint_sha,
@@ -966,7 +966,11 @@ def restore_hitl_checkpoint_with_artifacts(
         raise HitlArtifactSnapshotError("The HITL node is not a workspace checkpoint.")
     snapshot_id = str(artifact_snapshot_id or "").strip()
     manifest = (
-        _inspect_hitl_artifact_snapshot(workspace, snapshot_id)
+        inspect_hitl_artifact_snapshot(
+            workspace,
+            snapshot_id,
+            source_checkpoint_sha=sha,
+        )
         if snapshot_id
         else None
     )
