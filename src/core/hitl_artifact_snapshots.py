@@ -23,8 +23,9 @@ from core.hitl_git import (
     HitlGitlinkError,
     checkpoint_gitlinks,
     create_git_commit_bundle,
-    fetch_git_commit_bundle,
+    fetch_git_commit,
     git_failure_detail,
+    prepare_git_commit_bundle_repository,
     resolve_checkpoint_gitlinks,
     run_git,
     verify_git_commit_bundle,
@@ -668,7 +669,7 @@ def _prepare_hitl_artifact_materialization(
                     f"HITL artifact snapshot {snapshot_id} is missing {relative_text}."
                 )
             staged = _path_without_symlink_ancestors(
-                staging,
+                staging / _FILES_DIR,
                 relative,
                 label="Staged evaluator artifact",
             )
@@ -696,7 +697,7 @@ def _publish_hitl_artifact_materialization(
     for relative_text in manifest["captured_paths"]:
         relative = _safe_relative_path(relative_text, label="captured artifact path")
         staged = _path_without_symlink_ancestors(
-            staging,
+            staging / _FILES_DIR,
             relative,
             label="Staged evaluator artifact",
         )
@@ -885,17 +886,43 @@ def _restore_checkpoint_gitlinks(
         )
 
 
-def _restore_bundled_checkpoint_gitlinks(
+def _prepare_bundled_checkpoint_gitlinks(
     work_dir: Path,
     *,
     snapshot_id: str,
     manifest: dict[str, Any],
-    checkpoint_links: list[CheckpointGitlink],
+    staging: Path,
+) -> list[tuple[CheckpointGitlink, Path, tuple[str, ...]]]:
+    """Import every bundle in private storage before any live restoration."""
+    prepared = []
+    for index, (gitlink, bundle_text, shallow_boundaries) in enumerate(
+        _manifest_gitlinks(manifest)
+    ):
+        repository = staging / _GITLINKS_DIR / f"{index:04d}.git"
+        try:
+            prepare_git_commit_bundle_repository(
+                repository,
+                bundle_path=_snapshot_bundle_path(work_dir, snapshot_id, bundle_text),
+                commit_sha=gitlink.commit_sha,
+                shallow_boundaries=shallow_boundaries,
+            )
+        except HitlGitlinkError as exc:
+            raise HitlArtifactSnapshotError(
+                "Runtime could not prepare checkpointed nested repository "
+                f"`{gitlink.relative_path.as_posix()}`: {exc}"
+            ) from exc
+        prepared.append((gitlink, repository, shallow_boundaries))
+    return prepared
+
+
+def _restore_bundled_checkpoint_gitlinks(
+    work_dir: Path,
+    *,
+    prepared_gitlinks: list[tuple[CheckpointGitlink, Path, tuple[str, ...]]],
     artifact_roots: list[str],
 ) -> None:
-    entries = _require_manifest_gitlinks_match_checkpoint(manifest, checkpoint_links)
     workspace = Path(work_dir).resolve()
-    for gitlink, bundle_text, shallow_boundaries in entries:
+    for gitlink, prepared_repository, shallow_boundaries in prepared_gitlinks:
         repository = _path_without_symlink_ancestors(
             workspace,
             gitlink.relative_path,
@@ -921,9 +948,9 @@ def _restore_bundled_checkpoint_gitlinks(
                     f"{git_failure_detail(initialized)}"
                 )
         try:
-            fetch_git_commit_bundle(
+            fetch_git_commit(
                 repository,
-                bundle_path=_snapshot_bundle_path(workspace, snapshot_id, bundle_text),
+                source=prepared_repository,
                 commit_sha=gitlink.commit_sha,
                 shallow_boundaries=shallow_boundaries,
             )
@@ -1008,6 +1035,12 @@ def restore_hitl_checkpoint_with_artifacts(
         if bundled_gitlinks:
             assert manifest is not None
             assert staging is not None
+            prepared_gitlinks = _prepare_bundled_checkpoint_gitlinks(
+                workspace,
+                snapshot_id=snapshot_id,
+                manifest=manifest,
+                staging=staging,
+            )
             current_paths = {
                 gitlink.relative_path.as_posix(): gitlink.relative_path
                 for gitlink in current_gitlinks
@@ -1043,9 +1076,7 @@ def restore_hitl_checkpoint_with_artifacts(
                     )
             _restore_bundled_checkpoint_gitlinks(
                 workspace,
-                snapshot_id=snapshot_id,
-                manifest=manifest,
-                checkpoint_links=target_gitlinks,
+                prepared_gitlinks=prepared_gitlinks,
                 artifact_roots=artifact_roots,
             )
             _publish_hitl_artifact_materialization(

@@ -19,8 +19,8 @@ import tarfile
 
 from core.hitl_git import (
     HitlGitlinkError,
-    fetch_git_commit_bundle,
     git_failure_detail,
+    prepare_git_commit_bundle_repository,
     resolve_checkpoint_gitlinks,
     run_git,
 )
@@ -298,22 +298,8 @@ def _materialize_checkpoint_gitlinks(
                     shallow_boundaries,
                 ) in enumerate(bundled_gitlinks):
                     repository = bundle_repositories_root / f"{index:04d}.git"
-                    repository.mkdir()
-                    initialized = run_git(
-                        repository,
-                        "init",
-                        "--bare",
-                        "--quiet",
-                        check=False,
-                    )
-                    if initialized.returncode != 0:
-                        raise HitlScoringWorkspaceError(
-                            "Runtime could not initialize bundled nested repository "
-                            f"`{gitlink.relative_path.as_posix()}`: "
-                            f"{git_failure_detail(initialized)}"
-                        )
                     try:
-                        fetch_git_commit_bundle(
+                        prepare_git_commit_bundle_repository(
                             repository,
                             bundle_path=bundle_path,
                             commit_sha=gitlink.commit_sha,

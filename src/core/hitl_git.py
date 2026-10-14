@@ -406,6 +406,35 @@ def create_git_commit_bundle(
     return shallow_boundaries
 
 
+def prepare_git_commit_bundle_repository(
+    repository: Path,
+    *,
+    bundle_path: Path,
+    commit_sha: str,
+    shallow_boundaries: tuple[str, ...] = (),
+) -> None:
+    """Import a bundle into a new private repository before changing live state.
+
+    The caller owns the repository's temporary directory and its cleanup.
+    Starting empty ensures Git consumes the bundle even if the live repository
+    already contains the requested commit.
+    """
+    repo = Path(repository).resolve()
+    repo.mkdir(parents=True)
+    initialized = run_git(repo, "init", "--bare", "--quiet", check=False)
+    if initialized.returncode != 0:
+        raise HitlGitlinkError(
+            "Runtime could not initialize a bundled nested repository: "
+            f"{git_failure_detail(initialized)}"
+        )
+    fetch_git_commit_bundle(
+        repo,
+        bundle_path=bundle_path,
+        commit_sha=commit_sha,
+        shallow_boundaries=shallow_boundaries,
+    )
+
+
 def fetch_git_commit_bundle(
     repository: Path,
     *,
@@ -416,13 +445,32 @@ def fetch_git_commit_bundle(
     """Import one bundled commit with any required shallow boundaries."""
     repo = Path(repository).resolve()
     bundle = Path(bundle_path).resolve()
-    boundaries = _normalize_shallow_boundaries(shallow_boundaries)
     verify_git_commit_bundle(repo, bundle, commit_sha)
+    fetch_git_commit(
+        repo,
+        source=bundle,
+        commit_sha=commit_sha,
+        shallow_boundaries=shallow_boundaries,
+    )
+
+
+def fetch_git_commit(
+    repository: Path,
+    *,
+    source: Path,
+    commit_sha: str,
+    shallow_boundaries: tuple[str, ...] = (),
+) -> None:
+    """Import one commit from a bundle or a prepared private repository."""
+    repo = Path(repository).resolve()
+    source = Path(source).resolve()
+    boundaries = _normalize_shallow_boundaries(shallow_boundaries)
     fetched = run_git(
         repo,
         "fetch",
         "--no-tags",
-        str(bundle),
+        "--update-shallow",
+        str(source),
         commit_sha,
         check=False,
     )
@@ -451,7 +499,8 @@ def fetch_git_commit_bundle(
             repo,
             "fetch",
             "--no-tags",
-            str(bundle),
+            "--update-shallow",
+            str(source),
             commit_sha,
             check=False,
         )
@@ -459,7 +508,7 @@ def fetch_git_commit_bundle(
     try:
         if fetched.returncode != 0:
             raise HitlGitlinkError(
-                "Runtime could not fetch a checkpointed nested-repository bundle: "
+                "Runtime could not fetch a checkpointed nested-repository commit: "
                 f"{git_failure_detail(fetched)}"
             )
         exists = run_git(
@@ -472,7 +521,7 @@ def fetch_git_commit_bundle(
         )
         if exists.returncode != 0:
             raise HitlGitlinkError(
-                "Fetched nested-repository bundle is missing its recorded commit."
+                "Fetched nested repository is missing its recorded commit."
             )
     except Exception:
         if changed_shallow and shallow_path is not None:
@@ -481,6 +530,6 @@ def fetch_git_commit_bundle(
             except OSError as exc:
                 raise HitlGitlinkError(
                     "Runtime could not restore destination shallow metadata after a "
-                    "failed bundle import."
+                    "failed commit import."
                 ) from exc
         raise
