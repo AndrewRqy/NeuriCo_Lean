@@ -8,6 +8,7 @@ without capturing unrelated datasets, environments, or caches.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -29,7 +30,7 @@ from core.hitl_git import (
     verify_git_commit_bundle,
 )
 from core.hitl_paths import hitl_artifact_snapshots_dir
-from core.hitl_util import atomic_write_json, fsync_directory
+from core.hitl_util import atomic_write_json, fsync_directory, sha256_file
 
 
 _SNAPSHOT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -37,10 +38,13 @@ _MANIFEST_NAME = "manifest.json"
 _FILES_DIR = "files"
 _GITLINKS_DIR = "gitlinks"
 _OBJECT_ID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_COPY_CHUNK_SIZE = 1024 * 1024
 _STAGING_NAME = re.compile(
     r"^\.(?P<snapshot_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})\."
     r"[0-9]+\.[0-9a-f]{32}\.tmp$"
 )
+_MATERIALIZATION_STAGING_NAME = re.compile(r"^\.materialize\.[0-9]+\.[0-9a-f]{32}\.tmp$")
 
 
 class HitlArtifactSnapshotError(RuntimeError):
@@ -104,6 +108,19 @@ def _discard_incomplete_snapshot_generations(
             shutil.rmtree(entry)
 
 
+def _discard_incomplete_materializations(store: Path) -> None:
+    """Remove unpublished verified copies left by process loss."""
+    if not store.is_dir():
+        return
+    for entry in store.iterdir():
+        if _MATERIALIZATION_STAGING_NAME.fullmatch(entry.name) is None:
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            entry.unlink()
+        else:
+            shutil.rmtree(entry)
+
+
 def _path_without_symlink_ancestors(root: Path, relative: Path, *, label: str) -> Path:
     current = Path(root).resolve()
     for part in relative.parts[:-1]:
@@ -122,19 +139,40 @@ def _path_without_symlink_ancestors(root: Path, relative: Path, *, label: str) -
     return target
 
 
-def _copy_entry(source: Path, destination: Path) -> None:
+def _copy_regular_file_with_integrity(
+    source: Path,
+    destination: Path,
+    *,
+    expected: dict[str, Any] | None = None,
+    label: str | None = None,
+) -> dict[str, Any]:
+    """Copy one regular file while recording or verifying its bytes."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source.is_symlink():
         raise HitlArtifactSnapshotError(
             f"Evaluator-declared ignored artifact cannot be a symlink: {source}"
         )
     mode = source.lstat().st_mode
-    if stat.S_ISREG(mode):
-        shutil.copy2(source, destination, follow_symlinks=False)
-        return
-    raise HitlArtifactSnapshotError(
-        f"Evaluator-declared ignored artifact is not a regular file: {source}"
-    )
+    if not stat.S_ISREG(mode):
+        raise HitlArtifactSnapshotError(
+            f"Evaluator-declared ignored artifact is not a regular file: {source}"
+        )
+
+    digest = hashlib.sha256()
+    size = 0
+    with source.open("rb") as source_handle, destination.open("wb") as destination_handle:
+        for chunk in iter(lambda: source_handle.read(_COPY_CHUNK_SIZE), b""):
+            destination_handle.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    shutil.copystat(source, destination, follow_symlinks=False)
+    actual = {"size": size, "sha256": digest.hexdigest()}
+    if expected is not None and actual != expected:
+        artifact = label or str(source)
+        raise HitlArtifactSnapshotError(
+            f"HITL artifact snapshot content does not match its manifest: {artifact}."
+        )
+    return actual
 
 
 def _artifact_scopes_in_gitlink(
@@ -300,7 +338,7 @@ def _read_manifest(work_dir: Path, snapshot_id: str) -> dict[str, Any]:
         ) from exc
     if (
         not isinstance(payload, dict)
-        or payload.get("version") not in {1, 2}
+        or payload.get("version") not in {1, 2, 3}
         or payload.get("artifact_snapshot_id") != normalized
         or not isinstance(payload.get("source_checkpoint_sha"), str)
         or not isinstance(payload.get("artifact_roots"), list)
@@ -313,23 +351,52 @@ def _read_manifest(work_dir: Path, snapshot_id: str) -> dict[str, Any]:
         _safe_relative_path(str(root), label="artifact root")
         for root in payload["artifact_roots"]
     ]
-    for relative in payload["captured_paths"]:
+    captured_paths = payload["captured_paths"]
+    if any(not isinstance(relative, str) for relative in captured_paths):
+        raise HitlArtifactSnapshotError(
+            f"HITL artifact snapshot {normalized} has invalid captured paths."
+        )
+    for relative in captured_paths:
         captured = _safe_relative_path(str(relative), label="captured artifact path")
         if not any(captured == root or root in captured.parents for root in artifact_roots):
             raise HitlArtifactSnapshotError(
                 f"HITL artifact snapshot {normalized} contains an undeclared path."
             )
+    if payload["version"] == 3:
+        captured_files = payload.get("captured_files")
+        if (
+            not isinstance(captured_files, dict)
+            or len(set(captured_paths)) != len(captured_paths)
+            or set(captured_files) != set(captured_paths)
+        ):
+            raise HitlArtifactSnapshotError(
+                f"HITL artifact snapshot {normalized} has invalid file integrity metadata."
+            )
+        for relative_text, integrity in captured_files.items():
+            if (
+                not isinstance(integrity, dict)
+                or set(integrity) != {"size", "sha256"}
+                or not isinstance(integrity["size"], int)
+                or isinstance(integrity["size"], bool)
+                or integrity["size"] < 0
+                or not isinstance(integrity["sha256"], str)
+                or not _SHA256.fullmatch(integrity["sha256"])
+            ):
+                raise HitlArtifactSnapshotError(
+                    f"HITL artifact snapshot {normalized} has invalid integrity metadata "
+                    f"for {relative_text}."
+                )
     _manifest_gitlinks(payload)
     return payload
 
 
-def validate_hitl_artifact_snapshot(
+def _inspect_hitl_artifact_snapshot(
     work_dir: Path,
     snapshot_id: str,
     *,
     source_checkpoint_sha: str | None = None,
 ) -> dict[str, Any]:
-    """Validate one stored snapshot and its optional source checkpoint."""
+    """Validate snapshot structure without reading every stored artifact byte."""
     workspace = Path(work_dir).resolve()
     manifest = _read_manifest(workspace, snapshot_id)
     expected = str(source_checkpoint_sha or "").strip()
@@ -337,6 +404,7 @@ def validate_hitl_artifact_snapshot(
         raise HitlArtifactSnapshotError(
             f"HITL artifact snapshot {snapshot_id} belongs to a different checkpoint."
         )
+    captured_files = manifest.get("captured_files", {})
     files_root = _snapshot_dir(workspace, snapshot_id) / _FILES_DIR
     for relative_text in manifest["captured_paths"]:
         relative = _safe_relative_path(
@@ -349,14 +417,20 @@ def validate_hitl_artifact_snapshot(
             label="Stored evaluator artifact",
         )
         try:
-            mode = source.lstat().st_mode
+            file_stat = source.lstat()
         except OSError as exc:
             raise HitlArtifactSnapshotError(
                 f"HITL artifact snapshot {snapshot_id} is missing {relative_text}."
             ) from exc
-        if not stat.S_ISREG(mode):
+        if not stat.S_ISREG(file_stat.st_mode):
             raise HitlArtifactSnapshotError(
                 f"HITL artifact snapshot {snapshot_id} has an invalid stored file: "
+                f"{relative_text}."
+            )
+        integrity = captured_files.get(relative_text)
+        if integrity is not None and file_stat.st_size != integrity["size"]:
+            raise HitlArtifactSnapshotError(
+                f"HITL artifact snapshot content does not match its manifest: "
                 f"{relative_text}."
             )
     snapshot_root = _snapshot_dir(workspace, snapshot_id)
@@ -373,6 +447,48 @@ def validate_hitl_artifact_snapshot(
                 f"HITL artifact snapshot {snapshot_id} has an invalid bundle for "
                 f"`{gitlink.relative_path.as_posix()}`: {exc}"
             ) from exc
+    return manifest
+
+
+def validate_hitl_artifact_snapshot(
+    work_dir: Path,
+    snapshot_id: str,
+    *,
+    source_checkpoint_sha: str | None = None,
+) -> dict[str, Any]:
+    """Validate one stored snapshot, including v3 artifact contents."""
+    workspace = Path(work_dir).resolve()
+    manifest = _inspect_hitl_artifact_snapshot(
+        workspace,
+        snapshot_id,
+        source_checkpoint_sha=source_checkpoint_sha,
+    )
+    captured_files = manifest.get("captured_files", {})
+    files_root = _snapshot_dir(workspace, snapshot_id) / _FILES_DIR
+    for relative_text in manifest["captured_paths"]:
+        integrity = captured_files.get(relative_text)
+        if integrity is None:
+            continue
+        relative = _safe_relative_path(
+            relative_text,
+            label="captured artifact path",
+        )
+        source = _path_without_symlink_ancestors(
+            files_root,
+            relative,
+            label="Stored evaluator artifact",
+        )
+        try:
+            digest = sha256_file(source)
+        except OSError as exc:
+            raise HitlArtifactSnapshotError(
+                f"HITL artifact snapshot {snapshot_id} could not read {relative_text}."
+            ) from exc
+        if digest != integrity["sha256"]:
+            raise HitlArtifactSnapshotError(
+                f"HITL artifact snapshot content does not match its manifest: "
+                f"{relative_text}."
+            )
     return manifest
 
 
@@ -404,6 +520,7 @@ def capture_hitl_artifact_snapshot(
     store = hitl_artifact_snapshots_dir(workspace)
     store.mkdir(parents=True, exist_ok=True)
     _discard_incomplete_snapshot_generations(store)
+    _discard_incomplete_materializations(store)
     final = store / normalized
     if final.exists():
         manifest = validate_hitl_artifact_snapshot(workspace, normalized)
@@ -415,7 +532,7 @@ def capture_hitl_artifact_snapshot(
             or manifest["artifact_roots"] != roots
             or (manifest["version"] == 1 and bool(gitlinks))
             or (
-                manifest["version"] == 2
+                manifest["version"] >= 2
                 and _gitlink_identity_map(stored_gitlinks) != _gitlink_identity_map(gitlinks)
             )
         ):
@@ -464,6 +581,7 @@ def capture_hitl_artifact_snapshot(
     try:
         files_root = staging / _FILES_DIR
         files_root.mkdir(parents=True)
+        captured_files: dict[str, dict[str, Any]] = {}
         for relative_text in captured:
             relative = _safe_relative_path(relative_text, label="ignored artifact path")
             source = _path_without_symlink_ancestors(
@@ -475,7 +593,11 @@ def capture_hitl_artifact_snapshot(
                 raise HitlArtifactSnapshotError(
                     f"Ignored evaluator artifact disappeared during capture: {relative_text}"
                 )
-            _copy_entry(source, files_root / relative)
+            captured_files[relative_text] = _copy_regular_file_with_integrity(
+                source,
+                files_root / relative,
+                label=relative_text,
+            )
         bundled_gitlinks: list[dict[str, Any]] = []
         for index, (gitlink, repository) in enumerate(resolved_gitlinks):
             bundle_relative = f"{_GITLINKS_DIR}/{index:04d}.bundle"
@@ -501,11 +623,12 @@ def capture_hitl_artifact_snapshot(
         atomic_write_json(
             staging / _MANIFEST_NAME,
             {
-                "version": 2,
+                "version": 3,
                 "artifact_snapshot_id": normalized,
                 "source_checkpoint_sha": source_sha,
                 "artifact_roots": roots,
                 "captured_paths": captured,
+                "captured_files": captured_files,
                 "gitlinks": bundled_gitlinks,
             },
             fsync_parent=False,
@@ -529,27 +652,55 @@ def materialize_hitl_artifact_snapshot(
     manifest = _read_manifest(workspace, snapshot_id)
     files_root = _snapshot_dir(workspace, snapshot_id) / _FILES_DIR
     target_root = Path(destination).resolve()
-    for relative_text in manifest["captured_paths"]:
-        relative = _safe_relative_path(relative_text, label="captured artifact path")
-        source = _path_without_symlink_ancestors(
-            files_root,
-            relative,
-            label="Stored evaluator artifact",
-        )
-        if not source.exists() and not source.is_symlink():
-            raise HitlArtifactSnapshotError(
-                f"HITL artifact snapshot {snapshot_id} is missing {relative_text}."
+    captured_files = manifest.get("captured_files", {})
+    store = hitl_artifact_snapshots_dir(workspace)
+    _discard_incomplete_materializations(store)
+    staging = store / f".materialize.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        staging.mkdir()
+        for relative_text in manifest["captured_paths"]:
+            relative = _safe_relative_path(relative_text, label="captured artifact path")
+            source = _path_without_symlink_ancestors(
+                files_root,
+                relative,
+                label="Stored evaluator artifact",
             )
-        target = _path_without_symlink_ancestors(
-            target_root,
-            relative,
-            label="Restored evaluator artifact",
-        )
-        if target.is_symlink() or target.is_file():
-            target.unlink()
-        elif target.is_dir():
-            shutil.rmtree(target)
-        _copy_entry(source, target)
+            if not source.exists() and not source.is_symlink():
+                raise HitlArtifactSnapshotError(
+                    f"HITL artifact snapshot {snapshot_id} is missing {relative_text}."
+                )
+            staged = _path_without_symlink_ancestors(
+                staging,
+                relative,
+                label="Staged evaluator artifact",
+            )
+            _copy_regular_file_with_integrity(
+                source,
+                staged,
+                expected=captured_files.get(relative_text),
+                label=relative_text,
+            )
+
+        # Verify every v3 artifact before replacing any destination file.
+        for relative_text in manifest["captured_paths"]:
+            relative = _safe_relative_path(relative_text, label="captured artifact path")
+            staged = _path_without_symlink_ancestors(
+                staging,
+                relative,
+                label="Staged evaluator artifact",
+            )
+            target = _path_without_symlink_ancestors(
+                target_root,
+                relative,
+                label="Restored evaluator artifact",
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            os.replace(staged, target)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def _remove_workspace_entry(path: Path) -> None:
@@ -576,7 +727,7 @@ def _require_manifest_gitlinks_match_checkpoint(
     checkpoint_links: list[CheckpointGitlink],
 ) -> list[tuple[CheckpointGitlink, str, tuple[str, ...]]]:
     entries = _manifest_gitlinks(manifest)
-    if manifest["version"] == 2 and _gitlink_identity_map(
+    if manifest["version"] >= 2 and _gitlink_identity_map(
         [gitlink for gitlink, _bundle, _boundaries in entries]
     ) != _gitlink_identity_map(checkpoint_links):
         raise HitlArtifactSnapshotError(
@@ -597,7 +748,7 @@ def resolve_hitl_snapshot_gitlink_bundles(
     scorer can retain its existing live-repository fallback.
     """
     workspace = Path(work_dir).resolve()
-    manifest = validate_hitl_artifact_snapshot(
+    manifest = _inspect_hitl_artifact_snapshot(
         workspace,
         snapshot_id,
         source_checkpoint_sha=checkpoint_sha,
@@ -625,6 +776,7 @@ def discard_hitl_artifact_snapshot(work_dir: Path, snapshot_id: str) -> None:
     normalized = _safe_snapshot_id(snapshot_id)
     store = hitl_artifact_snapshots_dir(workspace)
     _discard_incomplete_snapshot_generations(store, snapshot_id=normalized)
+    _discard_incomplete_materializations(store)
     target = store / normalized
     if target.is_symlink() or (target.exists() and not target.is_dir()):
         target.unlink()
@@ -781,7 +933,7 @@ def restore_hitl_checkpoint_with_artifacts(
         raise HitlArtifactSnapshotError("The HITL node is not a workspace checkpoint.")
     snapshot_id = str(artifact_snapshot_id or "").strip()
     manifest = (
-        validate_hitl_artifact_snapshot(workspace, snapshot_id)
+        _inspect_hitl_artifact_snapshot(workspace, snapshot_id)
         if snapshot_id
         else None
     )
@@ -793,7 +945,7 @@ def restore_hitl_checkpoint_with_artifacts(
     except HitlGitlinkError as exc:
         raise HitlArtifactSnapshotError(str(exc)) from exc
 
-    if manifest is not None and manifest["version"] == 2:
+    if manifest is not None and manifest["version"] >= 2:
         _require_manifest_gitlinks_match_checkpoint(manifest, target_gitlinks)
         current_paths = {
             gitlink.relative_path.as_posix(): gitlink.relative_path for gitlink in current_gitlinks
