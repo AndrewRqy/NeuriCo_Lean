@@ -126,9 +126,22 @@ def run_scorer(
                      + "; ".join(mismatches),
         }
 
-    # Clear stale results so we never read leftover values from a prior run
-    if results_path.exists():
-        results_path.unlink()
+    # Clear stale results so we never read leftover values from a prior run.
+    # Malformed paths (for example, a directory left by a failed evaluator)
+    # are scorer failures rather than uncaught pipeline exceptions.
+    try:
+        results_path.unlink(missing_ok=True)
+    except OSError as e:
+        return {
+            'success': False,
+            'return_code': None,
+            'results': None,
+            'results_path': str(results_path),
+            'log_path': str(log_path),
+            'elapsed_time': 0.0,
+            'error': f"could not clear stale results.json: {e}",
+            'stopped': False,
+        }
 
     python_executable = python_executable or _resolve_python_executable(work_dir)
     cmd = [python_executable, str(eval_script)]
@@ -171,12 +184,27 @@ def run_scorer(
     elapsed = time.time() - start_time
 
     results: Optional[Dict[str, Any]] = None
-    if results_path.exists():
+    if not results_path.exists():
+        results_err = f"{RESULTS_FILE_NAME} was not produced"
+        error = f"{error}; {results_err}" if error else results_err
+    else:
         try:
-            results = json.loads(results_path.read_text(encoding='utf-8'))
+            parsed_results = json.loads(results_path.read_text(encoding='utf-8'))
+        except UnicodeDecodeError as e:
+            read_err = f"results.json is not valid UTF-8: {e}"
+            error = f"{error}; {read_err}" if error else read_err
+        except OSError as e:
+            read_err = f"results.json could not be read: {e}"
+            error = f"{error}; {read_err}" if error else read_err
         except json.JSONDecodeError as e:
             json_err = f"results.json is not valid JSON: {e}"
             error = f"{error}; {json_err}" if error else json_err
+        else:
+            if isinstance(parsed_results, dict):
+                results = parsed_results
+            else:
+                json_err = "results.json must contain a JSON object"
+                error = f"{error}; {json_err}" if error else json_err
 
     success = return_code == 0 and results is not None and error is None
 
@@ -208,13 +236,14 @@ def load_scoring_results(work_dir: Path) -> Optional[Dict[str, Any]]:
     only need the score, not the full scorer-run dict.
 
     Returns:
-        Parsed results.json contents, or None if the file is missing or
-        unparseable.
+        Parsed results.json object, or None if the file is missing, invalid,
+        or contains a different JSON type.
     """
     results_path = Path(work_dir) / "scoring" / RESULTS_FILE_NAME
     if not results_path.exists():
         return None
     try:
-        return json.loads(results_path.read_text(encoding='utf-8'))
-    except json.JSONDecodeError:
+        results = json.loads(results_path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
+    return results if isinstance(results, dict) else None
