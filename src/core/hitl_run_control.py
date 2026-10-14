@@ -33,23 +33,68 @@ class HitlRollbackControl:
     def __init__(self, work_dir: Path) -> None:
         self.path = hitl_rollback_control_path(Path(work_dir).resolve())
 
+    @staticmethod
+    def _validate_post_restore_cleanup(value: Any) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"kind", "scoring_refs", "artifact_snapshot_id"}
+            or value.get("kind") != "initial_scoring"
+            or not isinstance(value.get("scoring_refs"), list)
+            or not isinstance(value.get("artifact_snapshot_id"), str)
+        ):
+            raise RuntimeError("HITL rollback post-restore cleanup is malformed.")
+        refs = value["scoring_refs"]
+        if any(
+            not isinstance(ref, str)
+            or ref != ref.strip()
+            or not ref.startswith("refs/neurico/hitl/scoring/")
+            for ref in refs
+        ):
+            raise RuntimeError("HITL rollback scoring references are malformed.")
+        if len(set(refs)) != len(refs) or refs != sorted(refs):
+            raise RuntimeError("HITL rollback scoring references are malformed.")
+        snapshot_id = value["artifact_snapshot_id"]
+        if snapshot_id and (
+            snapshot_id != snapshot_id.strip()
+            or snapshot_id in {".", ".."}
+            or "/" in snapshot_id
+            or "\\" in snapshot_id
+        ):
+            raise RuntimeError("HITL rollback artifact snapshot ID is malformed.")
+        return {
+            "kind": "initial_scoring",
+            "scoring_refs": list(refs),
+            "artifact_snapshot_id": snapshot_id,
+        }
+
     def request(
-        self, boundary: Dict[str, Any], *, discard_boundaries: list[Dict[str, Any]]
+        self,
+        boundary: Dict[str, Any],
+        *,
+        discard_boundaries: list[Dict[str, Any]],
+        post_restore_cleanup: Optional[Dict[str, Any]] = None,
     ) -> None:
+        cleanup = self._validate_post_restore_cleanup(post_restore_cleanup)
         existing = self.record()
         if existing is not None:
             if (
                 existing["boundary"] != boundary
                 or existing["discard_boundaries"] != discard_boundaries
+                or existing.get("post_restore_cleanup") != cleanup
             ):
                 raise RuntimeError("Another HITL rollback handoff is still pending.")
             return
-        atomic_write_json(self.path, {
-            "version": 1,
+        payload = {
+            "version": 2 if cleanup is not None else 1,
             "status": "restoring",
             "boundary": boundary,
             "discard_boundaries": discard_boundaries,
-        })
+        }
+        if cleanup is not None:
+            payload["post_restore_cleanup"] = cleanup
+        atomic_write_json(self.path, payload)
 
     def record(self) -> Optional[Dict[str, Any]]:
         try:
@@ -60,12 +105,19 @@ class HitlRollbackControl:
             raise RuntimeError("HITL rollback handoff is unavailable or invalid.") from exc
         if (
             not isinstance(value, dict)
-            or value.get("version") != 1
+            or value.get("version") not in {1, 2}
             or value.get("status") not in {"restoring", "cleanup_pending"}
             or not isinstance(value.get("boundary"), dict)
             or not isinstance(value.get("discard_boundaries"), list)
         ):
             raise RuntimeError("HITL rollback handoff is malformed.")
+        cleanup = self._validate_post_restore_cleanup(value.get("post_restore_cleanup"))
+        if (value["version"] == 1 and cleanup is not None) or (
+            value["version"] == 2 and cleanup is None
+        ):
+            raise RuntimeError("HITL rollback handoff has inconsistent cleanup metadata.")
+        if cleanup is not None:
+            value["post_restore_cleanup"] = cleanup
         for boundary in [value["boundary"], *value["discard_boundaries"]]:
             if not isinstance(boundary, dict) or not str(
                 boundary.get("hitl_snapshot_ref", "")

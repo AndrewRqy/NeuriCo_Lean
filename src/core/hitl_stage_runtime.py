@@ -311,7 +311,15 @@ class HitlStageRollback:
             source_checkpoint_sha=self.checkpoint_sha,
         )
 
-    def restore(self, runtime: Any, reason: str, *, cleanup_label: str) -> None:
+    def restore(
+        self,
+        runtime: Any,
+        reason: str,
+        *,
+        cleanup_label: str,
+        post_restore_cleanup: Dict[str, Any] | None = None,
+        cleanup_after_restore: Callable[[Dict[str, Any]], None] | None = None,
+    ) -> None:
         """Restore the boundary in the established public-then-private order."""
         runtime.abandon_pending_worker_request_for_rollback(reason)
         runtime.clear_idea_tool_context()
@@ -323,12 +331,21 @@ class HitlStageRollback:
         HitlRollbackControl(self.work_dir).request(
             {**self.descriptor(), "stage": getattr(runtime, "pipeline_stage", "")},
             discard_boundaries=[],
+            post_restore_cleanup=post_restore_cleanup,
         )
-        self.restore_pending(self.work_dir, after_restore=reload_runtime)
+        self.restore_pending(
+            self.work_dir,
+            after_restore=reload_runtime,
+            cleanup_after_restore=cleanup_after_restore,
+        )
 
     @classmethod
     def restore_pending(
-        cls, work_dir: Path, *, after_restore: Callable[[Dict[str, Any]], None]
+        cls,
+        work_dir: Path,
+        *,
+        after_restore: Callable[[Dict[str, Any]], None],
+        cleanup_after_restore: Callable[[Dict[str, Any]], None] | None = None,
     ) -> Dict[str, Any] | None:
         """Replay an unfinished restore, or finish disposal without reading its data."""
         from core.hitl_artifact_snapshots import (
@@ -352,6 +369,13 @@ class HitlStageRollback:
             control.mark_cleanup_pending(record)
             record["status"] = "cleanup_pending"
         after_restore(record)
+        post_restore_cleanup = record.get("post_restore_cleanup")
+        if isinstance(post_restore_cleanup, dict):
+            if cleanup_after_restore is None:
+                raise RuntimeError(
+                    "HITL rollback requires its registered post-restore cleanup handler."
+                )
+            cleanup_after_restore(post_restore_cleanup)
         store = HitlGitStateStore(work_dir)
         for boundary in [*record["discard_boundaries"], record["boundary"]]:
             artifact_id = str(boundary.get("artifact_snapshot_id", "")).strip()

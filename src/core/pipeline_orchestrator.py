@@ -512,7 +512,11 @@ class ResearchPipelineOrchestrator:
                 runtime = self._create_hitl_runtime(stage)
                 try:
                     rollback.restore(
-                        runtime, "Recovering interrupted initial stage.", cleanup_label="restored"
+                        runtime,
+                        "Recovering interrupted initial stage.",
+                        cleanup_label="restored",
+                        post_restore_cleanup=self._initial_scoring_cleanup_record(),
+                        cleanup_after_restore=self._retire_initial_scoring_resources,
                     )
                 finally:
                     runtime.clear_idea_tool_context()
@@ -574,13 +578,14 @@ class ResearchPipelineOrchestrator:
             self._discard_initial_boundary(boundary)
             return {"stage": stage, "checkpoint_sha": str(boundary.get("checkpoint_sha", ""))}
         rollback = HitlStageRollback.from_descriptor(self.work_dir, boundary)
-        self._retire_initial_scoring_refs_before_rollback()
         runtime = self._create_hitl_runtime(stage)
         try:
             rollback.restore(
                 runtime,
                 "The managed research run was stopped and runtime is restoring its stage boundary.",
                 cleanup_label="stopped",
+                post_restore_cleanup=self._initial_scoring_cleanup_record(),
+                cleanup_after_restore=self._retire_initial_scoring_resources,
             )
         finally:
             runtime.clear_idea_tool_context()
@@ -732,14 +737,26 @@ class ResearchPipelineOrchestrator:
                 runtime.reload_manager_after_state_restore()
                 runtime.clear_idea_tool_context()
                 return
+        post_restore_cleanup = None
+        cleanup_after_restore = None
         if self.hitl_autoresearch or self.baseline_construction:
             # Both scoring-capable initial workflows can own asynchronous
-            # scorer state. Quiesce it and retire its runtime-owned resources
-            # before private HITL rollback removes the ownership record.
+            # scorer state. Quiesce it and register its runtime-owned resources
+            # for disposal only after the complete rollback succeeds.
             runtime.abandon_pending_worker_request_for_rollback(reason)
             runtime.clear_idea_tool_context()
-            self._retire_initial_scoring_refs_before_rollback()
-        rollback.restore(runtime, reason, cleanup_label="restored")
+            post_restore_cleanup = self._initial_scoring_cleanup_record()
+            cleanup_after_restore = self._retire_initial_scoring_resources
+        if post_restore_cleanup is None:
+            rollback.restore(runtime, reason, cleanup_label="restored")
+        else:
+            rollback.restore(
+                runtime,
+                reason,
+                cleanup_label="restored",
+                post_restore_cleanup=post_restore_cleanup,
+                cleanup_after_restore=cleanup_after_restore,
+            )
         if self.managed_initial_run:
             self.state = PipelineState(self.work_dir)
 
@@ -1395,12 +1412,13 @@ class ResearchPipelineOrchestrator:
             return
         self._complete_rollback_artifact_capture("initial_stage")
         initial_boundary = self.state.get_runtime_recovery("initial_stage") if self.hitl_autoresearch else None
-        # Validate both halves before retiring score evidence or changing files.
+        # Register score cleanup in the durable rollback handoff. The resources
+        # remain available until both public and private restoration succeed.
         rollback = HitlStageRollback.from_descriptor(
             self.work_dir,
             {**recovery, "hitl_snapshot_paths": list(HitlGitStateStore.rollback_paths())},
         )
-        self._retire_initial_scoring_refs_before_rollback()
+        post_restore_cleanup = self._initial_scoring_cleanup_record()
         canceller = getattr(self.hitl_manager, "abandon_worker_request_for_rollback", None)
         if callable(canceller):
             canceller(
@@ -1411,12 +1429,15 @@ class ResearchPipelineOrchestrator:
         HitlRollbackControl(self.work_dir).request(
             {**recovery, **rollback.descriptor(), "stage": "experiment_runner"},
             discard_boundaries=[initial_boundary] if initial_boundary else [],
+            post_restore_cleanup=post_restore_cleanup,
         )
         self._resume_initial_rollback()
 
     def _resume_initial_rollback(self) -> Optional[Dict[str, Any]]:
         return HitlStageRollback.restore_pending(
-            self.work_dir, after_restore=self._reload_after_initial_rollback
+            self.work_dir,
+            after_restore=self._reload_after_initial_rollback,
+            cleanup_after_restore=self._retire_initial_scoring_resources,
         )
 
     def _reload_after_initial_rollback(self, record: Dict[str, Any]) -> None:
@@ -1433,27 +1454,37 @@ class ResearchPipelineOrchestrator:
             self.state.state_file.parent.mkdir(parents=True, exist_ok=True)
             self.state.clear_runtime_recovery("experiment_runner")
 
-    def _retire_initial_scoring_refs_before_rollback(self) -> None:
-        """Retire refs named by live initial-scoring state before restoring it."""
-        discard_isolated_scoring_workspace(self.work_dir)
+    def _initial_scoring_cleanup_record(self) -> Dict[str, Any]:
+        """Capture scorer resources before private rollback removes their owner."""
         pending = HitlRuntimeState(self.work_dir).pending_worker_command()
-        if not isinstance(pending, dict):
-            return
-        isolated = pending.get("isolated_scoring")
-        if not isinstance(isolated, dict):
-            return
         refs: set[str] = set()
-        scorer_result = isolated.get("scorer_result")
-        if isinstance(scorer_result, dict):
-            scoring_ref = str(scorer_result.get("scoring_ref", "")).strip()
-            if scoring_ref:
-                refs.add(scoring_ref)
-        request_key = str(pending.get("request_key", "")).strip()
-        if request_key:
-            refs.add(f"refs/neurico/hitl/scoring/{request_key}")
-        for scoring_ref in refs:
+        artifact_snapshot_id = ""
+        if isinstance(pending, dict):
+            isolated = pending.get("isolated_scoring")
+            if isinstance(isolated, dict):
+                scorer_result = isolated.get("scorer_result")
+                if isinstance(scorer_result, dict):
+                    scoring_ref = str(scorer_result.get("scoring_ref", "")).strip()
+                    if scoring_ref:
+                        refs.add(scoring_ref)
+                request_key = str(pending.get("request_key", "")).strip()
+                if request_key:
+                    refs.add(f"refs/neurico/hitl/scoring/{request_key}")
+                artifact_snapshot_id = str(
+                    isolated.get("artifact_snapshot_id", "")
+                ).strip()
+        return {
+            "kind": "initial_scoring",
+            "scoring_refs": sorted(refs),
+            "artifact_snapshot_id": artifact_snapshot_id,
+        }
+
+    def _retire_initial_scoring_resources(self, cleanup: Dict[str, Any]) -> None:
+        """Idempotently retire scorer resources after rollback succeeds."""
+        discard_isolated_scoring_workspace(self.work_dir)
+        for scoring_ref in cleanup["scoring_refs"]:
             delete_git_ref(self.work_dir, scoring_ref, strict=True)
-        artifact_snapshot_id = str(isolated.get("artifact_snapshot_id", "")).strip()
+        artifact_snapshot_id = str(cleanup["artifact_snapshot_id"]).strip()
         if artifact_snapshot_id:
             discard_hitl_artifact_snapshot(self.work_dir, artifact_snapshot_id)
 
