@@ -966,11 +966,11 @@ def restore_hitl_checkpoint_with_artifacts(
         raise HitlArtifactSnapshotError("The HITL node is not a workspace checkpoint.")
     snapshot_id = str(artifact_snapshot_id or "").strip()
     manifest = (
-        inspect_hitl_artifact_snapshot(
-            workspace,
-            snapshot_id,
-            source_checkpoint_sha=sha,
-        )
+        # A retained node pairs its scored public checkpoint with the artifact
+        # snapshot captured from the pre-scoring source checkpoint.  The
+        # persisted pair is the composite restoration identity; exact source
+        # matching remains enforced by scoring and stage-rollback callers.
+        inspect_hitl_artifact_snapshot(workspace, snapshot_id)
         if snapshot_id
         else None
     )
