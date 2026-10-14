@@ -1148,6 +1148,19 @@ def _retire_runtime_scoring_refs(
         discard_hitl_artifact_snapshot(work_dir, snapshot_id)
 
 
+def _reclaim_inactive_frontier_artifact_snapshots(work_dir: Path) -> None:
+    """Best-effort cleanup of snapshots whose nodes cannot be selected again."""
+    frontier = HitlFrontierStore(work_dir)
+    for snapshot_id in sorted(frontier.inactive_artifact_snapshot_ids()):
+        try:
+            discard_hitl_artifact_snapshot(work_dir, snapshot_id)
+        except OSError as exc:
+            print(
+                "⚠️  Could not reclaim inactive HITL artifact snapshot "
+                f"{snapshot_id}: {exc}"
+            )
+
+
 def _restore_selected_checkpoint(work_dir: Path, selected_sha: str) -> str:
     """Restore and verify one already-selected public frontier checkpoint."""
     return restore_hitl_frontier_node(work_dir, selected_sha)
@@ -1342,7 +1355,9 @@ def _finish_persisted_frontier_decision(
         status="completed",
     )
     selected = HitlFrontierStore(work_dir).state()["selected_frontier_node_sha"]
-    return restore_hitl_frontier_node(work_dir, selected)
+    restored = restore_hitl_frontier_node(work_dir, selected)
+    _reclaim_inactive_frontier_artifact_snapshots(work_dir)
+    return restored
 
 
 def _require_budget_exhausted_stop(work_dir: Path, request_id: str) -> None:
@@ -1921,6 +1936,8 @@ class HitlAutoResearchController:
             resumed_selection = self._resume_frontier_boundary_if_needed()
             if resumed_selection is not None:
                 current_best_sha = resumed_selection
+        if needs_another_proposal:
+            _reclaim_inactive_frontier_artifact_snapshots(self.work_dir)
 
         first_iteration = len(resumed_results) + 1
         for iteration in range(first_iteration, iterations + 1):
@@ -1986,6 +2003,7 @@ class HitlAutoResearchController:
         state = self.hitl_frontier.state()
         if not selected or selected != state["selected_frontier_node_sha"]:
             raise RuntimeError("HITL manager did not finalize a valid frontier selection.")
+        _reclaim_inactive_frontier_artifact_snapshots(self.work_dir)
         return selected
 
     def _maintain_frontier_after_scored_iteration(self) -> str:

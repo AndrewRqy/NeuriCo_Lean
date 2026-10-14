@@ -481,6 +481,25 @@ class HitlFrontierStore:
                 retained.add(snapshot_id)
         return retained
 
+    def inactive_artifact_snapshot_ids(self) -> set[str]:
+        """Return recorded snapshots no longer owned by the active frontier.
+
+        Historical node records remain part of the research audit trail after
+        exploitation replacement or explicit pruning.  Their large artifact
+        snapshots do not need to remain once no active node references them.
+        """
+        recorded = self.retained_artifact_snapshot_ids()
+        if not recorded:
+            return set()
+        active = {
+            snapshot_id
+            for node_sha in self.state(allow_unselected=True)[
+                "active_frontier_node_shas"
+            ]
+            if (snapshot_id := self.artifact_snapshot_id(node_sha))
+        }
+        return recorded - active
+
     def _direction_attempt_history(
         self,
         node_sha: str,
