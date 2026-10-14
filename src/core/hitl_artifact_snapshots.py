@@ -641,17 +641,15 @@ def capture_hitl_artifact_snapshot(
     return normalized
 
 
-def materialize_hitl_artifact_snapshot(
+def _prepare_hitl_artifact_materialization(
     work_dir: Path,
     *,
     snapshot_id: str,
-    destination: Path,
-) -> None:
-    """Copy one private snapshot into a workspace without following symlinks."""
+    manifest: dict[str, Any],
+) -> Path:
+    """Copy and verify every artifact before its destination is changed."""
     workspace = Path(work_dir).resolve()
-    manifest = _read_manifest(workspace, snapshot_id)
     files_root = _snapshot_dir(workspace, snapshot_id) / _FILES_DIR
-    target_root = Path(destination).resolve()
     captured_files = manifest.get("captured_files", {})
     store = hitl_artifact_snapshots_dir(workspace)
     _discard_incomplete_materializations(store)
@@ -680,24 +678,59 @@ def materialize_hitl_artifact_snapshot(
                 expected=captured_files.get(relative_text),
                 label=relative_text,
             )
+    except BaseException:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return staging
 
-        # Verify every v3 artifact before replacing any destination file.
-        for relative_text in manifest["captured_paths"]:
-            relative = _safe_relative_path(relative_text, label="captured artifact path")
-            staged = _path_without_symlink_ancestors(
-                staging,
-                relative,
-                label="Staged evaluator artifact",
-            )
-            target = _path_without_symlink_ancestors(
-                target_root,
-                relative,
-                label="Restored evaluator artifact",
-            )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.is_dir() and not target.is_symlink():
-                shutil.rmtree(target)
-            os.replace(staged, target)
+
+def _publish_hitl_artifact_materialization(
+    *,
+    manifest: dict[str, Any],
+    staging: Path,
+    destination: Path,
+) -> None:
+    """Publish artifact files that were already copied and verified."""
+    target_root = Path(destination).resolve()
+    for relative_text in manifest["captured_paths"]:
+        relative = _safe_relative_path(relative_text, label="captured artifact path")
+        staged = _path_without_symlink_ancestors(
+            staging,
+            relative,
+            label="Staged evaluator artifact",
+        )
+        target = _path_without_symlink_ancestors(
+            target_root,
+            relative,
+            label="Restored evaluator artifact",
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        os.replace(staged, target)
+
+
+def materialize_hitl_artifact_snapshot(
+    work_dir: Path,
+    *,
+    snapshot_id: str,
+    destination: Path,
+) -> None:
+    """Copy one private snapshot into a workspace without following symlinks."""
+    workspace = Path(work_dir).resolve()
+    manifest = _read_manifest(workspace, snapshot_id)
+    staging = _prepare_hitl_artifact_materialization(
+        workspace,
+        snapshot_id=snapshot_id,
+        manifest=manifest,
+    )
+    try:
+        _publish_hitl_artifact_materialization(
+            manifest=manifest,
+            staging=staging,
+            destination=destination,
+        )
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
@@ -945,89 +978,114 @@ def restore_hitl_checkpoint_with_artifacts(
     except HitlGitlinkError as exc:
         raise HitlArtifactSnapshotError(str(exc)) from exc
 
-    if manifest is not None and manifest["version"] >= 2:
+    bundled_gitlinks = manifest is not None and manifest["version"] >= 2
+    resolved_gitlinks: list[tuple[CheckpointGitlink, Path]] | None = None
+    if bundled_gitlinks:
+        assert manifest is not None
         _require_manifest_gitlinks_match_checkpoint(manifest, target_gitlinks)
-        current_paths = {
-            gitlink.relative_path.as_posix(): gitlink.relative_path for gitlink in current_gitlinks
-        }
-        target_paths = {gitlink.relative_path.as_posix() for gitlink in target_gitlinks}
-        for relative_text, relative in current_paths.items():
-            if relative_text in target_paths:
-                continue
-            obsolete = _path_without_symlink_ancestors(
-                workspace,
-                relative,
-                label="Obsolete Gitlink",
-            )
-            _remove_workspace_entry(obsolete)
+    else:
+        # Version-1 snapshots and legacy nodes depend on their existing live
+        # nested checkouts. Resolve every target before changing the workspace.
+        try:
+            resolved_gitlinks = resolve_checkpoint_gitlinks(workspace, sha)
+        except HitlGitlinkError as exc:
+            raise HitlArtifactSnapshotError(str(exc)) from exc
 
-        checkpoints.restore_checkpoint(sha, clean_untracked_public=True)
-        if artifact_roots:
-            cleaned = run_git(
-                workspace,
-                "--literal-pathspecs",
-                "clean",
-                "-ffdx",
-                "--",
-                *artifact_roots,
-                check=False,
-            )
-            if cleaned.returncode != 0:
-                detail = str(cleaned.stderr or cleaned.stdout or "unknown Git error").strip()
-                raise HitlArtifactSnapshotError(
-                    f"Runtime could not clear stale evaluator artifacts: {detail}"
-                )
-        _restore_bundled_checkpoint_gitlinks(
+    staging = (
+        _prepare_hitl_artifact_materialization(
             workspace,
             snapshot_id=snapshot_id,
             manifest=manifest,
-            checkpoint_links=target_gitlinks,
-            artifact_roots=artifact_roots,
         )
-        materialize_hitl_artifact_snapshot(
-            workspace,
-            snapshot_id=snapshot_id,
-            destination=workspace,
-        )
+        if manifest is not None
+        else None
+    )
+    try:
+        if bundled_gitlinks:
+            assert manifest is not None
+            assert staging is not None
+            current_paths = {
+                gitlink.relative_path.as_posix(): gitlink.relative_path
+                for gitlink in current_gitlinks
+            }
+            target_paths = {gitlink.relative_path.as_posix() for gitlink in target_gitlinks}
+            for relative_text, relative in current_paths.items():
+                if relative_text in target_paths:
+                    continue
+                obsolete = _path_without_symlink_ancestors(
+                    workspace,
+                    relative,
+                    label="Obsolete Gitlink",
+                )
+                _remove_workspace_entry(obsolete)
+
+            checkpoints.restore_checkpoint(sha, clean_untracked_public=True)
+            if artifact_roots:
+                cleaned = run_git(
+                    workspace,
+                    "--literal-pathspecs",
+                    "clean",
+                    "-ffdx",
+                    "--",
+                    *artifact_roots,
+                    check=False,
+                )
+                if cleaned.returncode != 0:
+                    detail = str(
+                        cleaned.stderr or cleaned.stdout or "unknown Git error"
+                    ).strip()
+                    raise HitlArtifactSnapshotError(
+                        f"Runtime could not clear stale evaluator artifacts: {detail}"
+                    )
+            _restore_bundled_checkpoint_gitlinks(
+                workspace,
+                snapshot_id=snapshot_id,
+                manifest=manifest,
+                checkpoint_links=target_gitlinks,
+                artifact_roots=artifact_roots,
+            )
+            _publish_hitl_artifact_materialization(
+                manifest=manifest,
+                staging=staging,
+                destination=workspace,
+            )
+        else:
+            assert resolved_gitlinks is not None
+            checkpoints.restore_checkpoint(sha, clean_untracked_public=True)
+            _restore_checkpoint_gitlinks(
+                resolved_gitlinks,
+                artifact_roots=artifact_roots,
+            )
+            if manifest is not None:
+                assert staging is not None
+                cleaned = run_git(
+                    workspace,
+                    "--literal-pathspecs",
+                    "clean",
+                    "-fdX",
+                    "--",
+                    *artifact_roots,
+                    check=False,
+                )
+                if cleaned.returncode != 0:
+                    detail = str(
+                        cleaned.stderr or cleaned.stdout or "unknown Git error"
+                    ).strip()
+                    raise HitlArtifactSnapshotError(
+                        "Runtime could not clear stale ignored evaluator artifacts: "
+                        f"{detail}"
+                    )
+                _publish_hitl_artifact_materialization(
+                    manifest=manifest,
+                    staging=staging,
+                    destination=workspace,
+                )
         if checkpoints.current_sha() != sha:
             raise HitlArtifactSnapshotError("Runtime could not restore the HITL node checkpoint.")
         return sha
-
-    # Version-1 snapshots and legacy nodes depend on their existing live
-    # nested checkouts. Resolve every target before changing the workspace.
-    try:
-        resolved_gitlinks = resolve_checkpoint_gitlinks(workspace, sha)
-    except HitlGitlinkError as exc:
-        raise HitlArtifactSnapshotError(str(exc)) from exc
-
-    checkpoints.restore_checkpoint(sha, clean_untracked_public=True)
-    _restore_checkpoint_gitlinks(
-        resolved_gitlinks,
-        artifact_roots=artifact_roots,
-    )
-    if manifest is not None:
-        cleaned = run_git(
-            workspace,
-            "--literal-pathspecs",
-            "clean",
-            "-fdX",
-            "--",
-            *artifact_roots,
-            check=False,
-        )
-        if cleaned.returncode != 0:
-            detail = str(cleaned.stderr or cleaned.stdout or "unknown Git error").strip()
-            raise HitlArtifactSnapshotError(
-                f"Runtime could not clear stale ignored evaluator artifacts: {detail}"
-            )
-        materialize_hitl_artifact_snapshot(
-            workspace,
-            snapshot_id=snapshot_id,
-            destination=workspace,
-        )
-    if checkpoints.current_sha() != sha:
-        raise HitlArtifactSnapshotError("Runtime could not restore the HITL node checkpoint.")
-    return sha
+    finally:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def restore_hitl_frontier_node(work_dir: Path, node_sha: str) -> str:
