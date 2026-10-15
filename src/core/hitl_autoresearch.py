@@ -50,10 +50,21 @@ from core.hitl_frontier import (
     encode_hitl_history_root,
     resolve_hitl_history_root,
 )
+from core.hitl_artifact_snapshots import (
+    discard_hitl_artifact_snapshot,
+    restore_hitl_checkpoint_with_artifacts,
+    restore_hitl_frontier_node,
+    validate_hitl_artifact_snapshot,
+)
 from core.hitl_git import delete_git_ref
 from core.hitl_git_state import HitlGitStateStore
 from core.hitl_manager_inbox import HitlManagerInbox
-from core.hitl_paths import hitl_run_budget_path, hitl_state_dir, hitl_stop_request_path
+from core.hitl_paths import (
+    hitl_artifact_contract_path,
+    hitl_run_budget_path,
+    hitl_state_dir,
+    hitl_stop_request_path,
+)
 from core.hitl_mode import HitlMode, normalize_hitl_mode
 from core.hitl_run_control import HitlRunStopRequested
 from core.hitl_runtime_state import (
@@ -62,6 +73,8 @@ from core.hitl_runtime_state import (
     worker_command_requires_resume,
 )
 from core.hitl_scoring_workspace import (
+    discard_isolated_scoring_workspace,
+    prepare_isolated_scoring_artifacts,
     run_isolated_scorer,
     scoring_source_workspace_fingerprint,
     scoring_source_workspace_scope,
@@ -187,6 +200,14 @@ def _scorer_result_from_objective_score(objective_score: Any) -> Dict[str, Any]:
     return scorer_result
 
 
+def _pending_scoring_artifact_snapshot_id(work_dir: Path) -> str:
+    pending = HitlRuntimeState(work_dir).pending_worker_command() or {}
+    isolated = pending.get("isolated_scoring")
+    if not isinstance(isolated, dict):
+        return ""
+    return str(isolated.get("artifact_snapshot_id", "")).strip()
+
+
 def _initial_publication_pipeline_result(
     work_dir: Path,
     transition: Dict[str, Any],
@@ -244,6 +265,9 @@ def _commit_initial_root_publication(
             reason_for_acceptance=str(
                 transition.get("reason_for_acceptance", "")
             ),
+            artifact_snapshot_id=str(
+                transition.get("artifact_snapshot_id", "")
+            ).strip() or None,
         )
         transition = runtime_state.advance_initial_root_publication_transition(
             status="root_initialized",
@@ -430,6 +454,11 @@ def run_fresh_hitl_autoresearch_initial_node(
     if not isinstance(results, dict):
         raise RuntimeError("HITL initial scorer result did not include structured objective results.")
     history_root, _ = resolve_autoresearch_history_root(work_dir, autoresearch_history_dir)
+    artifact_snapshot_id = _pending_scoring_artifact_snapshot_id(work_dir)
+    if not artifact_snapshot_id and hitl_artifact_contract_path(work_dir).is_file():
+        raise RuntimeError(
+            "HITL initial experiment completed without its artifact snapshot."
+        )
     publication = HitlRuntimeState(
         work_dir
     ).begin_initial_root_publication_transition(
@@ -442,6 +471,11 @@ def run_fresh_hitl_autoresearch_initial_node(
             "reason_for_acceptance": _initial_frontier_acceptance_reason(work_dir),
             "history_root": encode_hitl_history_root(work_dir, history_root),
             "scoring_ref": str(scorer_result.get("scoring_ref", "")).strip(),
+            **(
+                {"artifact_snapshot_id": artifact_snapshot_id}
+                if artifact_snapshot_id
+                else {}
+            ),
         }
     )
     completed_publication = _commit_initial_root_publication(
@@ -812,9 +846,6 @@ def construct_managed_baseline(
 
     def restore_active_rule_maker_boundary() -> None:
         """Restore the inner managed-stage boundary before the outer workspace."""
-        state = PipelineState(work_dir)
-        if state.get_runtime_recovery("initial_stage") is None:
-            return
         ResearchPipelineOrchestrator(
             work_dir=work_dir,
             templates_dir=templates_dir,
@@ -950,6 +981,11 @@ def construct_managed_baseline(
         history_root, _ = resolve_autoresearch_history_root(
             work_dir, autoresearch_history_dir
         )
+        artifact_snapshot_id = _pending_scoring_artifact_snapshot_id(work_dir)
+        if not artifact_snapshot_id and hitl_artifact_contract_path(work_dir).is_file():
+            raise RuntimeError(
+                "Managed baseline completed without its artifact snapshot."
+            )
         publication = runtime_state.begin_initial_root_publication_transition(
             {
                 "plan_text": plan_text,
@@ -962,6 +998,11 @@ def construct_managed_baseline(
                 ),
                 "history_root": encode_hitl_history_root(work_dir, history_root),
                 "scoring_ref": str(scorer_result.get("scoring_ref", "")).strip(),
+                **(
+                    {"artifact_snapshot_id": artifact_snapshot_id}
+                    if artifact_snapshot_id
+                    else {}
+                ),
             }
         )
         orchestrator.state.convert_completed_ordinary_to_autoresearch()
@@ -1077,16 +1118,24 @@ def _retire_runtime_scoring_refs(
     *,
     strict: bool,
 ) -> None:
-    """Retire every scorer ref still named by live runtime state before rollback."""
+    """Retire transient scorer state without deleting frontier-owned artifacts."""
+    discard_isolated_scoring_workspace(work_dir)
     records: list[Dict[str, Any]] = []
+    artifact_snapshot_ids: set[str] = set()
     pending = runtime_state.pending_worker_command()
     if isinstance(pending, dict):
         isolated = pending.get("isolated_scoring")
         if isinstance(isolated, dict):
             records.append(dict(isolated.get("scorer_result") or {}))
+            snapshot_id = str(isolated.get("artifact_snapshot_id", "")).strip()
+            if snapshot_id:
+                artifact_snapshot_ids.add(snapshot_id)
     transition = runtime_state.frontier_decision_transition()
     if isinstance(transition, dict):
         records.append(dict(transition.get("scorer_result") or {}))
+        snapshot_id = str(transition.get("artifact_snapshot_id", "")).strip()
+        if snapshot_id:
+            artifact_snapshot_ids.add(snapshot_id)
     seen: set[str] = set()
     for scorer_result in records:
         scoring_ref = str(scorer_result.get("scoring_ref", "")).strip()
@@ -1094,17 +1143,27 @@ def _retire_runtime_scoring_refs(
             continue
         seen.add(scoring_ref)
         _retire_temporary_scoring_ref(work_dir, scorer_result, strict=strict)
+    retained_snapshot_ids = HitlFrontierStore(work_dir).retained_artifact_snapshot_ids()
+    for snapshot_id in artifact_snapshot_ids - retained_snapshot_ids:
+        discard_hitl_artifact_snapshot(work_dir, snapshot_id)
+
+
+def _reclaim_inactive_frontier_artifact_snapshots(work_dir: Path) -> None:
+    """Best-effort cleanup of snapshots whose nodes cannot be selected again."""
+    frontier = HitlFrontierStore(work_dir)
+    for snapshot_id in sorted(frontier.inactive_artifact_snapshot_ids()):
+        try:
+            discard_hitl_artifact_snapshot(work_dir, snapshot_id)
+        except OSError as exc:
+            print(
+                "⚠️  Could not reclaim inactive HITL artifact snapshot "
+                f"{snapshot_id}: {exc}"
+            )
 
 
 def _restore_selected_checkpoint(work_dir: Path, selected_sha: str) -> str:
     """Restore and verify one already-selected public frontier checkpoint."""
-    checkpoints = CheckpointManager(work_dir)
-    if not checkpoints.checkpoint_exists(selected_sha):
-        raise RuntimeError("The selected HITL frontier node is not a workspace checkpoint.")
-    checkpoints.restore_checkpoint(selected_sha, clean_untracked_public=True)
-    if checkpoints.current_sha() != selected_sha:
-        raise RuntimeError("HITL runtime could not restore the selected frontier checkpoint.")
-    return selected_sha
+    return restore_hitl_frontier_node(work_dir, selected_sha)
 
 
 def _rollback_interrupted_attempt_to_selected_node(
@@ -1116,7 +1175,6 @@ def _rollback_interrupted_attempt_to_selected_node(
     selected_sha: str,
     phase: str,
     reason: str,
-    verify_selected_checkpoint: bool = False,
 ) -> HitlRecoveryResult:
     """Apply the existing complete rollback sequence to one unfinished attempt."""
     classification, missing_paths = _classify_hitl_attempt_recovery(work_dir, attempt_dir)
@@ -1130,13 +1188,7 @@ def _rollback_interrupted_attempt_to_selected_node(
         )
     runtime_state = HitlRuntimeState(work_dir)
     _retire_runtime_scoring_refs(work_dir, runtime_state, strict=True)
-    if verify_selected_checkpoint:
-        _restore_selected_checkpoint(work_dir, selected_sha)
-    else:
-        CheckpointManager(work_dir).restore_checkpoint(
-            selected_sha,
-            clean_untracked_public=True,
-        )
+    _restore_selected_checkpoint(work_dir, selected_sha)
     _restore_hitl_state_snapshot(work_dir, attempt_dir)
     _rollback_failed_hitl_whiteboard_attempt(work_dir, marker)
     _remove_hitl_state_snapshot(work_dir, attempt_dir)
@@ -1171,6 +1223,7 @@ def _commit_persisted_frontier_decision(
     proposal_id = str(transition.get("proposal_idea_id", "")).strip()
     kind = str(transition.get("proposal_type", "")).strip()
     score = transition.get("objective_score")
+    artifact_snapshot_id = str(transition.get("artifact_snapshot_id", "")).strip()
     review_reason = str(transition.get("reason", "")).strip()
     if not all([parent, attempt, candidate, proposal_id, review_reason]) or not isinstance(score, dict):
         raise RuntimeError("Persisted frontier decision transition is incomplete.")
@@ -1211,6 +1264,7 @@ def _commit_persisted_frontier_decision(
             accepted=bool(transition.get("accepted")),
             reason=review_reason,
             plan_text=str(transition.get("plan_text", "")),
+            artifact_snapshot_id=artifact_snapshot_id or None,
         )
         transition = state.advance_frontier_decision_transition(
             attempt_id=attempt,
@@ -1236,6 +1290,8 @@ def _commit_persisted_frontier_decision(
         dict(transition.get("scorer_result") or {}),
         strict=True,
     )
+    if not bool(transition.get("accepted")) and artifact_snapshot_id:
+        discard_hitl_artifact_snapshot(work_dir, artifact_snapshot_id)
     scored_candidate = {
         "node_sha": candidate,
         "objective_score": score,
@@ -1276,10 +1332,16 @@ def _finish_persisted_frontier_decision(
     candidate = str(transition.get("candidate_node_sha", "")).strip()
     accepted = bool(transition.get("accepted"))
     if accepted:
-        _restore_selected_checkpoint(work_dir, candidate)
+        restore_hitl_checkpoint_with_artifacts(
+            work_dir,
+            checkpoint_sha=candidate,
+            artifact_snapshot_id=str(
+                transition.get("artifact_snapshot_id", "")
+            ).strip() or None,
+        )
     else:
         state.begin_rejected_whiteboard_cleanup(marker)
-        _restore_selected_checkpoint(work_dir, parent)
+        restore_hitl_frontier_node(work_dir, parent)
         remove_public_sealed_paths(work_dir)
         whiteboard = HitlAutoResearchWhiteboard(work_dir).load()
         if revert_whiteboard_attempt(whiteboard, marker):
@@ -1293,7 +1355,9 @@ def _finish_persisted_frontier_decision(
         status="completed",
     )
     selected = HitlFrontierStore(work_dir).state()["selected_frontier_node_sha"]
-    return _restore_selected_checkpoint(work_dir, selected)
+    restored = restore_hitl_frontier_node(work_dir, selected)
+    _reclaim_inactive_frontier_artifact_snapshots(work_dir)
+    return restored
 
 
 def _require_budget_exhausted_stop(work_dir: Path, request_id: str) -> None:
@@ -1389,7 +1453,6 @@ def finalize_budget_exhausted_autoresearch(
                     "The launch exhausted its time budget before this attempt reached "
                     "a recorded frontier decision."
                 ),
-                verify_selected_checkpoint=True,
             )
     else:
         selected = frontier.state(allow_unselected=True)["selected_frontier_node_sha"]
@@ -1456,10 +1519,7 @@ def recover_interrupted_hitl_attempt_if_needed(work_dir: Path) -> Optional[HitlR
         and rejected_cleanup.get("status") == "pending"
         and rejected_cleanup.get("attempt_id") == marker
     ):
-        CheckpointManager(work_dir).restore_checkpoint(
-            current_best_sha,
-            clean_untracked_public=True,
-        )
+        restore_hitl_frontier_node(work_dir, current_best_sha)
         _recover_rejected_whiteboard_cleanup(
             work_dir=work_dir,
             attempt_dir=attempt_dir,
@@ -1699,8 +1759,7 @@ def continue_hitl_autoresearch(
     if selected_sha is None and not frontier_boundary_pending:
         raise RuntimeError("HITL frontier has no selected node outside a frontier boundary.")
     if not pending_worker_request and not pending_frontier_transition and selected_sha:
-        if checkpoints.current_sha() != selected_sha:
-            checkpoints.restore_checkpoint(selected_sha, clean_untracked_public=True)
+        restore_hitl_frontier_node(work_dir, selected_sha)
         current_sha = checkpoints.current_sha()
         if current_sha != selected_sha:
             raise RuntimeError("HITL runtime could not restore the selected frontier checkpoint.")
@@ -1842,7 +1901,7 @@ class HitlAutoResearchController:
             frontier_state = self.hitl_frontier.state(allow_unselected=True)
             current_best_sha = frontier_state["selected_frontier_node_sha"]
             if current_best_sha:
-                self.checkpoints.restore_checkpoint(current_best_sha, clean_untracked_public=True)
+                restore_hitl_frontier_node(self.work_dir, current_best_sha)
                 initial = Checkpoint(current_best_sha, "Existing HITL AutoResearch frontier root")
             else:
                 current_best_sha = self.checkpoints.current_sha()
@@ -1877,6 +1936,8 @@ class HitlAutoResearchController:
             resumed_selection = self._resume_frontier_boundary_if_needed()
             if resumed_selection is not None:
                 current_best_sha = resumed_selection
+        if needs_another_proposal:
+            _reclaim_inactive_frontier_artifact_snapshots(self.work_dir)
 
         first_iteration = len(resumed_results) + 1
         for iteration in range(first_iteration, iterations + 1):
@@ -1942,6 +2003,7 @@ class HitlAutoResearchController:
         state = self.hitl_frontier.state()
         if not selected or selected != state["selected_frontier_node_sha"]:
             raise RuntimeError("HITL manager did not finalize a valid frontier selection.")
+        _reclaim_inactive_frontier_artifact_snapshots(self.work_dir)
         return selected
 
     def _maintain_frontier_after_scored_iteration(self) -> str:
@@ -2247,7 +2309,7 @@ class HitlAutoResearchController:
         )
         self._retire_temporary_scoring_ref(scorer_result, strict=True)
         self._retire_pending_scoring_ref(strict=True)
-        self.checkpoints.restore_checkpoint(parent_sha, clean_untracked_public=True)
+        restore_hitl_frontier_node(self.work_dir, parent_sha)
         remove_public_sealed_paths(self.work_dir)
         _restore_hitl_state_snapshot(self.work_dir, attempt_dir)
         self._reload_manager_after_hitl_restore()
@@ -2310,7 +2372,7 @@ class HitlAutoResearchController:
             # The manager decision and objective score apply to this immutable
             # public checkpoint, not to any provider-side writes made after the
             # held finish command was released.
-            self.checkpoints.restore_checkpoint(child_sha, clean_untracked_public=True)
+            restore_hitl_frontier_node(self.work_dir, child_sha)
         else:
             self._restore_rejected_candidate_workspace(
                 parent_sha=parent_sha,
@@ -2426,6 +2488,18 @@ class HitlAutoResearchController:
             raise RuntimeError("Frontier decision is missing runtime-owned candidate data.")
         state = HitlRuntimeState(self.work_dir)
         pending = state.pending_worker_command() or {}
+        isolated = pending.get("isolated_scoring")
+        artifact_snapshot_id = (
+            str(isolated.get("artifact_snapshot_id", "")).strip()
+            if isinstance(isolated, dict)
+            else ""
+        )
+        if not artifact_snapshot_id and hitl_artifact_contract_path(
+            self.work_dir
+        ).is_file():
+            raise RuntimeError(
+                "Frontier decision is missing the candidate artifact snapshot."
+            )
         return state.begin_frontier_decision_transition(
             {
                 "request_key": str(pending.get("request_key", "")).strip(),
@@ -2437,6 +2511,11 @@ class HitlAutoResearchController:
                 "objective_score": objective_score,
                 "scorer_result": scorer_result,
                 "candidate_summary": candidate_summary.as_dict(),
+                **(
+                    {"artifact_snapshot_id": artifact_snapshot_id}
+                    if artifact_snapshot_id
+                    else {}
+                ),
                 "accepted": bool(accepted),
                 "reason": str(reason),
                 "plan_text": self._read_experiment_plan(),
@@ -2533,7 +2612,7 @@ class HitlAutoResearchController:
                 "The AutoResearch attempt failed before scoring and runtime is restoring its parent."
             )
             self._retire_pending_scoring_ref(strict=True)
-            self.checkpoints.restore_checkpoint(parent_sha, clean_untracked_public=True)
+            restore_hitl_frontier_node(self.work_dir, parent_sha)
             remove_public_sealed_paths(self.work_dir)
             _restore_hitl_state_snapshot(self.work_dir, attempt_dir)
             self._reload_manager_after_hitl_restore()
@@ -2601,10 +2680,7 @@ class HitlAutoResearchController:
             )
             self._retire_temporary_scoring_ref(scorer_result, strict=True)
             self._retire_pending_scoring_ref(strict=True)
-            self.checkpoints.restore_checkpoint(
-                parent_sha,
-                clean_untracked_public=True,
-            )
+            restore_hitl_frontier_node(self.work_dir, parent_sha)
             remove_public_sealed_paths(self.work_dir)
             _restore_hitl_state_snapshot(self.work_dir, attempt_dir)
             self._reload_manager_after_hitl_restore()
@@ -2736,12 +2812,33 @@ class HitlAutoResearchController:
             "proposal_idea_id": proposal_idea_id,
         }
 
-        def clear_repairable_scoring_handoff(
-            *, request_key: str, scorer_result: Dict[str, Any]
-        ) -> None:
+        def clear_repairable_scoring_handoff() -> None:
             """Discard an obsolete score before the worker revises the workspace."""
+            state = HitlRuntimeState(self.work_dir)
+            pending = state.pending_worker_command() or {}
+            request_key = str(pending.get("request_key", "")).strip()
+            if not request_key:
+                raise RuntimeError("HITL candidate repair has no held runtime request.")
+            isolated = pending.get("isolated_scoring")
+            scorer_result = (
+                dict(isolated.get("scorer_result") or {})
+                if isinstance(isolated, dict)
+                else {}
+            )
             self._retire_temporary_scoring_ref(scorer_result, strict=True)
-            HitlRuntimeState(self.work_dir).update_pending_worker_command(
+            delete_git_ref(
+                self.work_dir,
+                f"refs/neurico/hitl/scoring/{request_key}",
+                strict=True,
+            )
+            snapshot_id = (
+                str(isolated.get("artifact_snapshot_id", "")).strip()
+                if isinstance(isolated, dict)
+                else ""
+            )
+            if snapshot_id:
+                discard_hitl_artifact_snapshot(self.work_dir, snapshot_id)
+            state.update_pending_worker_command(
                 request_key,
                 isolated_scoring=None,
             )
@@ -2763,6 +2860,23 @@ class HitlAutoResearchController:
                 source_sha = str(cached_score.get("source_checkpoint_sha", "")).strip()
                 if not scorer_result or not source_sha:
                     raise RuntimeError("Persisted isolated scoring handoff is incomplete.")
+                artifact_snapshot_id = str(
+                    cached_score.get("artifact_snapshot_id") or ""
+                ).strip()
+                if (
+                    not artifact_snapshot_id
+                    and hitl_artifact_contract_path(self.work_dir).is_file()
+                ):
+                    raise RuntimeError(
+                        "Persisted isolated scoring handoff predates ignored-artifact "
+                        "snapshots and cannot safely retain this candidate."
+                    )
+                if artifact_snapshot_id:
+                    validate_hitl_artifact_snapshot(
+                        self.work_dir,
+                        artifact_snapshot_id,
+                        source_checkpoint_sha=source_sha,
+                    )
             else:
                 reviewed_fingerprint = scoring_source_workspace_fingerprint(
                     pending,
@@ -2802,20 +2916,22 @@ class HitlAutoResearchController:
                     source_sha = self.checkpoints.create_checkpoint(
                         "HITL AutoResearch candidate before isolated scoring"
                     ).sha
-                    runtime_state.update_pending_worker_command(
-                        request_key,
-                        isolated_scoring={
-                            "status": "prepared",
-                            "source_checkpoint_sha": source_sha,
-                            "source_workspace_fingerprint": source_workspace_fingerprint,
-                            "source_workspace_fingerprint_scope": reviewed_scope,
-                        },
-                    )
+                    reviewed_fingerprint = source_workspace_fingerprint
+                artifact_snapshot_id, _ = prepare_isolated_scoring_artifacts(
+                    work_dir=self.work_dir,
+                    runtime_state=runtime_state,
+                    request_key=request_key,
+                    source_checkpoint_sha=source_sha,
+                    source_workspace_fingerprint=reviewed_fingerprint,
+                    source_workspace_fingerprint_scope=reviewed_scope,
+                    cached_score=cached_score,
+                )
                 try:
                     scorer_result = self._score_candidate_in_private_workspace(
                         source_sha=source_sha,
                         sealed_scoring=sealed_scoring,
                         temporary_ref=f"refs/neurico/hitl/scoring/{request_key}",
+                        artifact_snapshot_id=artifact_snapshot_id,
                     )
                 except Exception as exc:
                     scorer_result = {
@@ -2831,6 +2947,11 @@ class HitlAutoResearchController:
                         "source_checkpoint_sha": source_sha,
                         "scored_checkpoint_sha": candidate_sha,
                         "scorer_result": scorer_result,
+                        **(
+                            {"artifact_snapshot_id": artifact_snapshot_id}
+                            if artifact_snapshot_id
+                            else {}
+                        ),
                     },
                 )
 
@@ -2852,10 +2973,7 @@ class HitlAutoResearchController:
                         manager_feedback=decision["reason"],
                         provenance=attempt_provenance,
                     )
-                    clear_repairable_scoring_handoff(
-                        request_key=request_key,
-                        scorer_result=scorer_result,
-                    )
+                    clear_repairable_scoring_handoff()
                     return runtime.scoring_repair_response(
                         context="Manager requested a revision after reviewing runtime score evidence.",
                         manager_feedback=decision["reason"],
@@ -2939,6 +3057,7 @@ class HitlAutoResearchController:
             allow_scoring_approval=True,
             phase_finish_validator=lambda: validate_required_artifact_contract(self.work_dir),
             scoring_handler=score_in_background,
+            scoring_repair_cleanup=clear_repairable_scoring_handoff,
         )
         try:
             prompt = (
@@ -3024,7 +3143,13 @@ class HitlAutoResearchController:
                 "phase": "frontier_decision",
                 "error": "Prepared frontier decision has no candidate checkpoint.",
             }
-        self.checkpoints.restore_checkpoint(candidate_sha, clean_untracked_public=True)
+        restore_hitl_checkpoint_with_artifacts(
+            self.work_dir,
+            checkpoint_sha=candidate_sha,
+            artifact_snapshot_id=str(
+                transition.get("artifact_snapshot_id", "")
+            ).strip() or None,
+        )
         phase_result = self._commit_frontier_decision(
             runtime=runtime,
             transition=transition,
@@ -3051,6 +3176,7 @@ class HitlAutoResearchController:
         source_sha: str,
         sealed_scoring: Optional[Dict[str, Optional[Path]]],
         temporary_ref: Optional[str] = None,
+        artifact_snapshot_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the scorer without restoring evaluator inputs to the worker workspace."""
         return run_isolated_scorer(
@@ -3059,6 +3185,7 @@ class HitlAutoResearchController:
             sealed_dir=(sealed_scoring or {}).get("path"),
             scorer=self.scorer,
             temporary_ref=temporary_ref,
+            artifact_snapshot_id=artifact_snapshot_id,
         )
 
     def _call_proposal_generator(
@@ -3223,10 +3350,7 @@ class HitlAutoResearchController:
         """Restore a rejected candidate while preserving its useful whiteboard adds."""
         runtime_state = HitlRuntimeState(self.work_dir)
         runtime_state.begin_rejected_whiteboard_cleanup(attempt_id)
-        self.checkpoints.restore_checkpoint(
-            parent_sha,
-            clean_untracked_public=clean_untracked_public,
-        )
+        restore_hitl_frontier_node(self.work_dir, parent_sha)
         remove_public_sealed_paths(self.work_dir)
         self._revert_whiteboard_for(attempt_id)
         runtime_state.complete_rejected_whiteboard_cleanup(attempt_id)
