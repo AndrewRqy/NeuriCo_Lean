@@ -259,7 +259,7 @@ async def run_autoresearch_process(
     iterations: int,
     time_limit_seconds: int | None,
     emit: OutputHandler,
-    register_process: Callable[[asyncio.subprocess.Process], None],
+    register_process: Callable[[asyncio.subprocess.Process], bool],
 ) -> int:
     """Run the normal NeuriCo AutoResearch entrypoint and stream its output."""
     with tempfile.TemporaryDirectory(prefix="neurico-harbor-") as control_dir_value:
@@ -299,7 +299,13 @@ async def run_autoresearch_process(
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
-        register_process(process)
+        cancelled_before_registration = register_process(process)
+        if cancelled_before_registration:
+            await _terminate_process_tree(
+                process,
+                request_cooperative_stop=True,
+            )
+            return process.returncode if process.returncode is not None else 1
         if time_limit_seconds is None:
             return await _stream_process_output(process, emit)
         try:
@@ -473,8 +479,9 @@ class NeuricoHarborAgent(Agent):
         session.cancelled = False
         session.active_task = asyncio.current_task()
 
-        def register_process(process: asyncio.subprocess.Process) -> None:
+        def register_process(process: asyncio.subprocess.Process) -> bool:
             session.process = process
+            return session.cancelled
 
         try:
             return_code = await run_autoresearch_process(

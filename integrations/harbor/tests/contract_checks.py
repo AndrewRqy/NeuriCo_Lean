@@ -196,6 +196,64 @@ def test_cancellation_requests_native_stop_and_terminates_detached_provider(
     asyncio.run(exercise())
 
 
+def test_cancellation_during_child_spawn_is_honored_after_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def exercise() -> None:
+        auth_file = tmp_path / "auth.json"
+        auth_file.write_text('{"tokens": {}}')
+        spawn_started = asyncio.Event()
+        allow_spawn = asyncio.Event()
+        spawned_process: asyncio.subprocess.Process | None = None
+        create_subprocess_exec = asyncio.create_subprocess_exec
+
+        async def delayed_create_subprocess_exec(*_args: Any, **kwargs: Any):
+            nonlocal spawned_process
+            spawn_started.set()
+            await allow_spawn.wait()
+            spawned_process = await create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+                cwd=kwargs["cwd"],
+                env=kwargs["env"],
+                stdout=kwargs["stdout"],
+                stderr=kwargs["stderr"],
+                start_new_session=kwargs["start_new_session"],
+            )
+            return spawned_process
+
+        monkeypatch.setattr(
+            agent_module.asyncio,
+            "create_subprocess_exec",
+            delayed_create_subprocess_exec,
+        )
+        agent = NeuricoHarborAgent(
+            {
+                "NEURICO_MODEL": "openai/test-model",
+                "NEURICO_CODEX_AUTH_FILE": str(auth_file),
+            }
+        )
+        session = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+        prompt_task = asyncio.create_task(
+            agent.prompt(
+                session_id=session.session_id,
+                prompt=[{"type": "text", "text": "Run this benchmark"}],
+            )
+        )
+
+        await asyncio.wait_for(spawn_started.wait(), timeout=5)
+        await agent.cancel(session.session_id)
+        allow_spawn.set()
+        response = await asyncio.wait_for(prompt_task, timeout=5)
+
+        assert response.stop_reason == "cancelled"
+        assert spawned_process is not None
+        assert spawned_process.returncode is not None
+
+    asyncio.run(exercise())
+
+
 def test_child_output_stream_accepts_events_larger_than_asyncio_line_limit() -> None:
     async def exercise() -> None:
         payload_size = 200_000
