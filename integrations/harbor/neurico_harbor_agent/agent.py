@@ -5,9 +5,8 @@ from __future__ import annotations
 import asyncio
 import codecs
 import os
-import shutil
 import signal
-import stat
+import subprocess
 import sys
 import tempfile
 from collections.abc import Awaitable, Callable
@@ -59,6 +58,8 @@ ContentBlock = (
 OutputHandler = Callable[[str], Awaitable[None]]
 _TIME_LIMIT_EXIT_CODE = 124
 _COOPERATIVE_SHUTDOWN_GRACE_SECONDS = 30.0
+_CANCELLATION_GRACE_SECONDS = 30.0
+_FORCED_TERMINATION_GRACE_SECONDS = 5.0
 
 
 @dataclass
@@ -102,68 +103,135 @@ def _autoresearch_time_limit(environment: dict[str, str]) -> int | None:
     try:
         seconds = int(raw)
     except ValueError as error:
-        raise ValueError(
-            "NEURICO_HARBOR_TIME_LIMIT_SECONDS must be a positive integer"
-        ) from error
+        raise ValueError("NEURICO_HARBOR_TIME_LIMIT_SECONDS must be a positive integer") from error
     if seconds <= 0:
-        raise ValueError(
-            "NEURICO_HARBOR_TIME_LIMIT_SECONDS must be a positive integer"
-        )
+        raise ValueError("NEURICO_HARBOR_TIME_LIMIT_SECONDS must be a positive integer")
     return seconds
 
 
-def _path_entry_exists(path: Path) -> bool:
-    """Return whether a path entry exists without following a symlink."""
+def _linux_process_rows() -> list[tuple[int, int, int]]:
+    """Read PID, parent PID, and process group from Linux procfs."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return []
+    rows: list[tuple[int, int, int]] = []
     try:
-        path.lstat()
-    except FileNotFoundError:
-        return False
-    return True
+        entries = list(proc.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat_line = (entry / "stat").read_text(encoding="utf-8")
+            # The command name is parenthesized and may itself contain spaces.
+            fields = stat_line[stat_line.rfind(")") + 2 :].split()
+            rows.append((int(entry.name), int(fields[1]), int(fields[2])))
+        except (IndexError, OSError, ValueError):
+            continue
+    return rows
 
 
-def _remove_created_workspace_venv(workspace: Path, *, existed_before: bool) -> bool:
-    """Remove only a workspace ``.venv`` created during this Harbor run."""
-    if existed_before:
-        return False
-
-    workspace = workspace.resolve()
-    if workspace == Path(workspace.anchor):
-        raise RuntimeError(
-            "Refusing to clean a workspace virtual environment under filesystem root"
-        )
-
-    target = workspace / ".venv"
+def _process_rows() -> list[tuple[int, int, int]]:
+    """Return the process ancestry fields available on this POSIX host."""
+    linux_rows = _linux_process_rows()
+    if linux_rows:
+        return linux_rows
     try:
-        target_stat = target.lstat()
-    except FileNotFoundError:
-        return False
+        process_table = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid="],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
 
-    if stat.S_ISDIR(target_stat.st_mode) and not stat.S_ISLNK(target_stat.st_mode):
-        shutil.rmtree(target)
-    else:
-        # Never follow a run-created symlink. Unlink the workspace entry only.
-        target.unlink()
-    return True
+    rows: list[tuple[int, int, int]] = []
+    for line in process_table.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            rows.append(tuple(int(field) for field in fields))
+        except ValueError:
+            continue
+    return rows
 
 
-async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
-    """Stop the isolated AutoResearch process group and its provider children."""
-    if process.returncode is not None:
+def _owned_process_group_ids(root_pid: int) -> set[int]:
+    """Return POSIX process groups currently descended from ``root_pid``."""
+    if os.name != "posix":
+        return set()
+    rows = _process_rows()
+    if not rows:
+        try:
+            return {os.getpgid(root_pid)}
+        except (ProcessLookupError, PermissionError):
+            return set()
+
+    descendants = {root_pid}
+    while True:
+        discovered = {pid for pid, parent_pid, _group_id in rows if parent_pid in descendants}
+        expanded = descendants | discovered
+        if expanded == descendants:
+            break
+        descendants = expanded
+    own_group = os.getpgrp()
+    return {
+        group_id
+        for pid, _parent_pid, group_id in rows
+        if pid in descendants and group_id > 1 and group_id != own_group
+    }
+
+
+def _signal_process_groups(process_groups: set[int], signum: signal.Signals) -> None:
+    """Signal only groups previously observed under the AutoResearch child."""
+    for group_id in sorted(process_groups, reverse=True):
+        try:
+            os.killpg(group_id, signum)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+
+async def _terminate_process_tree(
+    process: asyncio.subprocess.Process,
+    *,
+    request_cooperative_stop: bool = False,
+) -> None:
+    """Stop AutoResearch and every separately grouped provider descendant."""
+    process_groups = _owned_process_group_ids(process.pid)
+    if request_cooperative_stop and process.returncode is None:
+        # The child translates SIGINT into NeuriCo's durable native stop request.
+        # Providers then observe that request and terminate their own groups.
+        try:
+            process.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_CANCELLATION_GRACE_SECONDS)
+        except TimeoutError:
+            pass
+        process_groups.update(_owned_process_group_ids(process.pid))
+
+    if process.returncode is not None and not process_groups:
         return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        process.terminate()
-    try:
-        await asyncio.wait_for(process.wait(), timeout=5)
-        return
-    except TimeoutError:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        process.kill()
-    await process.wait()
+
+    _signal_process_groups(process_groups, signal.SIGTERM)
+    if process.returncode is None:
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_FORCED_TERMINATION_GRACE_SECONDS)
+        except TimeoutError:
+            pass
+
+    process_groups.update(_owned_process_group_ids(process.pid))
+    _signal_process_groups(process_groups, signal.SIGKILL)
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
 
 
 async def _stream_process_output(
@@ -242,7 +310,7 @@ async def run_autoresearch_process(
         except TimeoutError:
             await emit(
                 "NeuriCo did not finish cooperative deadline cleanup within "
-                f"{_COOPERATIVE_SHUTDOWN_GRACE_SECONDS:g} seconds; terminating its process group.\n"
+                f"{_COOPERATIVE_SHUTDOWN_GRACE_SECONDS:g} seconds; terminating its process tree.\n"
             )
             await _terminate_process_tree(process)
             return 1
@@ -310,14 +378,24 @@ class NeuricoHarborAgent(Agent):
         self,
         cwd: str,
         additional_directories: list[str] | None = None,
-        mcp_servers: list[HttpMcpServer | SseMcpServer | AcpMcpServer | McpServerStdio]
-        | None = None,
+        mcp_servers: (
+            list[HttpMcpServer | SseMcpServer | AcpMcpServer | McpServerStdio] | None
+        ) = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
         workspace = Path(cwd)
         if not workspace.is_absolute() or not workspace.is_dir():
             raise RequestError.invalid_params(
                 {"cwd": "Harbor must provide an existing absolute task workspace"}
+            )
+        if mcp_servers:
+            raise RequestError.invalid_params(
+                {
+                    "mcp_servers": (
+                        "NeuriCo's Harbor adapter does not currently support "
+                        "task-provided MCP servers"
+                    )
+                }
             )
         session_id = uuid4().hex
         self._sessions[session_id] = _Session(cwd=workspace, model=self._requested_model())
@@ -354,7 +432,10 @@ class NeuricoHarborAgent(Agent):
             return
         session.cancelled = True
         if session.process is not None and session.process.returncode is None:
-            await _terminate_process_tree(session.process)
+            await _terminate_process_tree(
+                session.process,
+                request_cooperative_stop=True,
+            )
 
     async def _send_text(self, session_id: str, text: str) -> None:
         if self._conn is None or not text:
@@ -389,7 +470,6 @@ class NeuricoHarborAgent(Agent):
         )
         iterations = _autoresearch_iterations(self._environment)
         time_limit_seconds = _autoresearch_time_limit(self._environment)
-        workspace_venv_existed = _path_entry_exists(task.workspace.resolve() / ".venv")
         session.cancelled = False
         session.active_task = asyncio.current_task()
 
@@ -428,11 +508,5 @@ class NeuricoHarborAgent(Agent):
         finally:
             if session.process is not None and session.process.returncode is None:
                 await _terminate_process_tree(session.process)
-            try:
-                _remove_created_workspace_venv(
-                    task.workspace,
-                    existed_before=workspace_venv_existed,
-                )
-            finally:
-                session.process = None
-                session.active_task = None
+            session.process = None
+            session.active_task = None

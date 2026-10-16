@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import signal
 import sys
+import threading
+import time
 from typing import Any
 
 # NeuriCo's core modules use the historical top-level ``core`` namespace.
@@ -15,7 +18,10 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 sys.path.insert(0, str(_SRC_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from core.hitl_run_control import HitlRunStopRequested  # noqa: E402
+from core.hitl_run_control import (  # noqa: E402
+    HitlRunStopRequested,
+    active_hitl_run_stop_control,
+)
 from core.idea_manager import IdeaManager  # noqa: E402
 from core.runner import ResearchRunner  # noqa: E402
 
@@ -23,6 +29,22 @@ from .runtime import HarborAutoResearchTask, build_harbor_idea  # noqa: E402
 
 
 TIME_LIMIT_EXIT_CODE = 124
+
+
+def _propagate_native_stop(
+    stop_requested: threading.Event,
+    finished: threading.Event,
+) -> None:
+    """Bridge Harbor's interrupt into the active NeuriCo stop control."""
+    while not stop_requested.wait(0.05):
+        if finished.is_set():
+            return
+    while not finished.is_set():
+        control = active_hitl_run_stop_control()
+        if control is not None:
+            control.request(requested_by="harbor_cancel")
+            return
+        time.sleep(0.05)
 
 
 def execute_autoresearch(
@@ -69,6 +91,7 @@ def execute_autoresearch(
             hitl_mode="auto",
             autoresearch_iterations=iterations,
             time_limit_seconds=time_limit_seconds,
+            workspace_mode="embedded",
         )
     except HitlRunStopRequested as stop:
         if "budget_exhausted" not in str(stop):
@@ -94,14 +117,32 @@ def main() -> None:
     parser.add_argument("--time-limit-seconds", type=int)
     args = parser.parse_args()
 
-    instruction = args.instruction_file.read_text(encoding="utf-8")
-    result = execute_autoresearch(
-        instruction=instruction,
-        workspace=args.workspace,
-        ideas_dir=args.ideas_dir,
-        iterations=args.iterations,
-        time_limit_seconds=args.time_limit_seconds,
+    stop_requested = threading.Event()
+    finished = threading.Event()
+
+    def request_native_stop(_signum: int, _frame: Any) -> None:
+        stop_requested.set()
+
+    signal.signal(signal.SIGINT, request_native_stop)
+    stop_thread = threading.Thread(
+        target=_propagate_native_stop,
+        args=(stop_requested, finished),
+        daemon=True,
+        name="neurico-harbor-stop",
     )
+    stop_thread.start()
+    try:
+        instruction = args.instruction_file.read_text(encoding="utf-8")
+        result = execute_autoresearch(
+            instruction=instruction,
+            workspace=args.workspace,
+            ideas_dir=args.ideas_dir,
+            iterations=args.iterations,
+            time_limit_seconds=args.time_limit_seconds,
+        )
+    finally:
+        finished.set()
+        stop_thread.join(timeout=0.2)
     if result.get("time_limit_reached", False):
         raise SystemExit(TIME_LIMIT_EXIT_CODE)
     if not result.get("success", False):

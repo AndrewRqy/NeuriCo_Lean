@@ -34,10 +34,13 @@ for human input.
   budget through NeuriCo's native managed-AutoResearch deadline. NeuriCo owns
   stop propagation and budget-specific selected-frontier finalization; the
   adapter only translates the completed budget stop for Harbor. Set this below
-  Harbor's agent timeout so native finalization and `.venv` cleanup have time
+  Harbor's agent timeout so native finalization has time
   to finish; for example, use 3480 seconds with a 3600-second Harbor timeout.
   If native shutdown itself stalls, the adapter terminates the isolated NeuriCo
-  process group after a 30-second grace period. Harbor's ACP launcher does not
+  process tree, including separately grouped provider processes, after a
+  30-second grace period. ACP cancellation follows the same ownership boundary:
+  it requests NeuriCo's native stop first, then terminates any surviving owned
+  groups. Harbor's ACP launcher does not
   currently expose its resolved hard deadline to the agent, so the Harbor
   timeout and the smaller NeuriCo budget are explicit paired job settings.
 - The requested Harbor model is advertised as an ACP session configuration
@@ -52,11 +55,13 @@ for human input.
 - NeuriCo's idea registry and Codex home are kept in a temporary control
   directory outside the task repository. Research state and the retained best
   implementation remain in Harbor's workspace.
-- NeuriCo may create a workspace `.venv` while its agents and internal scorer
-  run. After the AutoResearch child process exits, the adapter removes that
-  environment if it did not exist before the Harbor session. Dependency
-  metadata and research artifacts remain, while a benchmark-provided `.venv`
-  is preserved. Harbor's verifier is responsible for its own environment.
+- Harbor runs NeuriCo in embedded workspace mode. NeuriCo-owned dependency
+  metadata and its virtual environment live under `neurico-research-env/`,
+  while the task's root `.venv` is never read, reused, or removed by the
+  adapter. Harbor's verifier remains responsible for its own environment.
+- Task-provided MCP servers are rejected when the ACP session is created. The
+  adapter does not silently start a run without capabilities declared by the
+  benchmark.
 - Harbor runs its own verifier after NeuriCo exits; the adapter does not inspect
   or translate Harbor's verifier.
 
